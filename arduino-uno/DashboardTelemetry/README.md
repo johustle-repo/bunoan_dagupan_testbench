@@ -92,3 +92,7 @@ Never connect a 5 V Uno TX directly to an ESP32 GPIO.
 On the dashboard, mark data stale if no new line arrives for 3 seconds.
 The only process opening COM5 should be the intended serial consumer;
 close Serial Monitor before uploading or connecting a serial bridge.
+
+## SoftwareSerial version
+The current sketch uses SoftwareSerial arduino(5, 6), RX D5 and TX D6, at 19200 baud. Reception is stopped because telemetry is one-way. Timer1 samples D7 at 20 kHz to avoid SoftwareSerial pin-change ISR conflicts. Timer1 PWM/Servo features are unavailable. Transmit interrupt blocking can miss D7 pulses; frequency accuracy requires hardware verification. This replaces the earlier Timer2 transmitter described above.
+

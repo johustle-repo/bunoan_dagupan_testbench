@@ -13,6 +13,7 @@
 volatile uint32_t pulseCount = 0;
 volatile bool previousD7High = false;
 uint32_t windowStartUs = 0;
+uint32_t serialPauseUs = 0;
 volatile bool acquisitionEnabled = false;
 DebouncedButton smartKeyButton(8), brakeButton(9, false);
 // Existing brake wiring: released LOW, pressed HIGH (active-high).
@@ -23,7 +24,8 @@ uint32_t lastRampMs = 0;
 float displayedRpm = 0;
 float lastPublishedRpm = 0;
 
-ISR(PCINT2_vect) {
+// SoftwareSerial owns PCINT2; Timer1 samples D7 at 20 kHz instead.
+ISR(TIMER1_COMPA_vect) {
   const bool highNow = (PIND & _BV(PD7)) != 0;
   if (acquisitionEnabled && highNow && !previousD7High) pulseCount++;
   previousD7High = highNow;
@@ -39,6 +41,20 @@ constexpr float DISPLAY_RPM_MAX = 300.0f; // User-requested display scale.
 float rawSnapshot[5];
 float voltageSnapshot[5];
 float positionSnapshot[5];
+
+void publishEspSnapshot(float hz, bool keyOn, bool brakePressed, float mappedRpm) {
+  uint32_t pauseStart;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    acquisitionEnabled = false;
+    pauseStart = micros();
+  }
+  sendEspSnapshot(rawSnapshot, hz, keyOn, brakePressed, mappedRpm);
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    if (keyOn) serialPauseUs += uint32_t(micros() - pauseStart);
+    previousD7High = (PIND & _BV(PD7)) != 0;
+    acquisitionEnabled = keyOn;
+  }
+}
 
 void printSensor(uint8_t i) {
   analogRead(sensorPins[i]);
@@ -90,15 +106,18 @@ void setup() {
     digitalWrite(sensorPins[i], LOW); // Keep internal pull-ups disabled.
   }
   delay(1000);
-  // D7 uses a pin-change interrupt on Uno. No internal pull-up:
-  // the simulator must provide a valid 0-to-VCC digital waveform.
+  // D7 is sampled by Timer1; SoftwareSerial owns the pin-change vectors.
+  // No internal pull-up: provide a valid 0-to-VCC waveform.
   pinMode(7, INPUT);
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
     previousD7High = (PIND & _BV(PD7)) != 0;
-    PCIFR = _BV(PCIF2);
-    PCMSK2 |= _BV(PCINT23);
+    TCCR1A = 0;
+    TCCR1B = _BV(WGM12) | _BV(CS11);
+    OCR1A = 99; // 16 MHz / 8 / 100 = 20 kHz.
+    TCNT1 = 0;
+    TIFR1 = _BV(OCF1A);
+    TIMSK1 |= _BV(OCIE1A);
     windowStartUs = micros();
-    PCICR |= _BV(PCIE2);
   }
   // JSON lines start with '{'; readable lines start with '#'.
   // A dashboard serial bridge should ignore lines starting with '#'.
@@ -112,6 +131,7 @@ void loop() {
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
       acquisitionEnabled = smartKeyOn;
       pulseCount = 0;
+      serialPauseUs = 0;
       windowStartUs = micros();
       previousD7High = (PIND & _BV(PD7)) != 0;
     }
@@ -125,17 +145,21 @@ void loop() {
     uint32_t pulses, elapsedUs;
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
       const uint32_t nowUs = micros();
-      elapsedUs = nowUs - windowStartUs;
+      elapsedUs = uint32_t(nowUs - windowStartUs) - serialPauseUs;
+      serialPauseUs = 0;
       windowStartUs = nowUs;
       pulses = pulseCount;
       pulseCount = 0;
     }
-    lastFrequencyHz = pulses * 1000000.0f / elapsedUs;
+    lastFrequencyHz = elapsedUs ? pulses * 1000000.0f / elapsedUs : 0;
     changed = true;
   }
   const bool brakePressed = brakeButton.pressed();
-  const float targetRpm = !smartKeyOn || brakePressed ? 0 : constrain(
+  float targetRpm = !smartKeyOn || brakePressed ? 0 : constrain(
       lastFrequencyHz * DISPLAY_RPM_MAX / FREQUENCY_MAX_HZ, 0.0f, DISPLAY_RPM_MAX);
+  // Small endpoint variation should still let the full-scale knob reach 300.
+  if (smartKeyOn && !brakePressed && lastFrequencyHz >= FREQUENCY_MAX_HZ * 0.99f)
+    targetRpm = DISPLAY_RPM_MAX;
   displayedRpm = smartKeyOn ? stepMappedRpm(displayedRpm, targetRpm,
       uint32_t(nowMs - lastRampMs) / 1000.0f) : 0;
   lastRampMs = nowMs;
@@ -151,7 +175,7 @@ void loop() {
     Serial.print(brakePressed ? F("true") : F("false"));
     Serial.println(F(",\"sensors\":null,\"frequency_hz\":0,\"engine_rpm\":0}"));
     Serial.println(F("# SMART KEY OFF: sensor acquisition locked. Press D8 to enable."));
-    sendEspSnapshot(rawSnapshot, 0, false, brakePressed, 0);
+    publishEspSnapshot(0, false, brakePressed, 0);
     return; // No analogRead while locked.
   }
   const float frequencyHz = lastFrequencyHz;
@@ -205,5 +229,5 @@ void loop() {
   Serial.print(F("# Mapped RPM: ")); Serial.print(mappedRpm, 1);
   Serial.println(F(" / 300 (display scale, not calibrated engine RPM)"));
   Serial.println(F("# ----------------------------------------------------"));
-  sendEspSnapshot(rawSnapshot, frequencyHz, smartKeyOn, brakePressed, mappedRpm);
+  publishEspSnapshot(frequencyHz, smartKeyOn, brakePressed, mappedRpm);
 }
