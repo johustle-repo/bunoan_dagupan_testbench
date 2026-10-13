@@ -88,11 +88,11 @@ async function poll(){
 // Source-age deadline, independent of request timeouts. Don't keep old readings
 // alive just because a request is still pending or retrying.
 setInterval(()=>{if(recentPacket&&performance.now()>=freshUntil){recentPacket=null;render(null,'stale');}},250);
-function drawHistory(){const ctx=$('historyChart').getContext('2d'),key=$('channel').value,max=key==='frequency_hz'?1700:key==='engine_rpm'?300:5;ctx.clearRect(0,0,900,320);ctx.fillStyle='#acbdd1';ctx.font='14px sans-serif';ctx.fillText(`${key==='IAT'?'AIT':key==='engine_rpm'?'Simulated speed':key} · scale 0–${max} ${names.includes(key)?'V':key==='frequency_hz'?'Hz':'simulated km/h'}`,20,25);ctx.strokeStyle='#66d4f1';ctx.lineWidth=2;ctx.beginPath();let connected=false;samples.forEach((r,i)=>{if(!r.data){connected=false;return;}const v=names.includes(key)?r.data.sensors[key].voltage_v:(key==='engine_rpm'?displaySpeed(r.data):r.data[key]),x=30+i/119*840,y=280-v/max*230;if(connected)ctx.lineTo(x,y);else ctx.moveTo(x,y);connected=true;});ctx.stroke();ctx.fillStyle='#acbdd1';ctx.fillText('Oldest → newest · gaps mean data unavailable',30,310);$('chartLegend').textContent=last?'Live inputs · '+samples.length+' history samples':'Waiting for fresh data';}
+function drawHistory(){const ctx=$('historyChart').getContext('2d'),key=$('channel').value,max=key==='frequency_hz'?1700:key==='engine_rpm'?300:key==='simulated_rpm'?15000:5;ctx.clearRect(0,0,900,320);ctx.fillStyle='#acbdd1';ctx.font='14px sans-serif';ctx.fillText(`${key==='IAT'?'AIT':key==='engine_rpm'?'Simulated speed':key==='simulated_rpm'?'Simulated RPM':key} · scale 0–${max} ${names.includes(key)?'V':key==='frequency_hz'?'Hz':key==='simulated_rpm'?'rpm':'simulated km/h'}`,20,25);ctx.strokeStyle='#66d4f1';ctx.lineWidth=2;ctx.beginPath();let connected=false;samples.forEach((r,i)=>{if(!r.data){connected=false;return;}const v=names.includes(key)?r.data.sensors[key].voltage_v:(key==='engine_rpm'?displaySpeed(r.data):r.data[key]),x=30+i/119*840,y=280-v/max*230;if(connected)ctx.lineTo(x,y);else ctx.moveTo(x,y);connected=true;});ctx.stroke();ctx.fillStyle='#acbdd1';ctx.fillText('Oldest → newest · gaps mean data unavailable',30,310);$('chartLegend').textContent=last?'Live inputs · '+samples.length+' history samples':'Waiting for fresh data';}
 for(const button of document.querySelectorAll('[data-page]'))button.addEventListener('click',()=>{for(const b of document.querySelectorAll('[data-page]')){const active=b===button;b.setAttribute('aria-pressed',String(active));$(b.dataset.page+'Page').hidden=!active;}drawHistory();});
 $('channel').addEventListener('change',drawHistory);
 $('recordButton').addEventListener('click',()=>{if(!recording&&recorded.length>=3600){$('recordStatus').textContent='Recording limit reached. Export CSV before refreshing.';return;}recording=!recording;updateRecording();log(recording?'Live recording started':'Recording stopped');});
-function csvText(){const header=['timestamp','source','smart_key','brake_pressed','frequency_hz','simulated_speed_kmh','check_engine','fault_mask',...names.flatMap(n=>[(n==='IAT'?'AIT':n)+'_raw',(n==='IAT'?'AIT':n)+'_voltage_v',(n==='IAT'?'AIT':n)+'_knob_percent',(n==='IAT'?'AIT':n)+'_endpoint_status']), 'AIT_c','ECT_c','MAP_kpa','TPS_percent','O2_lambda','O2_afr','O2_mixture','dtc_codes','coolant_warning','throttle_deg'];const rows=recorded.map(r=>[r.time,r.data.source,r.data.smart_key,r.data.brake_pressed,r.data.frequency_hz,displaySpeed(r.data),r.data.check_engine,r.data.fault_mask,...names.flatMap(n=>{const s=r.data.sensors[n];return[s.raw,s.voltage_v,s.knob_percent,s.endpoint_status];}),r.data.sensors.IAT.estimate_c,r.data.sensors.ECT.estimate_c,r.data.sensors.MAP.estimate_kpa,r.data.sensors.TPS.throttle_percent,r.data.sensors.O2.lambda,r.data.sensors.O2.afr,r.data.sensors.O2.mixture,(r.data.dtc||[]).map(x=>x.code).join(' '),r.data.coolant_warning,throttleDeg(r.data.sensors.TPS.throttle_percent)]);return[header,...rows].map(row=>row.map(v=>'"'+String(v??'').replaceAll('"','""')+'"').join(',')).join('\r\n');}
+function csvText(){const header=['timestamp','source','smart_key','brake_pressed','frequency_hz','simulated_speed_kmh','check_engine','fault_mask',...names.flatMap(n=>[(n==='IAT'?'AIT':n)+'_raw',(n==='IAT'?'AIT':n)+'_voltage_v',(n==='IAT'?'AIT':n)+'_knob_percent',(n==='IAT'?'AIT':n)+'_endpoint_status']), 'AIT_c','ECT_c','MAP_kpa','TPS_percent','O2_lambda','O2_afr','O2_mixture','dtc_codes','coolant_warning','throttle_deg','simulated_rpm','gear'];const rows=recorded.map(r=>[r.time,r.data.source,r.data.smart_key,r.data.brake_pressed,r.data.frequency_hz,displaySpeed(r.data),r.data.check_engine,r.data.fault_mask,...names.flatMap(n=>{const s=r.data.sensors[n];return[s.raw,s.voltage_v,s.knob_percent,s.endpoint_status];}),r.data.sensors.IAT.estimate_c,r.data.sensors.ECT.estimate_c,r.data.sensors.MAP.estimate_kpa,r.data.sensors.TPS.throttle_percent,r.data.sensors.O2.lambda,r.data.sensors.O2.afr,r.data.sensors.O2.mixture,(r.data.dtc||[]).map(x=>x.code).join(' '),r.data.coolant_warning,throttleDeg(r.data.sensors.TPS.throttle_percent),r.data.simulated_rpm,r.data.gear]);return[header,...rows].map(row=>row.map(v=>'"'+String(v??'').replaceAll('"','""')+'"').join(',')).join('\r\n');}
 $('exportCsv').addEventListener('click',()=>{if(!recorded.length){$('recordStatus').textContent='Start recording to collect fresh samples first.';return;}const url=URL.createObjectURL(new Blob([csvText()],{type:'text/csv;charset=utf-8'})),a=document.createElement('a');a.href=url;a.download='live-testbench-'+Date.now()+'.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);log('Exported '+recorded.length+' live samples');});
 $("printReport").addEventListener("click",()=>{$("printSummary").innerHTML=window.buildSessionReport({model:$("modelName").value,technician:$("technician").value,notes:$("reportNotes").value,generated:Date.now(),latest:last,recorded,history:samples,events});window.print();});
 window.liveDashboard={valid,csvText,getState:()=>({last,recorded:recorded.length,history:samples.length}),render};
@@ -136,7 +136,7 @@ function milLit(now){
  for(const [on,off] of seq){if(t<on)return true;t-=on;if(t<off)return false;t-=off;}
  return false;
 }
-let animatedRpm=0,lastAnimation=performance.now();
+let animatedRpm=0,animatedEngineRpm=0,lastAnimation=performance.now();
 function animateRpm(now){const dt=Math.min(.1,Math.max(0,(now-lastAnimation)/1000));lastAnimation=now;
  // Key-on self-test: every lamp lit and a full needle sweep, like a real cluster.
  const selfTestMs=now-selfTestStart,selfTest=selfTestMs<SELF_TEST_MS;
@@ -144,7 +144,7 @@ function animateRpm(now){const dt=Math.min(.1,Math.max(0,(now-lastAnimation)/100
  const mil=String(selfTest||milLit(now));if($('engineLamp').dataset.active!==mil)$('engineLamp').dataset.active=mil;
  syncRaceLamps();
  if(selfTest&&!$('dashboardPage').hidden){const sweep=300*(selfTestMs<SELF_TEST_MS/2?selfTestMs:SELF_TEST_MS-selfTestMs)/(SELF_TEST_MS/2);
-  $('needle').setAttribute('visibility','visible');setGauge(sweep);$('raceSpeed').textContent=String(Math.round(sweep));requestAnimationFrame(animateRpm);return;}
+  $('needle').setAttribute('visibility','visible');setGauge(sweep);$('raceSpeed').textContent=String(Math.round(sweep));setRpmGauge(sweep/300*RPM_MAX,true);requestAnimationFrame(animateRpm);return;}
  if(last&&!$('dashboardPage').hidden&&!document.hidden){const before=animatedRpm,difference=displaySpeed(last)-animatedRpm;animatedRpm+=Math.sign(difference)*Math.min(Math.abs(difference),150*dt);
  const digits=String(Math.round(animatedRpm)).padStart(3,'0'),barText=format(animatedRpm,1);
  if($('rpm').textContent!==digits)$('rpm').textContent=digits;
@@ -152,40 +152,72 @@ function animateRpm(now){const dt=Math.min(.1,Math.max(0,(now-lastAnimation)/100
  const raceDigits=String(Math.round(animatedRpm));if($('raceSpeed').textContent!==raceDigits)$('raceSpeed').textContent=raceDigits;
  if(before!==animatedRpm||$('rpmFill').style.width!==animatedRpm/3+'%'){
  setGauge(animatedRpm);}
- }else if(!last)animatedRpm=0;requestAnimationFrame(animateRpm);}
+ // Engine RPM moves faster than the speed needle so gear changes read as a quick drop.
+ const rpmDiff=(numeric(last.simulated_rpm)?last.simulated_rpm:0)-animatedEngineRpm;animatedEngineRpm+=Math.sign(rpmDiff)*Math.min(Math.abs(rpmDiff),20000*dt);setRpmGauge(animatedEngineRpm,true);
+ }else if(!last){animatedRpm=0;animatedEngineRpm=0;}requestAnimationFrame(animateRpm);}
 requestAnimationFrame(animateRpm);
 poll();
 
 // Throttle angle, air-fuel mixture symbols and the race-style display.
-// Throttle plate angle for TPS: 0 % = closed (0 deg), 100 % = wide open.
+// TPS 0-100 % is the throttle-plate angle, 0 deg closed to 90 deg wide open.
 const THROTTLE_MAX_DEG=90;
 // Client lambda -> gasoline AFR table (AFR = 14.7 x lambda).
 const AFR_TABLE=[[0.70,'10.3'],[0.75,'11.0'],[0.80,'11.8'],[0.85,'12.5'],[0.90,'13.2'],[0.95,'14.0'],[1.00,'14.7'],[1.05,'15.4'],[1.10,'16.2'],[1.15,'16.9'],[1.20,'17.6'],[1.25,'18.4'],[1.30,'19.1'],[1.35,'19.8'],[1.40,'20.6'],[1.45,'21.3'],[1.50,'22.1'],[1.55,'22.8'],[1.60,'23.5']];
 const LAMBDA_MIN=0.70,LAMBDA_MAX=1.60,MIXTURE_TEXT={rich:'RICH · more fuel than stoichiometric',stoich:'STOICHIOMETRIC · λ ≈ 1',lean:'LEAN · more air than stoichiometric'};
 const throttleDeg=pct=>numeric(pct)?pct*THROTTLE_MAX_DEG/100:null;
-// Quarter protractor with its pivot bottom-left, like a set of angle pieces.
-const TP={cx:14,cy:106,r:90},tpPoint=(deg,radius)=>[TP.cx+Math.cos(deg*Math.PI/180)*radius,TP.cy-Math.sin(deg*Math.PI/180)*radius];
-const tpSector=(deg,radius)=>{const [x,y]=tpPoint(deg,radius);return `M${TP.cx} ${TP.cy}L${TP.cx+radius} ${TP.cy}A${radius} ${radius} 0 0 0 ${x.toFixed(2)} ${y.toFixed(2)}Z`;};
+// Throttle body side view: the butterfly plate is a bar across the full circle,
+// vertical when closed (ends at 0 and 180 deg). TP_DIR -1 turns it
+// counter-clockwise (wide open ends at 270 and 90 deg); 1 turns it clockwise.
+const TP_DIR=-1;
+const TP={cx:60,cy:60,r:42},tpPoint=(deg,radius)=>[TP.cx+Math.sin(deg*Math.PI/180)*radius,TP.cy-Math.cos(deg*Math.PI/180)*radius];
+const tpArc=(from,to,radius)=>{const [x1,y1]=tpPoint(from,radius),[x2,y2]=tpPoint(to,radius);return `M${x1.toFixed(2)} ${y1.toFixed(2)}A${radius} ${radius} 0 ${to-from>180?1:0} 1 ${x2.toFixed(2)} ${y2.toFixed(2)}`;};
+const tpSector=(from,to,radius)=>`M${TP.cx} ${TP.cy}L`+tpArc(from,to,radius).slice(1)+'Z';
 function throttleIcon(){
  let ticks='',labels='';
- for(const deg of [0,15,30,45,60,75,90]){const [x1,y1]=tpPoint(deg,TP.r),[x2,y2]=tpPoint(deg,TP.r-(deg%15===0&&deg%30!==0&&deg!==45?7:13));ticks+=`<line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}"/>`;}
- for(const deg of [0,30,45,60,90]){const [x,y]=tpPoint(deg,TP.r+13);labels+=`<text x="${x.toFixed(1)}" y="${y.toFixed(1)}">${deg}°</text>`;}
- return `<svg class="throttle-icon" viewBox="0 -6 128 118" aria-hidden="true"><path class="tp-track" d="${tpSector(90,TP.r)}"/><path class="tp-wedge" d=""/><path class="tp-arc" d=""/><g class="tp-ticks">${ticks}</g><g class="tp-labels">${labels}</g></svg><b class="tp-deg">—</b>`;
+ for(let deg=0;deg<360;deg+=15){const major=deg%90===0,mid=deg%30===0||deg%45===0;if(!major&&!mid)continue;const [x1,y1]=tpPoint(deg,TP.r),[x2,y2]=tpPoint(deg,TP.r-(major?11:6));ticks+=`<line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}"/>`;}
+ for(const deg of [0,90,180,270]){const [x,y]=tpPoint(deg,TP.r+11);labels+=`<text x="${x.toFixed(1)}" y="${y.toFixed(1)}">${deg}°</text>`;}
+ return `<svg class="throttle-icon" viewBox="0 0 120 120" aria-hidden="true"><circle class="tp-track" cx="${TP.cx}" cy="${TP.cy}" r="${TP.r}"/><path class="tp-wedge" d=""/><path class="tp-arc" d=""/><g class="tp-ticks">${ticks}</g><g class="tp-labels">${labels}</g><line class="tp-plate" x1="${TP.cx}" y1="${TP.cy-TP.r+2}" x2="${TP.cx}" y2="${TP.cy+TP.r-2}" visibility="hidden"/><circle class="tp-shaft" cx="${TP.cx}" cy="${TP.cy}" r="4"/></svg><span class="tp-read"><b class="tp-deg">—</b><small class="tp-open"></small></span>`;
 }
 for(const slot of document.querySelectorAll('.throttle-slot'))slot.innerHTML=throttleIcon();
 function updateThrottle(deg){
- const has=numeric(deg),wedge=has&&deg>0.2?tpSector(deg,TP.r):'',[ax,ay]=tpPoint(has?deg:0,30);
- const arc=has&&deg>0.2?`M${TP.cx+30} ${TP.cy}A30 30 0 0 0 ${ax.toFixed(2)} ${ay.toFixed(2)}`:'',text=has?format(deg,1)+'°':'—';
+ // Readout is the plate's two end angles, e.g. closed 0° – 180°, wide open 270° – 90°.
+ const has=numeric(deg),on=has&&deg>0.2,turn=has?TP_DIR*deg:0,end1=(Math.round(turn)+360)%360,end2=(end1+180)%360;
+ const text=has?`${end1}° – ${end2}°`:'—',open=has?`opening ${format(deg,1)}°`:'';
+ // Arcs are drawn clockwise, so a counter-clockwise turn spans [-deg, 0].
+ const a0=TP_DIR>0?0:-deg,a1=TP_DIR>0?deg:0;
+ const wedge=on?tpSector(a0,a1,TP.r)+tpSector(180+a0,180+a1,TP.r):'',arc=on?tpArc(a0,a1,16)+tpArc(180+a0,180+a1,16):'';
+ const [x1,y1]=tpPoint(turn,TP.r-2),[x2,y2]=tpPoint(turn+180,TP.r-2);
  for(const el of document.querySelectorAll('.tp-wedge'))if(el.getAttribute('d')!==wedge)el.setAttribute('d',wedge);
  for(const el of document.querySelectorAll('.tp-arc'))if(el.getAttribute('d')!==arc)el.setAttribute('d',arc);
+ for(const el of document.querySelectorAll('.tp-plate')){el.setAttribute('x1',x1.toFixed(2));el.setAttribute('y1',y1.toFixed(2));el.setAttribute('x2',x2.toFixed(2));el.setAttribute('y2',y2.toFixed(2));el.setAttribute('visibility',has?'visible':'hidden');}
  for(const el of document.querySelectorAll('.tp-deg'))if(el.textContent!==text)el.textContent=text;
+ for(const el of document.querySelectorAll('.tp-open'))if(el.textContent!==open)el.textContent=open;
 }
 const lambdaX=v=>10+(v-LAMBDA_MIN)/(LAMBDA_MAX-LAMBDA_MIN)*280;
 $('lambdaScale').innerHTML=`<svg class="lambda-scale" viewBox="0 0 300 58" role="img" aria-label="Lambda scale from 0.70 rich to 1.60 lean"><rect class="zone-rich" x="10" y="20" width="${lambdaX(0.97)-10}" height="12"/><rect class="zone-stoich" x="${lambdaX(0.97)}" y="20" width="${lambdaX(1.03)-lambdaX(0.97)}" height="12"/><rect class="zone-lean" x="${lambdaX(1.03)}" y="20" width="${290-lambdaX(1.03)}" height="12"/>`+
  [0.70,0.85,1.00,1.15,1.30,1.45,1.60].map(v=>`<line x1="${lambdaX(v)}" y1="32" x2="${lambdaX(v)}" y2="38"/><text x="${lambdaX(v)}" y="50">${v.toFixed(2)}</text>`).join('')+
  `<text class="zone-label" x="${lambdaX(0.83)}" y="10">RICH</text><text class="zone-label" x="${lambdaX(1)}" y="10">λ = 1</text><text class="zone-label" x="${lambdaX(1.32)}" y="10">LEAN</text><g class="lambda-marker" id="lambdaMarker" visibility="hidden"><path d="M0 20L-6 12H6Z"/><line x1="0" y1="18" x2="0" y2="35"/></g></svg>`;
 $('afrTable').innerHTML='<tbody><tr><th scope="row">Lambda</th>'+AFR_TABLE.map(([l])=>`<td>${l.toFixed(2)}</td>`).join('')+'</tr><tr><th scope="row">Gasoline AFR</th>'+AFR_TABLE.map(([,a])=>`<td>${a}</td>`).join('')+'</tr></tbody>';
+// Small semicircle AFR gauge: needle and centre value show AFR, bands mark rich / stoich / lean.
+const AFR_MIN=10,AFR_MAX=24,AG={cx:60,cy:58,r:46};
+const agPoint=(afr,radius)=>{const t=Math.max(0,Math.min(1,(afr-AFR_MIN)/(AFR_MAX-AFR_MIN))),a=Math.PI*(1-t);return [AG.cx+Math.cos(a)*radius,AG.cy-Math.sin(a)*radius];};
+const agBand=(from,to)=>{const [x1,y1]=agPoint(from,AG.r),[x2,y2]=agPoint(to,AG.r);return `M${x1.toFixed(2)} ${y1.toFixed(2)}A${AG.r} ${AG.r} 0 0 1 ${x2.toFixed(2)} ${y2.toFixed(2)}`;};
+function afrGauge(){
+ const stoichLow=0.97*STOICH_AFR,stoichHigh=1.03*STOICH_AFR;
+ let ticks='';for(const afr of [10,12,14.7,17,20,24]){const [x1,y1]=agPoint(afr,AG.r-6),[x2,y2]=agPoint(afr,AG.r+6),[tx,ty]=agPoint(afr,AG.r+14);ticks+=`<line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}"/><text x="${tx.toFixed(1)}" y="${ty.toFixed(1)}">${afr}</text>`;}
+ return `<svg class="afr-gauge" viewBox="-6 -6 132 92" aria-hidden="true"><path class="ag-rich" d="${agBand(AFR_MIN,stoichLow)}"/><path class="ag-stoich" d="${agBand(stoichLow,stoichHigh)}"/><path class="ag-lean" d="${agBand(stoichHigh,AFR_MAX)}"/><g class="ag-ticks">${ticks}</g><line class="ag-needle" x1="${AG.cx}" y1="${AG.cy}" x2="${AG.cx}" y2="${AG.cy-AG.r+8}" visibility="hidden"/><circle class="ag-pivot" cx="${AG.cx}" cy="${AG.cy}" r="4"/><text class="ag-value" x="${AG.cx}" y="${AG.cy+22}">—</text><text class="ag-unit" x="${AG.cx}" y="${AG.cy-14}">AFR</text></svg>`;
+}
+const STOICH_AFR=14.7;
+for(const slot of document.querySelectorAll('.afr-slot'))slot.innerHTML=afrGauge();
+function updateAfrGauge(o2){
+ const lambda=o2&&numeric(o2.lambda)?o2.lambda:null,afr=o2&&numeric(o2.afr)?o2.afr:null;
+ // Off-table readings peg the needle at the matching end; the value shows —.
+ const needleAfr=afr!==null?afr:lambda!==null?lambda*STOICH_AFR:null,[x,y]=needleAfr===null?[AG.cx,AG.cy]:agPoint(needleAfr,AG.r-8),text=afr!==null?format(afr,1):'—';
+ for(const el of document.querySelectorAll('.ag-needle')){el.setAttribute('x2',x.toFixed(2));el.setAttribute('y2',y.toFixed(2));el.setAttribute('visibility',needleAfr===null?'hidden':'visible');}
+ for(const el of document.querySelectorAll('.ag-value'))if(el.textContent!==text)el.textContent=text;
+}
 function updateMixture(o2){
+ updateAfrGauge(o2);
  const lambda=o2&&numeric(o2.lambda)?o2.lambda:null,mixture=lambda===null?'':o2.mixture||'';
  for(const id of ['lambdaBadge','o2','raceLambda'])$(id).dataset.mixture=mixture;
  $('lambdaValue').textContent=lambda===null?'—':'λ '+format(lambda,2);
@@ -196,19 +228,25 @@ function updateMixture(o2){
  const row=lambda===null?-1:Math.round((lambda-LAMBDA_MIN)/0.05);
  $('afrTable').querySelectorAll('tr').forEach(tr=>[...tr.querySelectorAll('td')].forEach((td,i)=>td.classList.toggle('current',i===row)));
 }
-// Race display: curved segmented bar for the 0-300 simulated speed.
+// Race display: curved segmented bar for simulated engine RPM, 0-15,000.
+const RPM_MAX=15000;
 let raceTicksDrawn=false;
 function drawRaceTicks(){
  if(raceTicksDrawn)return;const track=$('raceTrack'),total=track.getTotalLength();if(!total)return;
- let ticks='';for(let v=0;v<=300;v+=50){const p=track.getPointAtLength(v/300*total);// The 0 label sits beside the bar's foot; 300 is right-aligned to stay inside the frame.
- const x=v===0?p.x+34:v===300?p.x+14:p.x,y=v===0?p.y+4:p.y-21;ticks+=`<text x="${x.toFixed(1)}" y="${y.toFixed(1)}"${v===300?' style="text-anchor:end"':''}>${v}</text>`;}
+ let ticks='';for(let v=0;v<=15;v+=3){const p=track.getPointAtLength(v/15*total);// The 0 label sits beside the bar's foot; 300 is right-aligned to stay inside the frame.
+ const x=v===0?p.x+34:v===15?p.x+14:p.x,y=v===0?p.y+4:p.y-21;ticks+=`<text x="${x.toFixed(1)}" y="${y.toFixed(1)}"${v===15?' style="text-anchor:end"':''}>${v}</text>`;}
  $('raceTicks').innerHTML=ticks;raceTicksDrawn=true;
 }
 function setGauge(value){
  const v=Math.max(0,Math.min(300,value)),fill=v/3+'%',dash=v.toFixed(1)+' 300';
  if($('rpmFill').style.width!==fill)$('rpmFill').style.width=fill;
  $('needle').setAttribute('transform',`rotate(${v/300*180} 200 205)`);
+}
+function setRpmGauge(rpm,show){
+ const r=Math.max(0,Math.min(RPM_MAX,rpm)),dash=(r/RPM_MAX*300).toFixed(1)+' 300',fill=(r/RPM_MAX*100).toFixed(2)+'%',text=show?String(Math.round(r/10)*10):'—';
  if($('raceFill').getAttribute('stroke-dasharray')!==dash)$('raceFill').setAttribute('stroke-dasharray',dash);
+ if($('engineRpmFill').style.width!==fill)$('engineRpmFill').style.width=fill;
+ for(const id of ['engineRpm','raceRpm'])if($(id).textContent!==text)$(id).textContent=text;
 }
 function syncRaceLamps(){
  for(const [race,classic] of [['raceKey','keyLamp'],['raceBrake','brakeLamp'],['raceEngine','engineLamp'],['raceCoolant','coolantLamp']]){const v=$(classic).dataset.active;if($(race).dataset.active!==v)$(race).dataset.active=v;}
@@ -220,7 +258,9 @@ function renderExtras(d,live,locked){
  $('raceEct').textContent=format(s?.ECT.estimate_c,1);$('raceIat').textContent=format(s?.IAT.estimate_c,1);$('raceMap').textContent=format(s?.MAP.estimate_kpa,1);
  $('raceLambda').textContent=format(s?.O2.lambda,2);$('raceAfr').textContent=format(s?.O2.afr,1);$('raceTps').textContent=format(pct,1);
  $('raceFreq').textContent=live?format(d.frequency_hz,0):'—';
- if(!live)$('raceSpeed').textContent=locked?'0':'—';
+ if(!live){$('raceSpeed').textContent=locked?'0':'—';setRpmGauge(0,locked);}
+ const gearText=live&&numeric(d.gear)?(d.gear===0?'N':String(d.gear)):locked?'N':'—';
+ for(const id of ['gear','raceGear'])if($(id).textContent!==gearText)$(id).textContent=gearText;
 }
 function setView(view){
  const race=view==='race';$('raceDisplay').hidden=!race;document.querySelector('.display').hidden=race;

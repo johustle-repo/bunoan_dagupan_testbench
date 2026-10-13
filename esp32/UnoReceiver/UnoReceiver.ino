@@ -6,6 +6,7 @@
 #include <WebServer.h>
 #include "SensorConversion.h"
 #include "DashboardAssets.h"
+#include "LocalDisplay.h"
 
 // ESP32 GPIO17 RX receives the Uno D6 signal at 3.3 V logic.
 // One-way link: no ESP32 TX connection is required.
@@ -29,6 +30,13 @@ uint32_t lastSerialReportMs = 0;
 uint8_t injectedFault = 0;
 float faultLimitedSpeed = 0;
 uint32_t lastSpeedMs = 0;
+
+// Simulated engine RPM: the D7 speed is run through a 6-speed gearbox model.
+// Ratios are engine rpm per km/h; 6th gear gives about 14,400 rpm at 300 km/h.
+constexpr float GEAR_RPM_PER_KMH[6] = {120, 90, 73, 62, 54, 48};
+constexpr float IDLE_RPM = 1300, RPM_REDLINE = 15000;
+uint8_t gear = 0; // 0 = neutral.
+float simulatedRpm = 0;
 
 // TPS closed / wide-open endpoints, learned from the dashboard and kept in NVS.
 constexpr float TPS_DEFAULT_CLOSED_RAW = 76, TPS_DEFAULT_WOT_RAW = 893;
@@ -109,6 +117,21 @@ void updateDiagnostics() {
   else if (ect.value <= COOLANT_WARNING_OFF_C) coolantWarning = false;
 }
 
+// Shift points follow throttle like a rider: light throttle shifts up near
+// 6000 rpm, wide open near 12,000 rpm. The hysteresis keeps a gear change
+// from immediately reversing.
+void updateGearbox(bool fresh) {
+  if (!fresh || !smartKeyOn) { gear = 0; simulatedRpm = 0; return; }
+  if (faultLimitedSpeed < 1.0f) { gear = 0; simulatedRpm = IDLE_RPM; return; }
+  const SensorReading tps = convertTps(rawValues[4], tpsClosedRaw, tpsWotRaw, channelVoltage(4));
+  const float throttle = tps.available ? tps.value : 0;
+  const float upshiftRpm = 6000 + 60 * throttle, downshiftRpm = 3000 + 25 * throttle;
+  if (gear == 0) gear = 1;
+  while (gear < 6 && faultLimitedSpeed * GEAR_RPM_PER_KMH[gear - 1] > upshiftRpm) ++gear;
+  while (gear > 1 && faultLimitedSpeed * GEAR_RPM_PER_KMH[gear - 1] < downshiftRpm) --gear;
+  simulatedRpm = constrain(faultLimitedSpeed * GEAR_RPM_PER_KMH[gear - 1], IDLE_RPM, RPM_REDLINE);
+}
+
 void appendDtcList(String& json, uint8_t autoMask, uint8_t injectedMask) {
   json += F(",\"dtc\":[");
   bool first = true;
@@ -129,6 +152,37 @@ void appendDtcList(String& json, uint8_t autoMask, uint8_t injectedMask) {
     json += '}';
   }
   json += ']';
+}
+
+// Feeds the local TFT the same values /api/live reports.
+void updateLocalDisplay() {
+  DisplayData d{};
+  const bool stale = !havePacket || uint32_t(millis() - lastPacketMs) > 3000;
+  d.link = !havePacket ? DisplayData::WAITING : stale ? DisplayData::STALE : DisplayData::LIVE;
+  d.keyOn = smartKeyOn;
+  d.brake = brakePressed;
+  const uint8_t activeInjected = !stale && smartKeyOn ? injectedFault : 0;
+  const uint8_t activeAuto = !stale && smartKeyOn ? autoFaultMask : 0;
+  d.checkEngine = activeInjected | activeAuto;
+  d.coolantWarning = !stale && coolantWarning;
+  d.speedKmh = faultLimitedSpeed;
+  d.rpm = simulatedRpm;
+  d.gear = gear;
+  for (uint8_t i = 0; i < 5 && !d.dtcCode; ++i) {
+    const uint8_t bit = 1 << i;
+    if (!((activeAuto | activeInjected) & bit)) continue;
+    d.dtcCode = activeInjected & bit ? SENSOR_DTCS[i].general
+              : autoFaultHighMask & bit ? SENSOR_DTCS[i].high : SENSOR_DTCS[i].low;
+    d.dtcSensor = names[i];
+    d.milBlink = SENSOR_DTCS[i].blink;
+  }
+  d.iat = convertTemperature(IAT_MODEL, channelVoltage(0));
+  d.ect = convertTemperature(ECT_MODEL, channelVoltage(1));
+  d.o2 = convertOxygen(channelVoltage(2));
+  d.map = convertMap(channelVoltage(3));
+  d.tps = convertTps(rawValues[4], tpsClosedRaw, tpsWotRaw, channelVoltage(4));
+  d.frequencyHz = frequencyHz;
+  localDisplay::update(d);
 }
 
 String telemetryJson() {
@@ -154,6 +208,8 @@ String telemetryJson() {
   json += F(",\"tps_closed_raw\":"); json += String(tpsClosedRaw, 1);
   json += F(",\"tps_wot_raw\":"); json += String(tpsWotRaw, 1);
   json += F(",\"simulated_speed_kmh\":"); json += String(faultLimitedSpeed, 1);
+  json += F(",\"simulated_rpm\":"); json += String(simulatedRpm, 0);
+  json += F(",\"gear\":"); json += gear;
   if (!smartKeyOn) { json += F(",\"sensors\":null,\"frequency_hz\":0,\"engine_rpm\":0}"); return json; }
   json += F(",\"adc_reference_v\":5.000,\"voltage_reference\":\"nominal_unverified\",\"sensors\":{");
   for (uint8_t i = 0; i < 5; ++i) {
@@ -197,6 +253,7 @@ void setup() {
   Serial.begin(115200);
 
 
+  localDisplay::begin();
   nodemcu.begin(19200, SWSERIAL_8N1, 17, 16, false, 256);
   settings.begin("ecu-testbench", false);
   tpsClosedRaw = settings.getFloat("tpsClosed", TPS_DEFAULT_CLOSED_RAW);
@@ -328,6 +385,8 @@ void loop() {
     else faultLimitedSpeed = max(target, faultLimitedSpeed-step);
   }
   lastSpeedMs = now;
+  updateGearbox(fresh);
+  updateLocalDisplay();
   server.handleClient();
   yield();
 }
