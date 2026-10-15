@@ -7,6 +7,7 @@
 #include "SensorConversion.h"
 #include "DashboardAssets.h"
 #include "LocalDisplay.h"
+#include "BatteryMonitor.h"
 
 // ESP32 GPIO17 RX receives the Nano D6 signal at 3.3 V logic.
 // One-way link: no ESP32 TX connection is required.
@@ -25,6 +26,7 @@ float rawValues[5] = {};
 float frequencyHz = 0;
 bool smartKeyOn = false, brakePressed = false;
 float mappedRpm = 0;
+float referenceVoltage[2] = {}; // Nano A5 (5 V) and A6 (3.3 V) supply references.
 uint32_t sampleSequence = 0;
 uint32_t lastSerialReportMs = 0;
 uint8_t injectedFault = 0;
@@ -60,23 +62,28 @@ bool parseFrame(char* text) {
   const unsigned long expected = strtoul(star + 1, &end, 16);
   if (*end || expected != checksum) return false;
   *star = '\0';
-  if (strncmp(text, "U3,", 3) != 0) return false;
-  unsigned long values[9];
+  if (strncmp(text, "U4,", 3) != 0) return false;
+  // key, brake, 5 x ADC (1/16 counts), Hz x100, RPM x100, Reference 1 and 2 in mV.
+  constexpr uint8_t FIELD_COUNT = 11;
+  constexpr unsigned long maximum[FIELD_COUNT] = {
+      1, 1, 16368, 16368, 16368, 16368, 16368, 100000000UL, 30000, 6000, 6000};
+  unsigned long values[FIELD_COUNT];
   char* p = text + 3;
-  for (uint8_t i = 0; i < 9; ++i) {
+  for (uint8_t i = 0; i < FIELD_COUNT; ++i) {
     if (*p < '0' || *p > '9') return false;
     values[i] = strtoul(p, &end, 10);
-    if (i < 8) {
-      const unsigned long maximum = i < 2 ? 1UL : i < 7 ? 16368UL : 100000000UL;
-      if (values[i] > maximum || *end != ',') return false;
+    if (values[i] > maximum[i]) return false;
+    if (i < FIELD_COUNT - 1) {
+      if (*end != ',') return false;
       p = end + 1;
-    } else if (*end || values[i] > 30000UL) return false;
+    } else if (*end) return false;
   }
   smartKeyOn = values[0] == 1;
   brakePressed = values[1] == 1;
   for (uint8_t i = 0; i < 5; ++i) rawValues[i] = smartKeyOn ? values[i + 2] / 16.0f : 0;
   frequencyHz = smartKeyOn ? values[7] / 100.0f : 0;
   mappedRpm = smartKeyOn ? values[8] / 100.0f : 0;
+  for (uint8_t i = 0; i < 2; ++i) referenceVoltage[i] = smartKeyOn ? values[i + 9] / 1000.0f : 0;
   lastPacketMs = millis();
   havePacket = true;
   if (!smartKeyOn) injectedFault = 0;
@@ -167,7 +174,6 @@ void updateLocalDisplay() {
   d.coolantWarning = !stale && coolantWarning;
   d.speedKmh = faultLimitedSpeed;
   d.rpm = simulatedRpm;
-  d.gear = gear;
   for (uint8_t i = 0; i < 5 && !d.dtcCode; ++i) {
     const uint8_t bit = 1 << i;
     if (!((activeAuto | activeInjected) & bit)) continue;
@@ -182,6 +188,8 @@ void updateLocalDisplay() {
   d.map = convertMap(channelVoltage(3));
   d.tps = convertTps(rawValues[4], tpsClosedRaw, tpsWotRaw, channelVoltage(4));
   d.frequencyHz = frequencyHz;
+  d.batteryAvailable = battery::latest.available;
+  d.batteryV = battery::latest.voltage;
   localDisplay::update(d);
 }
 
@@ -210,7 +218,13 @@ String telemetryJson() {
   json += F(",\"simulated_speed_kmh\":"); json += String(faultLimitedSpeed, 1);
   json += F(",\"simulated_rpm\":"); json += String(simulatedRpm, 0);
   json += F(",\"gear\":"); json += gear;
+  if (battery::latest.available) {
+    json += F(",\"battery_v\":"); json += String(battery::latest.voltage, 2);
+    json += F(",\"battery_a\":"); json += String(battery::latest.currentA, 3);
+  } else json += F(",\"battery_v\":null,\"battery_a\":null");
   if (!smartKeyOn) { json += F(",\"sensors\":null,\"frequency_hz\":0,\"engine_rpm\":0}"); return json; }
+  json += F(",\"reference_1_v\":"); json += String(referenceVoltage[0], 3);
+  json += F(",\"reference_2_v\":"); json += String(referenceVoltage[1], 3);
   json += F(",\"adc_reference_v\":5.000,\"voltage_reference\":\"nominal_unverified\",\"sensors\":{");
   for (uint8_t i = 0; i < 5; ++i) {
     if (i) json += ',';
@@ -254,6 +268,7 @@ void setup() {
 
 
   localDisplay::begin();
+  battery::begin();
   nodemcu.begin(19200, SWSERIAL_8N1, 17, 16, false, 256);
   settings.begin("ecu-testbench", false);
   tpsClosedRaw = settings.getFloat("tpsClosed", TPS_DEFAULT_CLOSED_RAW);
@@ -360,12 +375,18 @@ void loop() {
         Serial.println(telemetryJson());
         Serial.print(F("# SMART KEY: ")); Serial.print(smartKeyOn ? F("ON") : F("OFF - acquisition locked"));
         Serial.print(F(" | BRAKE: ")); Serial.println(brakePressed ? F("PRESSED") : F("RELEASED"));
+        if (battery::latest.available) {
+          Serial.print(F("# BATTERY ")); Serial.print(battery::latest.voltage, 2);
+          Serial.print(F(" V | ")); Serial.print(battery::latest.currentA, 3); Serial.println(F(" A"));
+        } else Serial.println(F("# BATTERY: INA219 not found (GPIO21 SDA, GPIO22 SCL, 0x40)"));
         if (!smartKeyOn) { frameLength = 0; discardFrame = false; continue; }
         for (uint8_t i = 0; i < 5; ++i) {
           Serial.print(F("# ")); Serial.print(names[i]);
           Serial.print(F(" raw=")); Serial.print(rawValues[i], 2);
           Serial.print(F(" voltage=")); Serial.print(rawValues[i] * 5 / 1023, 3); Serial.println(F(" V"));
         }
+        Serial.print(F("# REF1 A5=")); Serial.print(referenceVoltage[0], 3);
+        Serial.print(F(" V | REF2 A6=")); Serial.print(referenceVoltage[1], 3); Serial.println(F(" V"));
         Serial.print(F("# D7 frequency=")); Serial.print(frequencyHz, 2);
         Serial.print(F(" Hz | mapped RPM=")); Serial.println(mappedRpm, 1);
       } else if (discardFrame || frameLength) ++badFrames;
@@ -386,6 +407,7 @@ void loop() {
   }
   lastSpeedMs = now;
   updateGearbox(fresh);
+  battery::update();
   updateLocalDisplay();
   server.handleClient();
   yield();

@@ -42,13 +42,45 @@ float rawSnapshot[5];
 float voltageSnapshot[5];
 float positionSnapshot[5];
 
+// Supply references: Reference 1 = testbench 5 V on A5, Reference 2 = 3.3 V on A6.
+const uint8_t referencePins[] = {A5, A6};
+const char* const referenceNames[] = {"reference_1_v", "reference_2_v"};
+// Internal bandgap, nominally 1.1 V (1.0-1.2 V per chip). Calibrate: measure
+// the 5 V pin with a multimeter and set BANDGAP_V = 1.100 * meter / reported.
+constexpr float BANDGAP_V = 1.100f;
+float supplyVoltage = 0;
+float referenceVoltage[2] = {};
+
+// Reads the bandgap against AVcc. Unlike analogRead against VCC, this shows
+// the actual supply, so a sagging 5 V rail is visible.
+float readSupplyVoltage() {
+  ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
+  delay(2); // Bandgap settling after the multiplexer switch.
+  uint32_t sum = 0;
+  for (uint8_t n = 0; n < 17; n++) {
+    ADCSRA |= _BV(ADSC);
+    while (ADCSRA & _BV(ADSC)) {}
+    if (n) sum += ADC; // First conversion after switching is discarded.
+  }
+  return sum ? BANDGAP_V * 1023.0f * 16 / sum : 0;
+}
+
+// Scales by the measured supply, so A5 tied to the 5 V rail reads its real value.
+float readReference(uint8_t i) {
+  analogRead(referencePins[i]);
+  delayMicroseconds(200);
+  uint32_t sum = 0;
+  for (uint8_t n = 0; n < 16; n++) sum += analogRead(referencePins[i]);
+  return sum / 16.0f * supplyVoltage / 1023.0f;
+}
+
 void publishEspSnapshot(float hz, bool keyOn, bool brakePressed, float mappedRpm) {
   uint32_t pauseStart;
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
     acquisitionEnabled = false;
     pauseStart = micros();
   }
-  sendEspSnapshot(rawSnapshot, hz, keyOn, brakePressed, mappedRpm);
+  sendEspSnapshot(rawSnapshot, hz, keyOn, brakePressed, mappedRpm, referenceVoltage);
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
     if (keyOn) serialPauseUs += uint32_t(micros() - pauseStart);
     previousD7High = (PIND & _BV(PD7)) != 0;
@@ -105,6 +137,8 @@ void setup() {
     pinMode(sensorPins[i], INPUT);
     digitalWrite(sensorPins[i], LOW); // Keep internal pull-ups disabled.
   }
+  pinMode(A5, INPUT); // A6 is analog-only: pinMode would index past the pin tables.
+  digitalWrite(A5, LOW);
   delay(1000);
   // D7 is sampled by Timer1; SoftwareSerial owns the pin-change vectors.
   // No internal pull-up: provide a valid 0-to-VCC waveform.
@@ -171,6 +205,7 @@ void loop() {
   lastPublishedRpm = displayedRpm;
   if (!smartKeyOn) {
     for (uint8_t i = 0; i < 5; i++) rawSnapshot[i] = 0;
+    referenceVoltage[0] = referenceVoltage[1] = 0;
     Serial.print(F("{\"schema\":2,\"source\":\"nano_live\",\"smart_key\":false,\"acquisition_enabled\":false,\"brake_pressed\":"));
     Serial.print(brakePressed ? F("true") : F("false"));
     Serial.println(F(",\"sensors\":null,\"frequency_hz\":0,\"engine_rpm\":0}"));
@@ -190,7 +225,14 @@ void loop() {
     if (i) Serial.print(',');
     printSensor(i);
   }
-  Serial.print(F("},\"frequency_hz\":"));
+  supplyVoltage = readSupplyVoltage();
+  for (uint8_t i = 0; i < 2; i++) referenceVoltage[i] = readReference(i);
+  Serial.print(F("},\"supply_v\":")); Serial.print(supplyVoltage, 3);
+  for (uint8_t i = 0; i < 2; i++) {
+    Serial.print(F(",\"")); Serial.print(referenceNames[i]); Serial.print(F("\":"));
+    Serial.print(referenceVoltage[i], 3);
+  }
+  Serial.print(F(",\"frequency_hz\":"));
   Serial.print(frequencyHz, 2);
   Serial.print(F(",\"engine_rpm\":"));
   Serial.print(mappedRpm, 1);
@@ -199,7 +241,7 @@ void loop() {
   Serial.print(F("# SMART KEY ON | BRAKE: "));
   Serial.println(brakePressed ? F("PRESSED - mapped RPM ramps toward zero") : F("RELEASED - mapped RPM follows input smoothly"));
   for (uint8_t i = 0; i < 5; i++) {
-    Serial.print(F("# A")); Serial.print(i); Serial.print(' ');
+    Serial.print(F("# A")); Serial.print(sensorPins[i] - A0); Serial.print(' ');
     Serial.print(sensorNames[i]);
     Serial.print(F(" | raw=")); Serial.print(rawSnapshot[i], 1);
     Serial.print(F(" | voltage=")); Serial.print(voltageSnapshot[i], 3);
@@ -225,6 +267,9 @@ void loop() {
     }
     Serial.println();
   }
+  Serial.print(F("# Supply (bandgap)=")); Serial.print(supplyVoltage, 3);
+  Serial.print(F(" V | REF1 A5=")); Serial.print(referenceVoltage[0], 3);
+  Serial.print(F(" V | REF2 A6=")); Serial.print(referenceVoltage[1], 3); Serial.println(F(" V"));
   Serial.print(F("# D7 | frequency=")); Serial.print(frequencyHz, 2); Serial.println(F(" Hz"));
   Serial.print(F("# Mapped RPM: ")); Serial.print(mappedRpm, 1);
   Serial.println(F(" / 300 (display scale, not calibrated engine RPM)"));

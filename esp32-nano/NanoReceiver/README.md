@@ -36,5 +36,17 @@ Libraries: EspSoftwareSerial (Dirk Kaar / Peter Lerup), Adafruit GFX Library, Ad
 
 Tap anywhere on the screen to switch between the CLASSIC and RACE tabs.
 
+## Battery (INA219, address 0x40)
+| INA219 | Connection |
+|---|---|
+| VCC | ESP32 3V3 |
+| GND | ESP32 GND and 12 V battery − |
+| SDA | GPIO21 |
+| SCL | GPIO22 |
+| VIN+ | 12 V battery + |
+| VIN− | + of the load (lamp, fan…), or leave open to read voltage only |
+
+Up to 26 V and ±3.2 A with the module's 0.1 Ω shunt. The dashboard battery box and the TFT RACE "Bat" tile show it even with the smart key off: below 11.8 V low, 13.2 V and above charging, above 15 V overcharging. No library needed (BatteryMonitor.h uses Wire).
+
 ## Source
 UI: ../dashboard/dist. After UI edits run `python tools/embed_dashboard.py esp32-nano/dashboard/dist esp32-nano/NanoReceiver/DashboardAssets.h` from the project root.

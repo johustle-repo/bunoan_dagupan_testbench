@@ -3,7 +3,6 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
 #include <XPT2046_Touchscreen.h>
-#include <Fonts/FreeSansBold12pt7b.h>
 #include <Fonts/FreeSansBold18pt7b.h>
 #include <Fonts/FreeSansBold24pt7b.h>
 
@@ -27,11 +26,12 @@ struct DisplayData {
   bool keyOn, brake, checkEngine, coolantWarning;
   uint8_t milBlink;        // Blink code of the first DTC, 0 = none.
   float speedKmh, rpm, frequencyHz;
-  uint8_t gear;            // 0 = neutral.
   const char* dtcCode;     // First active DTC, or nullptr.
   const char* dtcSensor;
   SensorReading ect, iat, map, tps;
   OxygenReading o2;
+  bool batteryAvailable;   // INA219 answered.
+  float batteryV;
 };
 
 namespace localDisplay {
@@ -43,7 +43,7 @@ constexpr uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
 constexpr uint16_t BG = rgb(0x0d, 0x14, 0x1e), PANEL = rgb(0x13, 0x1d, 0x29), EDGE = rgb(0x43, 0x54, 0x6b);
 constexpr uint16_t TEXT = rgb(0xf2, 0xf7, 0xfc), MUTED = rgb(0xac, 0xbd, 0xd1), ACCENT = rgb(0x66, 0xd4, 0xf1);
 constexpr uint16_t ARC = rgb(0x33, 0x46, 0x5c), TICK = rgb(0x81, 0x99, 0xb5), TICK_LABEL = rgb(0xae, 0xbd, 0xd0);
-constexpr uint16_t DIGITS = rgb(0xc7, 0xf3, 0xff), GEAR_COLOR = rgb(0xff, 0xbd, 0x64);
+constexpr uint16_t DIGITS = rgb(0xc7, 0xf3, 0xff);
 constexpr uint16_t AMBER = rgb(0xff, 0xbd, 0x64), ORANGE = rgb(0xff, 0x9b, 0x36), RED = rgb(0xff, 0x4d, 0x4d);
 constexpr uint16_t GREEN = rgb(0x42, 0xd9, 0x7c), LAMP_OFF = rgb(0x23, 0x30, 0x44), LAMP_RING = rgb(0x63, 0x73, 0x8a);
 constexpr uint16_t BAR_TRACK = rgb(0x25, 0x34, 0x48), BAR_GAP = rgb(0x11, 0x1b, 0x28), BAR_EDGE = rgb(0x4f, 0x63, 0x7b);
@@ -269,7 +269,7 @@ inline void polar(float value, float r, int& x, int& y) {
   y = CG_CY + lroundf(sinf(a) * r);
 }
 
-void renderClassicGauge(float speed, bool showNeedle, const char* digits, const char* gearText) {
+void renderClassicGauge(float speed, bool showNeedle, const char* digits) {
   GFXcanvas16& c = *gauge;
   c.fillScreen(BG);
   // 0-300 arc, ticks every 10 km/h, labels every 50.
@@ -298,11 +298,6 @@ void renderClassicGauge(float speed, bool showNeedle, const char* digits, const 
   }
   centerText(c, digits, CG_CX, 98, &FreeSansBold18pt7b, DIGITS);
   smallText(c, "km/h", CG_CX, 104, MUTED, 0);
-  // Gear indicator, top right as in the browser.
-  c.fillRoundRect(156, 0, 36, 36, 5, BG);
-  c.drawRoundRect(156, 0, 36, 36, 5, EDGE);
-  smallText(c, "GEAR", 174, 3, MUTED, 0);
-  centerText(c, gearText, 174, 32, &FreeSansBold12pt7b, GEAR_COLOR);
   tft.drawRGBBitmap(CG_X, CG_Y, c.getBuffer(), CG_W, CG_H);
 }
 
@@ -405,15 +400,13 @@ uint16_t lerpColor(uint32_t a, uint32_t b, float t) {
   return rgb(ch(16), ch(8), ch(0));
 }
 
-// Browser gradient along x: red at the foot, orange, then cyan.
+// Gradient along x: blue at the foot (low RPM) fading to red at the redline.
 uint16_t raceGradient(float vbX) {
-  const float t = (vbX - 24) / (588 - 24);
-  if (t < 0.2f) return lerpColor(0xff3b3b, 0xff9b36, t / 0.2f);
-  if (t < 0.45f) return lerpColor(0xff9b36, 0x66d4f1, (t - 0.2f) / 0.25f);
-  return ACCENT;
+  const float t = constrain((vbX - 24) / (588 - 24), 0.0f, 1.0f);
+  return lerpColor(0x2f6bff, 0xff3b3b, t);
 }
 
-void renderRaceGauge(float rpm, bool showRpm, const char* speedText, const char* gearText) {
+void renderRaceGauge(float rpm, bool showRpm, const char* speedText) {
   GFXcanvas16& c = *gauge;
   c.fillScreen(RACE_BG);
   const float total = pathLen[PATH_POINTS - 1], step = total / RACE_SEGMENTS;
@@ -441,16 +434,14 @@ void renderRaceGauge(float rpm, bool showRpm, const char* speedText, const char*
     else smallText(c, label, RG_OX + (v == 15 ? x + 14 : x) * RG_SCALE, RG_OY + (y - 21) * RG_SCALE - 7, TEXT, v == 15 ? 1 : 0);
   }
   smallText(c, "x1000 RPM", RG_OX + 588 * RG_SCALE, 36, MUTED, 1);
-  // Readouts: speed, gear, RPM.
+  // Readouts: speed and RPM, both in the large font.
   char rpmText[8];
   if (showRpm) snprintf(rpmText, sizeof(rpmText), "%d", int(lroundf(rpm / 10) * 10));
   else strcpy(rpmText, "-");
   centerText(c, speedText, 128, 84, &FreeSansBold24pt7b, TEXT);
-  centerText(c, gearText, 204, 84, &FreeSansBold18pt7b, GEAR_COLOR);
-  centerText(c, rpmText, 272, 84, &FreeSansBold12pt7b, DIGITS);
+  centerText(c, rpmText, 248, 84, &FreeSansBold24pt7b, DIGITS);
   smallText(c, "km/h", 128, 90, RACE_LABEL, 0);
-  smallText(c, "GEAR", 204, 90, RACE_LABEL, 0);
-  smallText(c, "RPM", 272, 90, RACE_LABEL, 0);
+  smallText(c, "RPM", 248, 90, RACE_LABEL, 0);
   tft.drawRGBBitmap(0, RG_Y, c.getBuffer(), RG_W, RG_H);
 }
 
@@ -480,7 +471,13 @@ void raceText(const DisplayData& d, bool running) {
   char value[16];
   for (uint8_t i = 0; i < TILE_COUNT - 1; ++i) {
     uint16_t color = TEXT;
-    if (i == 0 || !running) { strcpy(value, "--"); color = MUTED; }  // No battery input.
+    if (i == 0) {  // Battery is live with the key off, like a real bike.
+      if (d.batteryAvailable) {
+        snprintf(value, sizeof(value), "%.1f", d.batteryV);
+        color = d.batteryV < 11.8f || d.batteryV > 15.0f ? ORANGE : TEXT;
+      } else { strcpy(value, "--"); color = MUTED; }
+    }
+    else if (!running) { strcpy(value, "--"); color = MUTED; }
     else if (i == 1) snprintf(value, sizeof(value), "%.0f", d.frequencyHz);
     else if (i == 2) color = sensorText(d.ect, 1, value, sizeof(value));
     else if (i == 3) color = sensorText(d.iat, 1, value, sizeof(value));
@@ -599,28 +596,23 @@ void update(const DisplayData& d) {
   if (now - lastGaugeMs >= GAUGE_REFRESH_MS) {
     lastGaugeMs = now;
     const bool locked = live && !d.keyOn;
-    const uint8_t gearCode = running ? d.gear : locked ? 0 : 0xFF;
-    const int32_t key = (int32_t(lroundf(speed * 2)) << 16) ^ (int32_t(rpm / 50) << 4) ^ gearCode
+    const int32_t key = (int32_t(lroundf(speed * 2)) << 16) ^ (int32_t(rpm / 50) << 4)
                       ^ (selfTest << 30) ^ (running << 29) ^ (locked << 28);
     if (key != shownGaugeKey) {
       shownGaugeKey = key;
-      char gearText[4];
-      if (gearCode == 0xFF) strcpy(gearText, "-");
-      else if (gearCode == 0) strcpy(gearText, "N");
-      else snprintf(gearText, sizeof(gearText), "%u", gearCode);
       char speedText[8];
       const bool show = running || selfTest;
       if (view == CLASSIC) {
         if (show) snprintf(speedText, sizeof(speedText), "%03d", int(lroundf(speed)));
         else strcpy(speedText, locked ? "000" : "---");
-        renderClassicGauge(speed, show, speedText, gearText);
+        renderClassicGauge(speed, show, speedText);
         drawBar(173, speed / SPEED_MAX, ACCENT);
         drawBar(189, rpm / RPM_MAX, ACCENT);
         drawBar(205, running ? d.frequencyHz / 1639 : 0, ACCENT);
       } else {
         if (show) snprintf(speedText, sizeof(speedText), "%d", int(lroundf(speed)));
         else strcpy(speedText, locked ? "0" : "-");
-        renderRaceGauge(rpm, show || locked, speedText, gearText);
+        renderRaceGauge(rpm, show || locked, speedText);
       }
     }
   }
