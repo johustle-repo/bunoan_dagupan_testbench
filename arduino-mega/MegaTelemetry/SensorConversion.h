@@ -1,26 +1,57 @@
 #pragma once
 
-// Provisional linear estimates from ECU TESTBENCH DISPLAY.docx.
-// These are not verified curves for the connected simulator or ECU.
-struct SensorConversion {
-  bool available;
+// 5-sensor diagnostic formulas. Each reading is either a value or a fault
+// (signal outside the sensor's valid range), printed as "ERR".
+struct SensorReading {
+  bool fault;
   float value;
 };
 
-inline SensorConversion interpolateSensor(float voltage, float v0, float y0,
-                                          float v1, float y1) {
-  float low = v0 < v1 ? v0 : v1;
-  float high = v0 > v1 ? v0 : v1;
-  if (!(voltage >= low && voltage <= high)) return {false, 0};
-  return {true, y0 + (voltage - v0) * (y1 - y0) / (v1 - v0)};
+// IAT and ECT: non-linear lookup tables, volts falling as temperature rises.
+constexpr int IAT_TABLE_SIZE = 5;
+const float iatVoltsTable[IAT_TABLE_SIZE] = {2.806f, 2.300f, 1.850f, 1.550f, 1.300f};
+const float iatTempsTable[IAT_TABLE_SIZE] = {15.0f, 25.0f, 35.0f, 45.0f, 55.0f};
+constexpr int ECT_TABLE_SIZE = 6;
+const float ectVoltsTable[ECT_TABLE_SIZE] = {3.564f, 2.500f, 1.500f, 0.800f, 0.300f, 0.100f};
+const float ectTempsTable[ECT_TABLE_SIZE] = {20.0f, 40.0f, 65.0f, 90.0f, 110.0f, 120.0f};
+
+// Linear interpolation between table points, clamped to the table ends.
+inline float lookupTemperature(float voltage, const float* volts, const float* temps, int size) {
+  if (voltage >= volts[0]) return temps[0];
+  if (voltage <= volts[size - 1]) return temps[size - 1];
+  for (int i = 0; i < size - 1; i++) {
+    if (voltage <= volts[i] && voltage >= volts[i + 1]) {
+      const float fraction = (voltage - volts[i]) / (volts[i + 1] - volts[i]);
+      return temps[i] + fraction * (temps[i + 1] - temps[i]);
+    }
+  }
+  return temps[0];
 }
 
-inline SensorConversion convertSensor(uint8_t channel, float voltage) {
-  switch (channel) {
-    case 0: return interpolateSensor(voltage, 3.0f, 30.0f, 1.72f, 50.0f); // IAT
-    case 1: return interpolateSensor(voltage, 3.0f, 20.0f, 0.43f, 100.0f); // ECT
-    case 3: return interpolateSensor(voltage, 0.78f, 20.0f, 4.0f, 101.3f); // MAP
-    case 4: return interpolateSensor(voltage, 0.6f, 0.0f, 3.5f, 100.0f); // TPS
-    default: return {false, 0}; // O2 is voltage, not AFR.
-  }
+inline SensorReading convertIat(float v) {
+  if (v > 4.85f || v < 0.15f) return {true, 0};
+  return {false, lookupTemperature(v, iatVoltsTable, iatTempsTable, IAT_TABLE_SIZE)};
+}
+
+inline SensorReading convertEct(float v) {
+  if (v > 4.85f || v < 0.10f) return {true, 0};
+  return {false, lookupTemperature(v, ectVoltsTable, ectTempsTable, ECT_TABLE_SIZE)};
+}
+
+// MAP: 0 V = 10 kPa, 4.21 V = 100 kPa.
+inline SensorReading convertMap(float v) {
+  if (v > 4.60f) return {true, 0};
+  return {false, 10.0f + v * (100.0f - 10.0f) / 4.21f};
+}
+
+// O2 to AFR: 0.1 V = 15.2:1 (lean), 0.9 V = 14.0:1 (rich).
+inline SensorReading convertAfr(float v) {
+  if (v > 1.20f || v < 0.02f) return {true, 0};
+  return {false, 15.2f + (v - 0.1f) * (14.0f - 15.2f) / (0.9f - 0.1f)};
+}
+
+// TPS: 0 V = 0 %, 4.25 V = 100 %.
+inline SensorReading convertTps(float v) {
+  if (v > 4.75f) return {true, 0};
+  return {false, constrain(v * 100.0f / 4.25f, 0.0f, 100.0f)};
 }

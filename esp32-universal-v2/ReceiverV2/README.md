@@ -4,14 +4,15 @@ The universal receiver (Arduino Uno, Nano or Mega, detected from each packet) ru
 
 Sender sketches: `Arduino-Uno-Testbench-Firmware/DashboardTelemetry` (Uno, U3 frames), `arduino-nano/NanoTelemetry` (Nano, U4) or `arduino-mega/MegaTelemetry` (Mega 2560, U5: the U4 fields plus battery voltage and current; Reference 1/2 and the battery are 0–30 V divider inputs). /api/live reports `"board": "uno" | "nano" | "mega"` and the source `<board>_via_esp32`.
 
+- **Speed and RPM** come from the D7 frequency for every board, as on the Mega: speed = Hz ÷ 6 km/h (max 250, ramps to 0 at 100 km/h per second with the brake or an injected fault) and RPM = Hz × 15000 ÷ 1549 (1549 Hz = 15,000 rpm, max 15,000).
 - Wi-Fi: ECU-Testbench, password ECUdemo2026, http://192.168.4.1/
 - /api/live, /api/health, /api/simulate-fault and /api/tps-learn work the same as in v1.
 
 ## What's new on the display
-- **Three tabs, picked by touch:** CLASSIC, RACE and SENSORS. Tap a tab to open it, or tap anywhere below the tabs to go to the next one.
-- **CLASSIC:** larger speedometer with a red zone above 250 km/h, seven-segment speed digits, glowing lamps, a sensor column in a larger font, and a full-width DTC line.
-- **RACE:** curved 50-segment RPM bar, speed and RPM in seven-segment digits, and larger tiles. The battery tile turns green when charging (≥ 13.2 V).
-- **SENSORS (new):** one row per channel (IAT, ECT, O2, MAP, TPS) with a 0-5 V pin-voltage bar marking the 0.20 / 4.80 V fault thresholds, the voltage, the converted value, and a circuit status: OK, OUT OF SPEC, LOW... / HIGH... (DTC pending), the confirmed DTC code, or "INJ" for a fault injected from the dashboard. Below it: board (Uno U3 / Nano U4 / Mega U5), link state, packet age, bad frames, Reference 1/2, D7 frequency, simulated engine RPM, battery (Mega only), speed, learned TPS endpoints, and the Wi-Fi address.
+- **Three screens, no tabs:** CLASSIC, RACE and SENSORS. Double-tap anywhere on the screen to go to the next one; a single tap does nothing.
+- **CLASSIC:** 0–15,000 rpm tachometer on a plain dial-face background (labels 0, 3, 6, 9, 12, 15 ×1000, red zone above 12,000) with the RPM digits in the centre, a km/h cell with the speed under the gauge, glowing lamps, a sensor column in a larger font, and a full-width DTC line.
+- **RACE:** REF 1 and REF 2 across the top, an LED indicator strip (KEY, BRAKE, WINKER, CHECK, TEMP, ABS, TCS), curved 50-segment RPM bar, speed and RPM in seven-segment digits, and tiles for Bat, ECT, IAT, MAP, O2 V, AFR and TPS. The battery tile turns green when charging (≥ 13.2 V).
+- **SENSORS (new):** one row per channel (IAT, ECT, O2, MAP, TPS) with a 0-5 V pin-voltage bar marking the 0.20 / 4.80 V fault thresholds, the voltage, the converted value, and a circuit status: OK, OUT OF SPEC, LOW... / HIGH... (DTC pending), the confirmed DTC code, or "INJ" for a fault injected from the dashboard. Below it: board (Uno U3 / Nano U4 / Mega U5), link state, packet age, bad frames, Reference 1/2, D7 frequency, engine RPM, battery (Mega only), speed, learned TPS endpoints, and the Wi-Fi address.
 - The header shows the detected board (UNO / NANO / MEGA) next to the LIVE / KEY OFF / NO LINK pill.
 - Gauges are drawn off-screen in bands and pushed to the panel, so there is no flicker and no full-screen buffer is needed (the ESP32 has no PSRAM).
 
@@ -44,10 +45,10 @@ Same wiring as ESP32_Touch_Games:
 | SCK + T_CLK | GPIO18 |
 | SDO (MISO) + T_DO | GPIO19 |
 | T_CS | GPIO33 |
-| T_IRQ | GPIO32 (**required now**: used for touch detection and recalibration) |
+| T_IRQ | GPIO32 (**required**: used for touch detection) |
 | SD_* | not connected |
 
-**Touch calibration** is shared with ESP32_Touch_Games / ESP32_LGFX_Touch_Test (NVS key `lgfxtouch/cal`), so a panel you already calibrated there works right away. On a fresh ESP32 the calibration screen appears at the first boot: tap the arrow tip in each corner. The receiver starts after that. To calibrate again, hold a finger on the screen while you press EN/reset, then release it when asked.
+**No touch calibration:** the screen is switched with a double tap, which only needs to detect a press, so there is no calibration screen. At power-up the ESP32 plays an ECU TESTBENCH boot animation (about 3 s: a tachometer ring sweeps up, the title fades in and a loading bar fills) and then shows the CLASSIC screen. A calibration saved earlier in NVS `lgfxtouch/cal` is still applied if present.
 
 The SPI clock is 27 MHz, the value the games sketch was tested with. Most ST7796S modules also run at 40 MHz (`TFT_SPI_HZ` in LocalDisplay.h), which makes the gauges about a third faster.
 

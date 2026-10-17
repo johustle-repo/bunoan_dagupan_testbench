@@ -5,11 +5,13 @@ A separate sketch from `esp32-universal-v2`. The ESP32 receives the testbench fr
 | Screen item | Source |
 |---|---|
 | 0-200 km/h gauge and speed bar | Testbench D7 speed knob (same speed as the universal receiver; above 200 the needle stays at full scale, the digits keep counting) |
-| BATTERY | Mega A7, 0-30 V. Green ≥ 13.2 V, orange < 11.8 V or > 15 V. Live with the key off |
-| CURRENT | Mega A8, 0-10 A. Live with the key off |
+| BATTERY | Mega A7, 0-30 V. Green ≥ 13.2 V, orange < 11.8 V or > 15 V |
+| CURRENT | Mega A8, 0-10 A |
 | REF1 | Mega A5, 0-30 V |
 | BRAKE ON / OFF | Brake switch D9 |
 | Title corner | WAITING / NO LINK / KEY OFF, then SIM (no output pin) or the output frequency |
+
+**Power-on animation:** the Mega has no smart-key button (D8 is unused), so every time the system powers up the ESP32 shows an ABS TESTER splash with a loading bar, then sweeps the needle and speed bar 0 → 200 → 0 km/h with the brake lamp lit (about 3 s) before live readings start.
 
 **START / STOP** turns the wheel-speed output on and off; **RESET** turns it off. There is no Wi-Fi dashboard.
 

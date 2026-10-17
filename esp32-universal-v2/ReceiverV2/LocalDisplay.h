@@ -4,11 +4,11 @@
 #include <Preferences.h>
 
 // Local 4.0" ST7796S TFT + XPT2046 touch panel (landscape 480 x 320) showing
-// the instrument panel of the browser dashboard in three tabs:
-//   CLASSIC - speedometer, lamps, sensor column, readout grid and DTC line
-//   RACE    - lamp strip, curved segmented RPM bar, speed / RPM, tiles
+// the instrument panel of the browser dashboard in three screens:
+//   CLASSIC - tachometer (RPM), lamps, sensor column, readout grid and DTC line
+//   RACE    - REF 1 / REF 2, LED indicator strip, curved RPM bar, speed / RPM, tiles
 //   SENSORS - per-channel volts, value and circuit status, link and battery info
-// Tap a tab to open it, or tap anywhere below the tabs for the next one.
+// There are no tabs: double-tap anywhere on the screen for the next screen.
 // Display and touch share the VSPI bus with separate chip selects; none of
 // these pins overlap the Uno/Nano/Mega link on GPIO16/17.
 constexpr int8_t PIN_TFT_SCK = 18, PIN_TFT_MISO = 19, PIN_TFT_MOSI = 23;
@@ -26,7 +26,7 @@ constexpr uint32_t TFT_SPI_HZ = 27000000;
 // waits for the DMA first. Without this the panel shows half-drawn bands.
 constexpr uint32_t GAUGE_REFRESH_MS = 50, TEXT_REFRESH_MS = 100, TOUCH_POLL_MS = 20;
 constexpr uint32_t SELF_TEST_MS = 2000;
-constexpr float SPEED_MAX = 300, RPM_MAX = 15000;
+constexpr float SPEED_MAX = 250, RPM_MAX = 15000;
 
 // Snapshot of what the panel shows, filled by the sketch each loop.
 struct DisplayData {
@@ -144,7 +144,8 @@ LGFX_Sprite throttleSprite(&lcd);
 constexpr uint8_t VIEW_COUNT = 3;
 enum View : uint8_t { CLASSIC, RACE, SENSORS } view = CLASSIC;
 const char* const VIEW_NAMES[VIEW_COUNT] = {"CLASSIC", "RACE", "SENSORS"};
-constexpr int TAB_X0 = 4, TAB_STEP = 92, TAB_W = 88, TAB_Y = 4, TAB_H = 28;
+constexpr int TAB_Y = 4, TAB_H = 28;           // Header row: status pill, board, REF boxes.
+constexpr uint32_t DOUBLE_TAP_MS = 400;        // Second tap within this time switches screen.
 
 bool wasTouched = false, wasRunning = false, selfTestActive = false;
 uint32_t lastTapMs = 0, lastPressMs = 0, lastTouchPollMs = 0;
@@ -158,7 +159,7 @@ constexpr uint8_t SLOT_COUNT = 64;
 char shown[SLOT_COUNT][40];
 uint16_t shownColor[SLOT_COUNT];
 enum Slot : uint8_t {
-  S_STATUS, S_DTC, S_BOARD, S_TP_ICON, S_TP_ANGLE,
+  S_STATUS, S_DTC, S_BOARD, S_TP_ICON, S_TP_ANGLE, S_REF1, S_REF2,
   S_LAMP0 = 8, S_VALUE0 = 16
 };
 
@@ -194,7 +195,7 @@ void field(uint8_t slot, int x, int y, textdatum_t datum, const lgfx::IFont* fon
 
 // Sensor value with the browser's formatting; returns the colour to use.
 uint16_t sensorText(const SensorReading& r, uint8_t decimals, char* out, size_t size) {
-  if (!r.available) { strlcpy(out, "--", size); return RED; }
+  if (!r.available) { strlcpy(out, "ERR", size); return RED; }  // Fault, as the Mega prints it.
   snprintf(out, size, "%.*f", decimals, r.value);
   if (strlen(out) > 5) snprintf(out, size, "%.0f", r.value);
   return r.inSpec ? TEXT : AMBER;
@@ -264,19 +265,24 @@ void drawClassicLamp(uint8_t i, uint16_t color) {
   label(lcd, LAMP_NAMES[i], 34, cy, color ? color : LAMP_WIRED[i] ? MUTED : LAMP_RING, textdatum_t::middle_left);
 }
 
+// RACE indicator strip: one LED per lamp with its name beside it.
 void drawRaceLamp(uint8_t i, uint16_t color) {
   char tag[8];
   snprintf(tag, sizeof(tag), "%u", color);
   if (!changed(S_LAMP0 + i, tag, color)) return;
-  const int x = 3 + i * 68, y = 41, w = 66, h = 24;
+  const int x = 3 + i * 68, y = 41, w = 66, h = 24, cx = x + 10, cy = y + h / 2;
   lcd.fillRect(x, y, w, h, RACE_BG);
-  if (color) lcd.fillRoundRect(x, y, w, h, 4, color);
-  else if (LAMP_WIRED[i]) lcd.fillRoundRect(x, y, w, h, 4, RACE_TRACK);
-  else for (int dx = 0; dx < w; dx += 6) {  // Dashed outline: not wired.
-    lcd.drawFastHLine(x + dx, y, 3, RACE_NA);
-    lcd.drawFastHLine(x + dx, y + h - 1, 3, RACE_NA);
+  if (color) {
+    lcd.fillCircle(cx, cy, 9, lerpColor(0x06090e, to888(color), 0.35f));  // Glow.
+    lcd.fillCircle(cx, cy, 6, color);
+    lcd.fillCircle(cx - 2, cy - 2, 2, TEXT);                              // Highlight.
+  } else if (LAMP_WIRED[i]) {
+    lcd.fillCircle(cx, cy, 6, RACE_TRACK);
+    lcd.drawCircle(cx, cy, 6, RACE_DIM);
+  } else {
+    for (int a = 0; a < 360; a += 45) lcd.fillArc(cx, cy, 6, 5, a, a + 20, RACE_NA);  // Dashed: not wired.
   }
-  label(lcd, LAMP_NAMES[i], x + w / 2, y + h / 2, color ? RACE_BG : RACE_DIM, textdatum_t::middle_center);
+  label(lcd, LAMP_NAMES[i], x + 20, cy, color ? color : LAMP_WIRED[i] ? RACE_DIM : RACE_NA, textdatum_t::middle_left);
 }
 
 // ---- Throttle angle --------------------------------------------------------
@@ -338,51 +344,62 @@ void drawThrottle(int x, int y, uint16_t bg, bool has, float deg) {
 }
 
 // ---- Classic display -------------------------------------------------------
-// Lamps 0-86 | speedometer and readout grid 88-379 | sensor column 381-479.
-constexpr int CG_X = 90, CG_Y = 40, CG_W = 288, CG_H = 186, CG_BAND = 31;  // Speedometer.
+// Lamps 0-86 | tachometer and readout grid 88-379 | sensor column 381-479.
+constexpr int CG_X = 90, CG_Y = 40, CG_W = 288, CG_H = 186, CG_BAND = 31;  // Tachometer.
 constexpr int CG_CX = 144, CG_CY = 176, CG_R = 134;
-// Readout grid under the speedometer: km/h, RPM, Current / Ref 1, Ref 2, Battery.
+// Readout grid under the tachometer: km/h, RPM, Current / Ref 1, Ref 2, Battery.
 constexpr int GRID_X = 88, GRID_Y = 228, GRID_W = 292, GRID_ROW1 = 34, GRID_ROW2 = 33;
 constexpr int GRID_COL_X[4] = {GRID_X, GRID_X + 97, GRID_X + 194, GRID_X + GRID_W};
 const char* const GRID_LABELS[6] = {"km/h", "RPM", "CURRENT", "REFERENCE 1", "REFERENCE 2", "BATTERY"};
 enum : uint8_t { CL_GRID0 = S_VALUE0 + 8 };  // 6 slots after the sensor column's.
 constexpr int SC_X = 381, SC_ROW = 56;  // Sensor column.
-const char* const CLASSIC_SENSORS[5] = {"AIT C", "ECT C", "O2 lambda", "MAP kPa", "TPS %"};
+const char* const CLASSIC_SENSORS[5] = {"AIT C", "ECT C", "O2 V", "MAP kPa", "TPS %"};
 
-inline void polar(float value, float r, int oy, float& x, float& y) {
-  const float a = PI + value / SPEED_MAX * PI;
+inline void polar(float rpm, float r, int oy, float& x, float& y) {
+  const float a = PI + rpm / RPM_MAX * PI;
   x = CG_CX + cosf(a) * r;
   y = CG_CY - oy + sinf(a) * r;
 }
 
-void renderClassicGauge(float speed, bool showNeedle, const char* digits) {
+// Tachometer: a plain dial-face background, the arc with a red zone above
+// 12,000 rpm, ticks every 1,000 rpm and labels 0, 3, 6, 9, 12, 15 (x1000).
+constexpr uint16_t CG_FACE = rgb(0x16, 0x22, 0x30), CG_FACE_INNER = rgb(0x11, 0x1a, 0x26);
+constexpr float CG_REDLINE_RPM = 12000;
+
+void renderClassicGauge(float rpm, bool showNeedle, const char* digits) {
   if (!gaugeBand[0].getBuffer() || !gaugeBand[1].getBuffer()) return;
   for (int oy = 0, band = 0; oy < CG_H; oy += CG_BAND, ++band) {
     LGFX_Sprite& c = gaugeBand[band & 1];
     c.fillScreen(BG);
     const int cy = CG_CY - oy;
-    label(c, "SIMULATED SPEED 0-300", CG_CX, 4 - oy, MUTED, textdatum_t::top_center, &fonts::Font0);
-    // 0-300 arc, red zone above 250, ticks every 10 km/h, labels every 50.
-    c.fillArc(CG_CX, cy, CG_R + 2, CG_R - 1, 180, 330, ARC);
-    c.fillArc(CG_CX, cy, CG_R + 2, CG_R - 1, 330, 360, lerpColor(0x33465c, 0xff4d4d, 0.6f));
-    for (int i = 0; i <= 30; ++i) {
+    // Background: dial face with a darker centre and a thin edge.
+    c.fillArc(CG_CX, cy, CG_R + 6, 0, 180, 360, CG_FACE);
+    c.fillArc(CG_CX, cy, CG_R - 50, 0, 180, 360, CG_FACE_INNER);
+    c.fillArc(CG_CX, cy, CG_R + 6, CG_R + 5, 180, 360, EDGE);
+    c.fillArc(CG_CX, cy, CG_R + 2, CG_R - 1, 180, 324, ARC);
+    c.fillArc(CG_CX, cy, CG_R + 2, CG_R - 1, 324, 360, RED);
+    for (int i = 0; i <= 15; ++i) {
+      const bool major = i % 3 == 0;
+      const uint16_t color = i * 1000 >= CG_REDLINE_RPM ? RED : TICK;
       float x1, y1, x2, y2;
-      polar(i * 10, CG_R - 3, oy, x1, y1);
-      polar(i * 10, i % 5 ? CG_R - 10 : CG_R - 16, oy, x2, y2);
-      c.drawWideLine(x1, y1, x2, y2, i % 5 ? 0.6f : 1.2f, TICK);
-      if (i % 5 == 0) {
+      polar(i * 1000, CG_R - 3, oy, x1, y1);
+      polar(i * 1000, major ? CG_R - 16 : CG_R - 10, oy, x2, y2);
+      c.drawWideLine(x1, y1, x2, y2, major ? 1.6f : 0.8f, color);
+      if (major) {
         float tx, ty;
-        polar(i * 10, CG_R - 32, oy, tx, ty);
+        polar(i * 1000, CG_R - 32, oy, tx, ty);
         char text[4];
-        snprintf(text, sizeof(text), "%d", i * 10);
-        label(c, text, tx, ty, TICK_LABEL, textdatum_t::middle_center);
+        snprintf(text, sizeof(text), "%d", i);
+        label(c, text, tx, ty, i * 1000 >= CG_REDLINE_RPM ? RED : TICK_LABEL, textdatum_t::middle_center,
+              &fonts::FreeSansBold12pt7b);
       }
     }
-    label(c, digits, CG_CX, cy - 50, DIGITS, textdatum_t::middle_center, &fonts::Font7);
-    label(c, "km/h", CG_CX, cy - 16, MUTED, textdatum_t::middle_center);
+    label(c, "x1000 r/min", CG_CX, cy - 76, MUTED, textdatum_t::middle_center, &fonts::Font0);
+    label(c, digits, CG_CX, cy - 44, DIGITS, textdatum_t::middle_center, &fonts::FreeSansBold18pt7b);
+    label(c, "RPM", CG_CX, cy - 20, MUTED, textdatum_t::middle_center);
     if (showNeedle) {
       float tx, ty, bx, by;
-      const float v = constrain(speed, 0.0f, SPEED_MAX);
+      const float v = constrain(rpm, 0.0f, RPM_MAX);
       polar(v, CG_R - 14, oy, tx, ty);
       polar(v, -12, oy, bx, by);  // Short tail behind the hub.
       c.drawWideLine(bx, by, tx, ty, 2.2f, ACCENT);
@@ -421,8 +438,10 @@ void classicText(const DisplayData& d, bool running, float speed, float rpm) {
     uint16_t color = MUTED;
     if (!running) strcpy(value, "--");
     else if (i < 2) color = sensorText(*temps[i], 1, value, sizeof(value));
-    else if (i == 2) { snprintf(value, sizeof(value), "%.2f", d.o2.lambda); color = mixtureColor(d.o2); }
-    else color = sensorText(d.map, 1, value, sizeof(value));
+    else if (i == 2) {
+      if (d.o2.afrAvailable) { snprintf(value, sizeof(value), "%.2f", d.o2.volts); color = mixtureColor(d.o2); }
+      else { strcpy(value, "ERR"); color = RED; }
+    } else color = sensorText(d.map, 1, value, sizeof(value));
     field(S_VALUE0 + i, SC_X + 6, 40 + i * SC_ROW + 24, textdatum_t::top_left, &fonts::Font4, color, BG, value, 92);
   }
   // TPS row: throttle-body symbol, whole percent and plate end angles.
@@ -443,7 +462,7 @@ void classicText(const DisplayData& d, bool running, float speed, float rpm) {
   for (uint8_t i = 0; i < 6; ++i) {
     uint16_t color = TEXT;
     switch (i) {
-      case 0: if (show) snprintf(value, sizeof(value), "%.1f", speed); else { strcpy(value, "--"); color = MUTED; } break;
+      case 0: if (show) snprintf(value, sizeof(value), "%.0f", speed); else { strcpy(value, "--"); color = MUTED; } break;
       case 1: if (show) snprintf(value, sizeof(value), "%.0f", rpm); else { strcpy(value, "--"); color = MUTED; } break;
       case 2:  // Mega A8, live with the key off like the battery.
         if (d.batteryAvailable) snprintf(value, sizeof(value), "%.2f A", d.currentA);
@@ -569,22 +588,24 @@ void renderRaceGauge(float rpm, bool showRpm, const char* speedText) {
   }
 }
 
-constexpr uint8_t TILE_COUNT = 8;
-const char* const TILE_LABELS[TILE_COUNT] = {"Bat", "D7", "TEng", "TAir", "MAP", "O2 lambda", "AFR", "TPS %"};
-const char* const TILE_UNITS[TILE_COUNT] = {"V", "Hz", "C", "C", "kPa", "", ":1", ""};
-constexpr int TILE_W = 116, TILE_H = 46, TILE_HEAD = 15;
-inline int tileX(uint8_t i) { return 2 + (i % 4) * 120; }
-inline int tileY(uint8_t i) { return 222 + (i / 4) * 49; }
+// Tiles: four on the top row, three wider ones below.
+constexpr uint8_t TILE_COUNT = 7;
+const char* const TILE_LABELS[TILE_COUNT] = {"Bat", "ECT", "IAT", "MAP", "O2 V", "AFR", "TPS %"};
+const char* const TILE_UNITS[TILE_COUNT] = {"V", "C", "C", "kPa", "", ":1", ""};
+constexpr int TILE_H = 46, TILE_HEAD = 15;
+inline int tileW(uint8_t i) { return i < 4 ? 116 : 156; }
+inline int tileX(uint8_t i) { return i < 4 ? 2 + i * 120 : 2 + (i - 4) * 160; }
+inline int tileY(uint8_t i) { return 222 + (i < 4 ? 0 : 49); }
 
 void drawRaceFrame() {
   for (uint8_t i = 0; i < TILE_COUNT; ++i) {
-    const int x = tileX(i), y = tileY(i);
-    lcd.fillRoundRect(x, y, TILE_W, TILE_H, 6, TILE_BG);
-    lcd.drawRoundRect(x, y, TILE_W, TILE_H, 6, TILE_EDGE);
+    const int x = tileX(i), y = tileY(i), w = tileW(i);
+    lcd.fillRoundRect(x, y, w, TILE_H, 6, TILE_BG);
+    lcd.drawRoundRect(x, y, w, TILE_H, 6, TILE_EDGE);
     for (int r = 0; r < TILE_HEAD; ++r)  // Green header, #6be594 -> #2c9a52 like the browser.
-      lcd.drawFastHLine(x + (r ? 1 : 4), y + 1 + r, TILE_W - (r ? 2 : 8), lerpColor(0x6be594, 0x2c9a52, r / float(TILE_HEAD - 1)));
-    label(lcd, TILE_LABELS[i], x + TILE_W / 2, y + 1 + TILE_HEAD / 2, TILE_INK, textdatum_t::middle_center);
-    label(lcd, TILE_UNITS[i], x + TILE_W - 6, y + TILE_H - 4, MUTED, textdatum_t::bottom_right);
+      lcd.drawFastHLine(x + (r ? 1 : 4), y + 1 + r, w - (r ? 2 : 8), lerpColor(0x6be594, 0x2c9a52, r / float(TILE_HEAD - 1)));
+    label(lcd, TILE_LABELS[i], x + w / 2, y + 1 + TILE_HEAD / 2, TILE_INK, textdatum_t::middle_center);
+    label(lcd, TILE_UNITS[i], x + w - 6, y + TILE_H - 4, MUTED, textdatum_t::bottom_right);
   }
 }
 
@@ -599,12 +620,13 @@ void raceText(const DisplayData& d, bool running) {
       } else { strcpy(value, "--"); color = MUTED; }
     }
     else if (!running) { strcpy(value, "--"); color = MUTED; }
-    else if (i == 1) snprintf(value, sizeof(value), "%.0f", d.frequencyHz);
-    else if (i == 2) color = sensorText(d.ect, 1, value, sizeof(value));
-    else if (i == 3) color = sensorText(d.iat, 1, value, sizeof(value));
-    else if (i == 4) color = sensorText(d.map, 1, value, sizeof(value));
-    else if (i == 5) { snprintf(value, sizeof(value), "%.2f", d.o2.lambda); color = mixtureColor(d.o2); }
-    else if (i == 6) { if (d.o2.afrAvailable) snprintf(value, sizeof(value), "%.1f", d.o2.afr); else strcpy(value, "--"); }
+    else if (i == 1) color = sensorText(d.ect, 1, value, sizeof(value));
+    else if (i == 2) color = sensorText(d.iat, 1, value, sizeof(value));
+    else if (i == 3) color = sensorText(d.map, 1, value, sizeof(value));
+    else if (i == 4) {
+      if (d.o2.afrAvailable) { snprintf(value, sizeof(value), "%.2f", d.o2.volts); color = mixtureColor(d.o2); }
+      else { strcpy(value, "ERR"); color = RED; }
+    } else if (i == 5) { if (d.o2.afrAvailable) snprintf(value, sizeof(value), "%.1f", d.o2.afr); else { strcpy(value, "ERR"); color = RED; } }
     field(S_VALUE0 + i, tileX(i) + 8, tileY(i) + 18, textdatum_t::top_left, &fonts::Font4, color, TILE_BG, value, 74);
   }
   // TPS tile: whole percent and end angles on the left, throttle body on the right.
@@ -620,7 +642,7 @@ void raceText(const DisplayData& d, bool running) {
   // Only the first plate end fits beside the icon ("293" of "293-113").
   if (char* dash = strchr(angle, '-')) *dash = '\0';
   field(S_TP_ANGLE, tileX(t) + 52, tileY(t) + 34, textdatum_t::top_left, &fonts::Font0, ORANGE, TILE_BG, angle, 30);
-  drawThrottle(tileX(t) + TILE_W - TP_SIZE - 2, tileY(t) + TILE_HEAD + 1, TILE_BG, tpsOk, tpsOk ? throttleDeg(d.tps) : 0);
+  drawThrottle(tileX(t) + tileW(t) - TP_SIZE - 2, tileY(t) + TILE_HEAD + 1, TILE_BG, tpsOk, tpsOk ? throttleDeg(d.tps) : 0);
 }
 
 // ---- Sensors display -------------------------------------------------------
@@ -654,7 +676,7 @@ void drawSensorsFrame() {
   }
 }
 
-void drawVoltBar(uint8_t slot, int y, float volts, bool on, bool ok) {
+void drawVoltBar(uint8_t slot, uint8_t channel, int y, float volts, bool on, bool ok) {
   const int fill = on ? lroundf(constrain(volts / 5.0f, 0.0f, 1.0f) * (VB_W - 2)) : 0;
   const uint16_t color = ok ? GREEN : RED;
   char tag[8];
@@ -662,9 +684,9 @@ void drawVoltBar(uint8_t slot, int y, float volts, bool on, bool ok) {
   if (!changed(slot, tag, color)) return;
   lcd.fillRect(VB_X, y, VB_W, VB_H, BAR_TRACK);
   if (fill) lcd.fillRect(VB_X + 1, y + 1, fill, VB_H - 2, color);
-  // Circuit-fault thresholds (0.20 V and 4.80 V).
-  for (float v : {CIRCUIT_LOW_V, CIRCUIT_HIGH_V})
-    lcd.drawFastVLine(VB_X + 1 + lroundf(v / 5.0f * (VB_W - 2)), y - 2, VB_H + 4, AMBER);
+  // This channel's fault limits (no marker for a sensor without a low fault).
+  for (float v : {FAULT_LIMITS[channel].low, FAULT_LIMITS[channel].high})
+    if (v > 0) lcd.drawFastVLine(VB_X + 1 + lroundf(v / 5.0f * (VB_W - 2)), y - 2, VB_H + 4, AMBER);
   lcd.drawRect(VB_X, y, VB_W, VB_H, BAR_EDGE);
 }
 
@@ -675,16 +697,18 @@ void sensorsText(const DisplayData& d, bool running) {
     const int y = SN_Y0 + i * SN_ROW, cy = y + SN_ROW / 2;
     const uint8_t slot = SS_ROW0 + i * 4, bit = 1 << i;
     const float v = d.volts[i];
-    const bool circuit = i == 2 || circuitOk(v);  // O2 may legitimately sit at 0 V.
-    drawVoltBar(slot, cy - VB_H / 2, v, running, circuit);
+    const bool circuit = !sensorFault(i, v);
+    drawVoltBar(slot, i, cy - VB_H / 2, v, running, circuit);
     if (running) snprintf(text, sizeof(text), "%.3f V", v); else strcpy(text, "--");
     field(slot + 1, 286, cy, textdatum_t::middle_right, &fonts::Font2, running ? TEXT : MUTED, BG, text, 72);
 
     uint16_t color = MUTED;
     char number[12];
     if (!running) strcpy(text, "--");
-    else if (i == 2) { snprintf(text, sizeof(text), "%.2f %s", d.o2.lambda, d.o2.mixture); color = mixtureColor(d.o2); }
-    else {
+    else if (i == 2) {
+      if (d.o2.afrAvailable) { snprintf(text, sizeof(text), "%.1f:1 %s", d.o2.afr, d.o2.mixture); color = mixtureColor(d.o2); }
+      else { strcpy(text, "ERR"); color = RED; }
+    } else {
       const SensorReading& r = i == 0 ? d.iat : i == 1 ? d.ect : i == 3 ? d.map : d.tps;
       color = sensorText(r, 1, number, sizeof(number));
       snprintf(text, sizeof(text), r.available ? "%s %s" : "%s", number, i == 3 ? "kPa" : i == 4 ? "%" : "C");
@@ -694,7 +718,7 @@ void sensorsText(const DisplayData& d, bool running) {
     if (!running) { strcpy(text, "--"); color = MUTED; }
     else if (d.injectedMask & bit) { snprintf(text, sizeof(text), "%s INJ", SENSOR_DTCS[i].general); color = ORANGE; }
     else if (d.autoMask & bit) { strcpy(text, d.highMask & bit ? SENSOR_DTCS[i].high : SENSOR_DTCS[i].low); color = RED; }
-    else if (!circuit) { strcpy(text, v > CIRCUIT_HIGH_V ? "HIGH ..." : "LOW ..."); color = AMBER; }  // Pending DTC.
+    else if (!circuit) { strcpy(text, sensorFaultHigh(i, v) ? "HIGH ..." : "LOW ..."); color = AMBER; }  // Pending DTC.
     else if (!inSpec[i]) { strcpy(text, "OUT OF SPEC"); color = AMBER; }
     else { strcpy(text, "OK"); color = GREEN; }
     field(slot + 3, 474, cy, textdatum_t::middle_right, &fonts::Font2, color, BG, text, 96);
@@ -753,20 +777,27 @@ void sensorsText(const DisplayData& d, bool running) {
 // ---- Shared frame ----------------------------------------------------------
 uint16_t viewBg() { return view == RACE ? RACE_BG : BG; }
 
-void drawTabs() {
-  for (uint8_t i = 0; i < VIEW_COUNT; ++i) {
-    const bool active = i == view;
-    const int x = TAB_X0 + i * TAB_STEP;
-    lcd.fillRoundRect(x, TAB_Y, TAB_W, TAB_H, 6, active ? PANEL : viewBg());
-    lcd.drawRoundRect(x, TAB_Y, TAB_W, TAB_H, 6, active ? ACCENT : EDGE);
-    label(lcd, VIEW_NAMES[i], x + TAB_W / 2, TAB_Y + TAB_H / 2, active ? ACCENT : MUTED, textdatum_t::middle_center);
+// REF 1 / REF 2 boxes in the RACE header.
+constexpr int REF_X[2] = {4, 150}, REF_W = 140;
+
+// Header without tabs: the screen name (RACE shows REF 1 / REF 2 instead),
+// then the board and the status pill drawn by drawStatus().
+void drawHeader() {
+  if (view != RACE) {
+    label(lcd, VIEW_NAMES[view], 10, TAB_Y + TAB_H / 2, MUTED, textdatum_t::middle_left, &fonts::Font2);
+    return;
+  }
+  for (uint8_t i = 0; i < 2; ++i) {
+    lcd.fillRoundRect(REF_X[i], TAB_Y, REF_W, TAB_H, 6, TILE_BG);
+    lcd.drawRoundRect(REF_X[i], TAB_Y, REF_W, TAB_H, 6, TILE_EDGE);
+    label(lcd, i ? "REF 2" : "REF 1", REF_X[i] + 8, TAB_Y + TAB_H / 2, RACE_LABEL, textdatum_t::middle_left, &fonts::Font2);
   }
 }
 
 void drawFrame() {
   lcd.startWrite();
   lcd.fillScreen(viewBg());
-  drawTabs();
+  drawHeader();
   lcd.drawFastHLine(0, HEADER_H, W, EDGE);
   lcd.waitDMA();
   for (auto& band : gaugeBand) {
@@ -783,32 +814,86 @@ void drawFrame() {
   shownGaugeKey = -1;
 }
 
-// Calibration is shared with ESP32_LGFX_Touch_Test / ESP32_Touch_Games (same
-// NVS key), so a panel calibrated there is reused. Hold the screen while the
-// ESP32 resets to calibrate again.
-void loadOrCalibrate() {
+// No calibration screen: double-tap only needs to know the panel is pressed,
+// not where. A calibration saved earlier by ESP32_LGFX_Touch_Test (NVS
+// "lgfxtouch/cal") is still applied if present.
+void loadTouchCalibration() {
   Preferences store;
   uint16_t cal[8];
-  store.begin("lgfxtouch", false);
-  const bool have = store.getBytes("cal", cal, sizeof(cal)) == sizeof(cal);
-  const bool force = digitalRead(PIN_TOUCH_IRQ) == LOW;
-  if (have && !force) {
-    lcd.setTouchCalibrate(cal);
-  } else {
-    lcd.fillScreen(BG);
-    label(lcd, "Touch calibration", W / 2, H / 2 - 24, TEXT, textdatum_t::middle_center, &fonts::FreeSansBold12pt7b);
-    if (force) {
-      label(lcd, "Release the screen...", W / 2, H / 2 + 12, MUTED, textdatum_t::middle_center);
-      const uint32_t start = millis();
-      while (digitalRead(PIN_TOUCH_IRQ) == LOW && millis() - start < 5000) delay(10);
-      delay(300);
-      lcd.fillRect(0, H / 2 + 2, W, 20, BG);
-    }
-    label(lcd, "Tap the tip of the arrow in each corner", W / 2, H / 2 + 12, MUTED, textdatum_t::middle_center);
-    lcd.calibrateTouch(cal, ACCENT, BG, 30);
-    store.putBytes("cal", cal, sizeof(cal));
-  }
+  store.begin("lgfxtouch", true);
+  if (store.getBytes("cal", cal, sizeof(cal)) == sizeof(cal)) lcd.setTouchCalibrate(cal);
   store.end();
+}
+
+// Boot animation: a tachometer ring sweeps up (cyan -> amber -> red) around
+// "ECU", the ECU TESTBENCH title fades in, and a loading bar fills with
+// start-up steps underneath.
+constexpr uint32_t INTRO_MS = 2600;
+
+void playIntro() {
+  constexpr int RX = W / 2, RY = 112, R = 70;
+  constexpr int BAR_X = 120, BAR_Y = 266, BAR_W = 240, BAR_H = 8;
+  const char* const STEPS[4] = {"Starting display", "Loading sensor formulas", "Opening Wi-Fi hotspot", "Ready"};
+  lcd.startWrite();
+  lcd.fillScreen(BG);
+  // Faint background grid and corner brackets.
+  for (int x = 0; x < W; x += 24) lcd.drawFastVLine(x, 0, H, rgb(0x10, 0x18, 0x24));
+  for (int y = 0; y < H; y += 24) lcd.drawFastHLine(0, y, W, rgb(0x10, 0x18, 0x24));
+  for (int k = 0; k < 4; ++k) {
+    const int cx = k & 1 ? W - 12 : 12, cy = k & 2 ? H - 12 : 12, dx = k & 1 ? -24 : 24, dy = k & 2 ? -24 : 24;
+    lcd.drawFastHLine(min(cx, cx + dx), cy, 24, EDGE);
+    lcd.drawFastVLine(cx, min(cy, cy + dy), 24, EDGE);
+  }
+  // Ring track, ticks and centre.
+  lcd.fillArc(RX, RY, R + 4, R + 3, 135, 405, EDGE);
+  lcd.fillArc(RX, RY, R, R - 10, 135, 405, ARC);
+  for (int i = 0; i <= 15; ++i) {
+    const float a = (135 + i * 18) * DEG_TO_RAD;
+    const int r1 = i % 3 ? R - 16 : R - 22;
+    lcd.drawLine(RX + cosf(a) * (R - 13), RY + sinf(a) * (R - 13), RX + cosf(a) * r1, RY + sinf(a) * r1, i >= 12 ? RED : TICK);
+  }
+  lcd.fillCircle(RX, RY, R - 28, PANEL);
+  lcd.drawCircle(RX, RY, R - 28, EDGE);
+  lcd.drawRoundRect(BAR_X - 2, BAR_Y - 2, BAR_W + 4, BAR_H + 4, 5, EDGE);
+  lcd.endWrite();
+
+  float shownDeg = 135;
+  int shownStep = -1;
+  const uint32_t start = millis();
+  for (uint32_t t = 0; t <= INTRO_MS; t = millis() - start) {
+    const float p = float(t) / INTRO_MS;
+    lcd.startWrite();
+    // Ring sweeps over the first 70 %, coloured by where it is on the scale.
+    const float deg = 135 + 270 * min(1.0f, p / 0.7f);
+    for (; shownDeg < deg; shownDeg += 3) {
+      const float at = (shownDeg - 135) / 270;
+      const uint16_t color = at >= 0.8f ? RED : at >= 0.6f ? AMBER : ACCENT;
+      lcd.fillArc(RX, RY, R, R - 10, shownDeg, min(shownDeg + 3, deg), color);
+    }
+    // Centre badge and title fade in.
+    const float fade = constrain((p - 0.15f) / 0.4f, 0.0f, 1.0f);
+    label(lcd, "ECU", RX, RY, lerpColor(0x131d29, 0x66d4f1, fade), textdatum_t::middle_center, &fonts::FreeSansBold12pt7b);
+    label(lcd, "ECU TESTBENCH", W / 2, 210, lerpColor(0x0d141e, 0xf2f7fc, fade), textdatum_t::middle_center,
+          &fonts::FreeSansBold18pt7b);
+    label(lcd, "Arduino Uno / Nano / Mega  +  ESP32", W / 2, 238, lerpColor(0x0d141e, 0xacbdd1, fade),
+          textdatum_t::middle_center, &fonts::Font2);
+    // Loading bar and the current start-up step.
+    const int fill = lroundf(min(1.0f, p) * BAR_W);
+    if (fill > 0) lcd.fillRoundRect(BAR_X, BAR_Y, fill, BAR_H, 3, ACCENT);
+    const int step = min(3, int(p * 4));
+    if (step != shownStep) {
+      shownStep = step;
+      lcd.setFont(&fonts::Font2);
+      lcd.setTextColor(step == 3 ? GREEN : MUTED, BG);
+      lcd.setTextDatum(textdatum_t::middle_center);
+      lcd.setTextPadding(BAR_W);
+      lcd.drawString(STEPS[step], W / 2, BAR_Y + 24);
+      lcd.setTextPadding(0);
+    }
+    lcd.endWrite();
+    delay(16);
+  }
+  delay(350);
 }
 
 void begin() {
@@ -816,7 +901,8 @@ void begin() {
   lcd.init();
   lcd.setRotation(1);  // Landscape 480 x 320.
   lcd.setBrightness(255);
-  loadOrCalibrate();
+  loadTouchCalibration();
+  playIntro();
   throttleSprite.setColorDepth(16);
   throttleSprite.createSprite(TP_SIZE, TP_SIZE);
   for (auto& band : gaugeBand) band.setColorDepth(16);
@@ -835,22 +921,32 @@ void drawStatus(const DisplayData& d) {
   }
   char board[8] = "";
   if (d.link != DisplayData::WAITING) for (uint8_t i = 0; i < 7 && d.board[i]; ++i) board[i] = toupper(d.board[i]);
-  field(S_BOARD, 330, TAB_Y + TAB_H / 2, textdatum_t::middle_center, &fonts::Font2, MUTED, viewBg(), board, 88);
+  field(S_BOARD, 336, TAB_Y + TAB_H / 2, textdatum_t::middle_center, &fonts::Font2, MUTED, viewBg(), board, 88);
+  if (view != RACE) return;
+  const bool running = live && d.keyOn;
+  for (uint8_t i = 0; i < 2; ++i) {
+    char value[12];
+    uint16_t color = TEXT;
+    if (d.link != DisplayData::WAITING && !d.references) { strcpy(value, "n/a"); color = MUTED; }
+    else if (running) snprintf(value, sizeof(value), "%.2f V", d.reference[i]);
+    else { strcpy(value, "-- V"); color = MUTED; }
+    field(S_REF1 + i, REF_X[i] + REF_W - 8, TAB_Y + TAB_H / 2, textdatum_t::middle_right, &fonts::Font4,
+          color, TILE_BG, value, 86);
+  }
 }
 
-// Tap a tab to open it; tap anywhere else for the next tab.
+// Double-tap anywhere for the next screen; a single tap does nothing.
 void handleTouch(uint32_t now) {
   if (now - lastTouchPollMs < TOUCH_POLL_MS) return;
   lastTouchPollMs = now;
   int32_t x, y;
   const bool pressed = lcd.getTouch(&x, &y);
-  if (pressed && !wasTouched && now - lastTapMs >= 250) {
-    lastTapMs = now;
-    View next = View((view + 1) % VIEW_COUNT);
-    if (y < HEADER_H)
-      for (uint8_t i = 0; i < VIEW_COUNT; ++i)
-        if (x >= TAB_X0 + i * TAB_STEP && x < TAB_X0 + i * TAB_STEP + TAB_W) next = View(i);
-    if (next != view) { view = next; drawFrame(); }
+  if (pressed && !wasTouched) {
+    if (lastTapMs && now - lastTapMs <= DOUBLE_TAP_MS) {
+      lastTapMs = 0;
+      view = View((view + 1) % VIEW_COUNT);
+      drawFrame();
+    } else lastTapMs = now;
   }
   // Short release debounce so a resistive panel's dropouts don't count as new taps.
   if (pressed) lastPressMs = now;
@@ -871,7 +967,7 @@ void update(const DisplayData& d) {
   const bool selfTest = selfTestActive;
   const float sweep = selfTest ? SPEED_MAX * (testMs < SELF_TEST_MS / 2 ? testMs : SELF_TEST_MS - testMs) / (SELF_TEST_MS / 2) : 0;
 
-  // Engine RPM eases at 20,000 rpm/s so gear changes read as a quick drop.
+  // Engine RPM eases at 20,000 rpm/s.
   const float dt = min(0.1f, (now - lastAnimMs) / 1000.0f);
   lastAnimMs = now;
   const float targetRpm = running ? d.rpm : 0;
@@ -891,9 +987,9 @@ void update(const DisplayData& d) {
       const bool show = running || selfTest;
       lcd.startWrite();
       if (view == CLASSIC) {
-        if (show) snprintf(speedText, sizeof(speedText), "%03d", int(lroundf(speed)));
-        else strcpy(speedText, locked ? "000" : "---");
-        renderClassicGauge(speed, show, speedText);
+        if (show) snprintf(speedText, sizeof(speedText), "%d", int(lroundf(rpm / 10)) * 10);
+        else strcpy(speedText, locked ? "0" : "---");
+        renderClassicGauge(rpm, show, speedText);
       } else {
         if (show) snprintf(speedText, sizeof(speedText), "%d", int(lroundf(speed)));
         else strcpy(speedText, locked ? "0" : "-");

@@ -1,72 +1,78 @@
 #pragma once
 #include <math.h>
 
-// Sensor transfer models built from the client's ECU TESTBENCH DISPLAY.docx
-// points. The Nano sends raw ADC counts; every engineering value is derived
-// here, so changing a model never requires reflashing the Nano.
-//
-// Readings outside the client's specified range are still converted (as a
-// real sensor would report them) and flagged with inSpec = false.
+// 5-sensor diagnostic formulas, the same as arduino-mega/MegaTelemetry's
+// SensorConversion.h. The board sends raw ADC counts; every engineering value
+// is derived here. A signal outside a sensor's valid range is a fault (the
+// Mega prints "ERR"): the reading is unavailable and, after 2 s, sets a DTC.
 
 constexpr float SENSOR_SUPPLY_V = 5.0f;
-// Outside this band a 5 V sensor circuit is treated as open or shorted.
-constexpr float CIRCUIT_LOW_V = 0.20f;
-constexpr float CIRCUIT_HIGH_V = 4.80f;
 
 struct SensorReading {
   bool available;
   float value;
-  bool inSpec;
+  bool inSpec;  // Inside the formula's calibrated span.
 };
 
-// NTC thermistor with a pull-up to the 5 V sensor supply, the usual ECT/IAT
-// circuit. With x = Rntc / Rpullup, V = 5x / (1 + x) and the beta model
-// x = x1 * exp(B * (1/T - 1/T1)). Two client points fix x1 and B exactly.
-struct NtcModel {
-  float v1, t1C, v2, t2C;
+// Fault limits per channel (IAT, ECT, O2, MAP, TPS): below low or above high.
+// A low limit of 0 means the sensor has no low fault.
+struct FaultLimits {
+  float low, high;
 };
-constexpr NtcModel ECT_MODEL{3.0f, 20.0f, 0.43f, 100.0f};  // B ~ 3786 K
-constexpr NtcModel IAT_MODEL{3.0f, 30.0f, 1.72f, 50.0f};   // B ~ 5148 K
+constexpr FaultLimits FAULT_LIMITS[5] = {{0.15f, 4.85f}, {0.10f, 4.85f}, {0.02f, 1.20f}, {0.0f, 4.60f}, {0.0f, 4.75f}};
 
-inline float ntcRatio(float voltage) { return voltage / (SENSOR_SUPPLY_V - voltage); }
+inline bool sensorFault(uint8_t channel, float voltage) {
+  return voltage < FAULT_LIMITS[channel].low || voltage > FAULT_LIMITS[channel].high;
+}
+inline bool sensorFaultHigh(uint8_t channel, float voltage) { return voltage > FAULT_LIMITS[channel].high; }
 
-inline float ntcTemperatureC(const NtcModel& m, float voltage) {
-  const float t1 = m.t1C + 273.15f, t2 = m.t2C + 273.15f;
-  const float beta = logf(ntcRatio(m.v1) / ntcRatio(m.v2)) / (1.0f / t1 - 1.0f / t2);
-  return 1.0f / (1.0f / t1 + logf(ntcRatio(voltage) / ntcRatio(m.v1)) / beta) - 273.15f;
+// IAT and ECT: non-linear lookup tables, volts falling as temperature rises.
+struct TempTable {
+  uint8_t channel;
+  const float* volts;
+  const float* temps;
+  uint8_t size;
+};
+const float IAT_VOLTS[5] = {2.806f, 2.300f, 1.850f, 1.550f, 1.300f};
+const float IAT_TEMPS[5] = {15.0f, 25.0f, 35.0f, 45.0f, 55.0f};
+const float ECT_VOLTS[6] = {3.564f, 2.500f, 1.500f, 0.800f, 0.300f, 0.100f};
+const float ECT_TEMPS[6] = {20.0f, 40.0f, 65.0f, 90.0f, 110.0f, 120.0f};
+const TempTable IAT_MODEL{0, IAT_VOLTS, IAT_TEMPS, 5};
+const TempTable ECT_MODEL{1, ECT_VOLTS, ECT_TEMPS, 6};
+
+// Linear interpolation between table points, clamped to the table ends.
+inline float lookupTemperature(const TempTable& t, float voltage) {
+  if (voltage >= t.volts[0]) return t.temps[0];
+  if (voltage <= t.volts[t.size - 1]) return t.temps[t.size - 1];
+  for (uint8_t i = 0; i + 1 < t.size; ++i)
+    if (voltage <= t.volts[i] && voltage >= t.volts[i + 1])
+      return t.temps[i] + (voltage - t.volts[i]) / (t.volts[i + 1] - t.volts[i]) * (t.temps[i + 1] - t.temps[i]);
+  return t.temps[0];
 }
 
-inline bool circuitOk(float voltage) {
-  return voltage >= CIRCUIT_LOW_V && voltage <= CIRCUIT_HIGH_V;
+inline SensorReading convertTemperature(const TempTable& t, float voltage) {
+  if (sensorFault(t.channel, voltage)) return {false, 0, false};
+  return {true, lookupTemperature(t, voltage), voltage <= t.volts[0] && voltage >= t.volts[t.size - 1]};
 }
 
-inline SensorReading convertTemperature(const NtcModel& m, float voltage) {
-  if (!circuitOk(voltage)) return {false, 0, false};
-  const float c = ntcTemperatureC(m, voltage);
-  const float low = m.t1C < m.t2C ? m.t1C : m.t2C, high = m.t1C > m.t2C ? m.t1C : m.t2C;
-  return {true, c, c >= low && c <= high};
-}
-
-// MAP sensors are linear: 0.78 V -> 20 kPa, 4.00 V -> 101.3 kPa (25.25 kPa/V).
+// MAP: 0 V = 10 kPa, 4.21 V = 100 kPa.
 inline SensorReading convertMap(float voltage) {
-  if (!circuitOk(voltage)) return {false, 0, false};
-  const float kpa = 20.0f + (voltage - 0.78f) * (101.3f - 20.0f) / (4.0f - 0.78f);
-  return {true, kpa, kpa >= 20.0f && kpa <= 101.3f};
+  if (sensorFault(3, voltage)) return {false, 0, false};
+  return {true, 10.0f + voltage * (100.0f - 10.0f) / 4.21f, voltage <= 4.21f};
 }
 
-// TPS percent from learned closed / wide-open ADC endpoints, like an ECU's
-// TPS reset procedure. Clamped to 0-100 %; inSpec is false beyond 2 %.
-inline SensorReading convertTps(float raw, float closedRaw, float wotRaw, float voltage) {
-  if (!circuitOk(voltage) || closedRaw == wotRaw) return {false, 0, false};
-  const float pct = (raw - closedRaw) * 100.0f / (wotRaw - closedRaw);
-  return {true, pct < 0 ? 0 : pct > 100 ? 100 : pct, pct >= -2.0f && pct <= 102.0f};
+// TPS: 0 V = 0 %, 4.25 V = 100 %.
+inline SensorReading convertTps(float voltage) {
+  if (sensorFault(4, voltage)) return {false, 0, false};
+  const float pct = voltage * 100.0f / 4.25f;
+  return {true, pct < 0 ? 0 : pct > 100 ? 100 : pct, voltage <= 4.25f};
 }
 
-// Client encoding: O2 signal volts read directly as lambda, AFR = 14.7 * lambda
-// (0.7 V -> 10.3, 1.0 V -> 14.7, 1.2 V -> 17.6). AFR is reported across the
-// client's lambda/AFR table, lambda 0.70-1.60 (AFR 10.3-23.5).
+// O2 volts to AFR: 0.1 V = 15.2:1 (lean), 0.9 V = 14.0:1 (rich). Lambda is
+// AFR / 14.7, for the dashboard's lambda scale and AFR gauge.
 constexpr float STOICH_AFR = 14.7f;
 struct OxygenReading {
+  float volts;
   float lambda;
   bool afrAvailable;
   float afr;
@@ -75,10 +81,10 @@ struct OxygenReading {
 };
 
 inline OxygenReading convertOxygen(float voltage) {
-  const float lambda = voltage < 0 ? 0 : voltage;
-  const bool onGauge = lambda >= 0.70f && lambda <= 1.60f;
-  const char* mixture = lambda < 0.97f ? "rich" : lambda <= 1.03f ? "stoich" : "lean";
-  return {lambda, onGauge, lambda * STOICH_AFR, lambda >= 0.7f && lambda <= 1.2f, mixture};
+  if (sensorFault(2, voltage)) return {voltage, 0, false, 0, false, "fault"};
+  const float afr = 15.2f + (voltage - 0.1f) * (14.0f - 15.2f) / (0.9f - 0.1f);
+  const char* mixture = afr < 14.4f ? "rich" : afr <= 15.0f ? "stoich" : "lean";
+  return {voltage, afr / STOICH_AFR, true, afr, voltage >= 0.1f && voltage <= 0.9f, mixture};
 }
 
 // Diagnostic trouble codes. Index matches the Nano channel order

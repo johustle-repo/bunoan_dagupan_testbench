@@ -8,12 +8,14 @@
 //   title | 0-200 km/h gauge + speed bar | BATTERY / CURRENT / REF1 tiles |
 //   output and brake state, START/STOP and RESET.
 // The speed is the testbench D7 knob; only what an ABS unit depends on is
-// shown, no engine sensors.
+// shown, no engine sensors. Every power-up starts with a splash and a needle
+// sweep, since the Mega has no smart-key button.
 constexpr int8_t PIN_TFT_SCK = 18, PIN_TFT_MISO = 19, PIN_TFT_MOSI = 23;
 constexpr int8_t PIN_TFT_CS = 27, PIN_TFT_DC = 25, PIN_TFT_RST = 26;
 constexpr int8_t PIN_TOUCH_CS = 33, PIN_TOUCH_IRQ = 32;
 constexpr uint32_t TFT_SPI_HZ = 27000000;
 constexpr uint32_t GAUGE_REFRESH_MS = 50, TEXT_REFRESH_MS = 100, TOUCH_POLL_MS = 20;
+constexpr uint32_t INTRO_LOAD_MS = 1200, INTRO_SWEEP_MS = 1600;  // Power-on animation.
 
 // Wheel-speed output: a 50 % square wave whose frequency follows the speed,
 // like a wheel-speed sensor on a tone ring. -1 = screen only (SIM).
@@ -270,6 +272,31 @@ void drawFrame() {
   shownGaugeKey = -1;
 }
 
+// Power-on animation: title and a loading bar on a splash, then the frame
+// appears and the needle sweeps 0 -> 200 -> 0 km/h with the brake lamp lit.
+void powerOnAnimation() {
+  constexpr int LX = W / 2 - 120, LY = H / 2 + 44, LW = 240;
+  lcd.startWrite();
+  lcd.fillScreen(BG);
+  label(lcd, "ABS TESTER", W / 2, H / 2 - 20, ACCENT, textdatum_t::middle_center, &fonts::FreeSansBold24pt7b);
+  label(lcd, "Powering on...", W / 2, H / 2 + 20, MUTED, textdatum_t::middle_center);
+  lcd.drawRoundRect(LX, LY, LW, 12, 6, EDGE);
+  lcd.endWrite();
+  for (uint32_t start = millis(), t = 0; t < INTRO_LOAD_MS; t = millis() - start) {
+    lcd.fillRoundRect(LX + 2, LY + 2, max(8, int((LW - 4) * t / INTRO_LOAD_MS)), 8, 4, ACCENT);
+    delay(15);
+  }
+  drawFrame();
+  lcd.startWrite();
+  lcd.fillCircle(20, AB_Y + 30, 5, RED);  // Lamp check; drawText redraws it afterwards.
+  for (uint32_t start = millis(), t = 0; t < INTRO_SWEEP_MS; t = millis() - start) {
+    const float kmh = ABS_SPEED_MAX * sinf(PI * t / INTRO_SWEEP_MS);  // Eases out and back.
+    renderGauge(kmh);
+    renderBar(kmh);
+  }
+  lcd.endWrite();
+}
+
 void drawText(const AbsData& d, bool running) {
   char text[16];
   const bool havePacket = d.link != AbsData::WAITING;
@@ -370,7 +397,7 @@ void begin() {
     band.setColorDepth(16);
     band.createSprite(AG_W, AG_BAND);
   }
-  drawFrame();
+  powerOnAnimation();
 }
 
 // Call every loop.

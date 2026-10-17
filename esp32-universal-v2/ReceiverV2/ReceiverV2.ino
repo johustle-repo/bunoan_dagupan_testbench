@@ -31,7 +31,6 @@ uint32_t badFrames = 0;
 float rawValues[5] = {};
 float frequencyHz = 0;
 bool smartKeyOn = false, brakePressed = false;
-float mappedRpm = 0;
 float referenceVoltage[2] = {}; // Nano: A5 (5 V) / A6 (3.3 V) direct. Mega: 0-30 V divider inputs.
 bool haveReferences = false;    // True for Nano (U4) and Mega (U5) frames, false for Uno (U3).
 float batteryVoltage = 0;       // Mega A7 through a divider, 0-30 V.
@@ -47,12 +46,12 @@ uint8_t injectedFault = 0;
 float faultLimitedSpeed = 0;
 uint32_t lastSpeedMs = 0;
 
-// Simulated engine RPM: the D7 speed is run through a 6-speed gearbox model.
-// Ratios are engine rpm per km/h; 6th gear gives about 14,400 rpm at 300 km/h.
-constexpr float GEAR_RPM_PER_KMH[6] = {120, 90, 73, 62, 54, 48};
-constexpr float IDLE_RPM = 1300, RPM_REDLINE = 15000;
-uint8_t gear = 0; // 0 = neutral.
-float simulatedRpm = 0;
+// Speed and RPM from the D7 frequency, the same for every board (as on the
+// Mega): speed = Hz / 6 km/h, max 250; RPM = Hz x 15000 / 1549, so 1549 Hz
+// = 15,000 rpm, max 15,000. The frame's own speed field is not used.
+constexpr float HZ_PER_KMH = 6, SPEED_MAX_KMH = 250;
+constexpr float RPM_PER_HZ = 15000.0f / 1549, ENGINE_RPM_MAX = 15000;
+float engineRpm = 0;
 
 // TPS closed / wide-open endpoints, learned from the dashboard and kept in NVS.
 constexpr float TPS_DEFAULT_CLOSED_RAW = 76, TPS_DEFAULT_WOT_RAW = 893;
@@ -104,7 +103,6 @@ bool parseFrame(char* text) {
   brakePressed = values[1] == 1;
   for (uint8_t i = 0; i < 5; ++i) rawValues[i] = smartKeyOn ? values[i + 2] / 16.0f : 0;
   frequencyHz = smartKeyOn ? values[7] / 100.0f : 0;
-  mappedRpm = smartKeyOn ? values[8] / 100.0f : 0;
   haveReferences = fieldCount >= 11;
   haveBattery = fieldCount == 13;
   batteryVoltage = haveBattery ? values[11] / 1000.0f : 0;
@@ -129,15 +127,14 @@ void updateDiagnostics() {
   }
   const uint32_t now = millis();
   for (uint8_t i = 0; i < 5; ++i) {
-    if (i == 2) continue; // O2 can legitimately sit at 0 V; injected faults only.
     const uint8_t bit = 1 << i;
     const float voltage = channelVoltage(i);
-    if (circuitOk(voltage)) {
+    if (!sensorFault(i, voltage)) {
       pendingFaultMask &= ~bit;
       autoFaultMask &= ~bit;
       continue;
     }
-    if (voltage > CIRCUIT_HIGH_V) autoFaultHighMask |= bit;
+    if (sensorFaultHigh(i, voltage)) autoFaultHighMask |= bit;
     else autoFaultHighMask &= ~bit;
     if (!(pendingFaultMask & bit)) {
       pendingFaultMask |= bit;
@@ -150,21 +147,6 @@ void updateDiagnostics() {
   if (!ect.available) coolantWarning = false;
   else if (ect.value >= COOLANT_WARNING_ON_C) coolantWarning = true;
   else if (ect.value <= COOLANT_WARNING_OFF_C) coolantWarning = false;
-}
-
-// Shift points follow throttle like a rider: light throttle shifts up near
-// 6000 rpm, wide open near 12,000 rpm. The hysteresis keeps a gear change
-// from immediately reversing.
-void updateGearbox(bool fresh) {
-  if (!fresh || !smartKeyOn) { gear = 0; simulatedRpm = 0; return; }
-  if (faultLimitedSpeed < 1.0f) { gear = 0; simulatedRpm = IDLE_RPM; return; }
-  const SensorReading tps = convertTps(rawValues[4], tpsClosedRaw, tpsWotRaw, channelVoltage(4));
-  const float throttle = tps.available ? tps.value : 0;
-  const float upshiftRpm = 6000 + 60 * throttle, downshiftRpm = 3000 + 25 * throttle;
-  if (gear == 0) gear = 1;
-  while (gear < 6 && faultLimitedSpeed * GEAR_RPM_PER_KMH[gear - 1] > upshiftRpm) ++gear;
-  while (gear > 1 && faultLimitedSpeed * GEAR_RPM_PER_KMH[gear - 1] < downshiftRpm) --gear;
-  simulatedRpm = constrain(faultLimitedSpeed * GEAR_RPM_PER_KMH[gear - 1], IDLE_RPM, RPM_REDLINE);
 }
 
 void appendDtcList(String& json, uint8_t autoMask, uint8_t injectedMask) {
@@ -201,7 +183,7 @@ void updateLocalDisplay() {
   d.checkEngine = activeInjected | activeAuto;
   d.coolantWarning = !stale && coolantWarning;
   d.speedKmh = faultLimitedSpeed;
-  d.rpm = simulatedRpm;
+  d.rpm = engineRpm;
   for (uint8_t i = 0; i < 5 && !d.dtcCode; ++i) {
     const uint8_t bit = 1 << i;
     if (!((activeAuto | activeInjected) & bit)) continue;
@@ -214,7 +196,7 @@ void updateLocalDisplay() {
   d.ect = convertTemperature(ECT_MODEL, channelVoltage(1));
   d.o2 = convertOxygen(channelVoltage(2));
   d.map = convertMap(channelVoltage(3));
-  d.tps = convertTps(rawValues[4], tpsClosedRaw, tpsWotRaw, channelVoltage(4));
+  d.tps = convertTps(channelVoltage(4));
   d.frequencyHz = frequencyHz;
   d.batteryAvailable = haveBattery && !stale;
   d.batteryV = batteryVoltage;
@@ -264,8 +246,7 @@ String telemetryJson() {
   json += F(",\"tps_closed_raw\":"); json += String(tpsClosedRaw, 1);
   json += F(",\"tps_wot_raw\":"); json += String(tpsWotRaw, 1);
   json += F(",\"simulated_speed_kmh\":"); json += String(faultLimitedSpeed, 1);
-  json += F(",\"simulated_rpm\":"); json += String(simulatedRpm, 0);
-  json += F(",\"gear\":"); json += gear;
+  json += F(",\"simulated_rpm\":"); json += String(engineRpm, 0);
   json += F(",\"battery_v\":");
   json += haveBattery && !stale ? String(batteryVoltage, 2) : String(F("null"));
   json += F(",\"current_a\":");
@@ -288,30 +269,32 @@ String telemetryJson() {
     json += F(",\"knob_percent\":"); json += valid ? String(constrain(pos, 0.0f, 100.0f), 1) : String(F("null"));
     json += F(",\"endpoint_status\":\""); json += valid ? F("in_range") : F("out_of_range"); json += '"';
     if (i == 4) {
-      const SensorReading tps = convertTps(rawValues[i], tpsClosedRaw, tpsWotRaw, voltage);
+      const SensorReading tps = convertTps(voltage);
       json += F(",\"throttle_percent\":"); json += tps.available ? String(tps.value, 1) : String(F("null"));
       json += F(",\"in_spec\":"); json += tps.inSpec ? F("true") : F("false");
-      json += F(",\"calibration\":\"learned_endpoints\"");
+      json += F(",\"calibration\":\"0v_0pct_4v25_100pct\"");
     } else if (i == 2) {
       const OxygenReading o2 = convertOxygen(voltage);
-      json += F(",\"lambda\":"); json += String(o2.lambda, 3);
+      json += F(",\"lambda\":"); json += o2.afrAvailable ? String(o2.lambda, 3) : String(F("null"));
       json += F(",\"afr\":"); json += o2.afrAvailable ? String(o2.afr, 1) : String(F("null"));
       json += F(",\"mixture\":\""); json += o2.mixture;
       json += F("\",\"in_spec\":"); json += o2.inSpec ? F("true") : F("false");
-      json += F(",\"calibration\":\"client_lambda_encoding\"");
+      json += F(",\"o2_v\":"); json += String(o2.volts, 2);
+      json += F(",\"calibration\":\"0v1_15.2_0v9_14.0_afr\"");
     } else {
       const SensorReading reading = i == 3 ? convertMap(voltage)
                                            : convertTemperature(i == 0 ? IAT_MODEL : ECT_MODEL, voltage);
       json += i == 3 ? F(",\"estimate_kpa\":") : F(",\"estimate_c\":");
       json += reading.available ? String(reading.value, 1) : String(F("null"));
       json += F(",\"in_spec\":"); json += reading.inSpec ? F("true") : F("false");
-      json += i == 3 ? F(",\"calibration\":\"client_spec_linear\"") : F(",\"calibration\":\"client_spec_ntc_model\"");
+      json += i == 3 ? F(",\"calibration\":\"0v_10kpa_4v21_100kpa\"") : F(",\"calibration\":\"lookup_table\"");
     }
     json += '}';
   }
   json += F("},\"frequency_hz\":"); json += String(frequencyHz, 2);
-  json += F(",\"engine_rpm\":"); json += String(mappedRpm, 1);
-  json += F(",\"rpm_calibration\":\"mapped_0_1639_hz_to_0_300\"}");
+  // engine_rpm keeps its old meaning for the dashboard: the speed in km/h.
+  json += F(",\"engine_rpm\":"); json += String(faultLimitedSpeed, 1);
+  json += F(",\"rpm_calibration\":\"1549_hz_is_15000_rpm\",\"speed_calibration\":\"hz_div_6\"}");
   return json;
 }
 
@@ -353,7 +336,7 @@ void setup() {
       if (!havePacket || !smartKeyOn || uint32_t(millis()-lastPacketMs)>3000) {
         server.send(409,"application/json","{\"error\":\"Enable smart key and wait for live data\"}"); return;
       }
-      if (!circuitOk(channelVoltage(4))) {
+      if (sensorFault(4, channelVoltage(4))) {
         server.send(409,"application/json","{\"error\":\"TPS circuit voltage is out of range\"}"); return;
       }
       const float raw = rawValues[4];
@@ -440,7 +423,8 @@ void loop() {
           Serial.print(F(" V | REF2 A6=")); Serial.print(referenceVoltage[1], 2); Serial.println(F(" V"));
         } else Serial.println(F("# BOARD Uno (no supply references)"));
         Serial.print(F("# D7 frequency=")); Serial.print(frequencyHz, 2);
-        Serial.print(F(" Hz | mapped RPM=")); Serial.println(mappedRpm, 1);
+        Serial.print(F(" Hz | SPEED=")); Serial.print(faultLimitedSpeed, 1);
+        Serial.print(F(" km/h | RPM=")); Serial.println(engineRpm, 0);
       } else if (discardFrame || frameLength) ++badFrames;
       frameLength = 0; discardFrame = false;
     } else if (!discardFrame) {
@@ -450,15 +434,16 @@ void loop() {
   }
   const uint32_t now = millis();
   const bool fresh = havePacket && uint32_t(now-lastPacketMs) <= 3000;
-  if (!fresh || !smartKeyOn) { faultLimitedSpeed = 0; injectedFault = 0; }
+  if (!fresh || !smartKeyOn) { faultLimitedSpeed = 0; engineRpm = 0; injectedFault = 0; }
   else {
-    const float target = injectedFault ? 0 : mappedRpm;
+    // Brake and injected faults pull the speed to zero; RPM follows Hz only.
+    const float target = injectedFault || brakePressed ? 0 : min(frequencyHz / HZ_PER_KMH, SPEED_MAX_KMH);
+    engineRpm = min(frequencyHz * RPM_PER_HZ, ENGINE_RPM_MAX);
     const float step = 100.0f * uint32_t(now-lastSpeedMs)/1000.0f;
     if (faultLimitedSpeed < target) faultLimitedSpeed = min(target, faultLimitedSpeed+step);
     else faultLimitedSpeed = max(target, faultLimitedSpeed-step);
   }
   lastSpeedMs = now;
-  updateGearbox(fresh);
   updateLocalDisplay();
   server.handleClient();
   yield();

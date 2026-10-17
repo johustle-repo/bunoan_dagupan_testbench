@@ -17,7 +17,8 @@ for(const [i,name] of names.entries()){
  for(const value of [name==='O2'?'O₂':name==='IAT'?'AIT':name,'A'+i,'—','—','—','Waiting']){const td=document.createElement('td');td.textContent=value;tr.append(td);rowCells[name].push(td);}
  $('sensorRows').append(tr);
 }
-let ticks='';for(let i=0;i<=30;i++){const a=Math.PI+i/30*Math.PI,p=r=>[200+Math.cos(a)*r,205+Math.sin(a)*r],x=p(165),y=p(i%5===0?149:157);ticks+=`<line x1="${x[0]}" y1="${x[1]}" x2="${y[0]}" y2="${y[1]}" stroke="#8199b5" stroke-width="2"/>`;if(i%5===0){const t=p(130);ticks+=`<text x="${t[0]}" y="${t[1]+5}" text-anchor="middle" fill="#aebdd0" font-size="14">${i*10}</text>`;}}$('ticks').innerHTML=ticks;
+// RPM dial like the 4" LCD: ticks every 1,000 rpm, labels 0, 3, 6, 9, 12, 15 (x1000), red from 12,000.
+let ticks='';for(let i=0;i<=15;i++){const a=Math.PI+i/15*Math.PI,p=r=>[200+Math.cos(a)*r,205+Math.sin(a)*r],major=i%3===0,red=i>=12,x=p(163),y=p(major?147:155);ticks+=`<line x1="${x[0]}" y1="${x[1]}" x2="${y[0]}" y2="${y[1]}" stroke="${red?'#ff4d4d':'#8199b5'}" stroke-width="${major?3:1.5}"/>`;if(major){const t=p(125);ticks+=`<text x="${t[0]}" y="${t[1]+7}" text-anchor="middle" fill="${red?'#ff4d4d':'#aebdd0'}" font-size="20" font-weight="700">${i}</text>`;}}$('ticks').innerHTML=ticks;
 function log(message){events.push({time:new Date().toISOString(),message});if(events.length>200)events.shift();const li=document.createElement('li');li.textContent=new Date().toLocaleTimeString()+' · '+message;$('eventLog').prepend(li);while($('eventLog').children.length>100)$('eventLog').lastChild.remove();}
 const SOURCES=['uno_via_esp32','nano_via_esp32','mega_via_esp32'];
 function boardName(d){return d&&d.board==='uno'?'Uno':d&&d.board==='mega'?'Mega':'Nano';}
@@ -38,6 +39,7 @@ function render(d,state){
  milFault=fault;milBlink=dtcs.length&&numeric(dtcs[0].blink)?dtcs[0].blink:0;
  const codes=dtcs.map(x=>x.code+' '+label(x.sensor)).join(', ');
  $('engineState').textContent=fault?(codes||'Fault'):live?'No fault':'Off';
+ $('dtcLine').textContent=fault?'CHECK ENGINE  '+(codes||'Fault'):live?'NO DTC':'';$('dtcLine').classList.toggle('fault',fault);
  $('coolantLamp').dataset.active=String(live&&d.coolant_warning===true);
  $('coolantState').textContent=live?(d.coolant_warning?'Overheat · ≥105 °C':'Normal'):'Unavailable';
  const injected=live&&(d.injected_fault_mask||0)!==0;
@@ -54,18 +56,20 @@ function render(d,state){
  if(state==='live'&&previousState==='locked')selfTestStart=performance.now();
  if(state!==previousState){log(live?'Live sensor stream connected':locked?'Smart key off; acquisition locked':state==='stale'?'Uno/Nano/Mega data missing or stale':'ESP32 connection unavailable');previousState=state;}
  for(const name of names){const s=live?d.sensors[name]:null,c=rowCells[name];c[2].textContent=s?format(s.raw,1):'—';c[3].textContent=s?format(s.voltage_v,3)+' V':'—';c[4].textContent=s?format(s.knob_percent,1)+(numeric(s.knob_percent)?'%':''):'—';
-  let status='Unavailable';if(s){if(name==='TPS')status=numeric(s.throttle_percent)?format(s.throttle_percent,1)+' % · learned endpoints':'Circuit fault (open/short)';else if(name==='O2')status='λ '+format(s.lambda,2)+' · '+(numeric(s.afr)?'AFR '+format(s.afr,1):'AFR off gauge')+' · '+String(s.mixture||'').toUpperCase();else{const est=name==='MAP'?s.estimate_kpa:s.estimate_c;status=numeric(est)?format(est,1)+(name==='MAP'?' kPa · linear model':' °C · NTC model'):'Circuit fault (open/short)';}if(s.in_spec===false&&!status.startsWith('Circuit fault'))status+=' · outside client spec';if(s.endpoint_status==='out_of_range')status+=' · outside knob endpoints';if(s.raw>=1022)status+=' · ADC near full scale';}c[5].textContent=status;
+  let status='Unavailable';if(s){if(name==='TPS')status=numeric(s.throttle_percent)?format(s.throttle_percent,1)+' % · 0–4.25 V = 0–100 %':'ERR · above 4.75 V';else if(name==='O2')status=numeric(s.afr)?'AFR '+format(s.afr,1)+':1 · '+String(s.mixture||'').toUpperCase():'ERR · outside 0.02–1.20 V';else{const est=name==='MAP'?s.estimate_kpa:s.estimate_c;status=numeric(est)?format(est,1)+(name==='MAP'?' kPa · 0 V = 10, 4.21 V = 100':' °C · lookup table'):'ERR · outside valid range';}if(s.in_spec===false&&!status.startsWith('ERR'))status+=' · outside calibrated span';if(s.endpoint_status==='out_of_range')status+=' · outside knob endpoints';if(s.raw>=1022)status+=' · ADC near full scale';}c[5].textContent=status;
 
  }
- for(const name of names){const s=live?d.sensors[name]:null;const value=s?(name==='O2'?s.lambda:name==='TPS'?s.throttle_percent:name==='MAP'?s.estimate_kpa:s.estimate_c):null;$(name.toLowerCase()).textContent=format(value,name==='O2'?2:1);}
+ for(const name of names){const s=live?d.sensors[name]:null;const value=s?(name==='O2'?(numeric(s.afr)?s.voltage_v:null):name==='TPS'?s.throttle_percent:name==='MAP'?s.estimate_kpa:s.estimate_c):null;
+  // ERR like the Mega's serial line when a live sensor is outside its valid range.
+  $(name.toLowerCase()).textContent=s&&!numeric(value)?'ERR':format(value,name==='O2'?2:1);}
  // Battery (Mega A7, 0-30 V divider) and current (A8, 0-10 A) are read even with the smart key off.
- {const v=fresh&&d?d.battery_v:null,a=fresh&&d?d.current_a:null,state=!numeric(v)?'':v<11.8?'low':v>15?'over':v>=13.2?'charging':'ok';$('batteryV').textContent=numeric(v)?format(v,2)+' V':'— V';$('batteryV').dataset.state=state;$('batteryState').textContent=!numeric(v)?(fresh&&d&&d.board!=='mega'?'Mega only · A7 input':'No measurement input'):({low:'Low · below 11.8 V',over:'Overcharging · check regulator',charging:'Charging',ok:'Normal'})[state]+(numeric(a)?' · '+format(a,2)+' A':'');}
+ {const v=fresh&&d?d.battery_v:null,a=fresh&&d?d.current_a:null,state=!numeric(v)?'':v<11.8?'low':v>15?'over':v>=13.2?'charging':'ok';$('batteryV').textContent=numeric(v)?format(v,2)+' V':'— V';$('batteryV').dataset.state=state;
+  // Like the LCD grid: n/a when the board has no battery / current input.
+  const na=fresh&&d&&d.board!=='mega';if(!numeric(v)&&na)$('batteryV').textContent='n/a';$('currentA').textContent=numeric(a)?format(a,2)+' A':na?'n/a':'— A';}
  // References: Mega inputs are plain 0-30 V readings; the Nano's direct 5 V /
  // 3.3 V supply references are flagged LOW or HIGH beyond 5% of nominal.
- document.querySelector('.references').hidden=!!(d&&d.board==='uno');const mega=!!(d&&d.board==='mega');$('ref1Label').textContent=mega?'REFERENCE 1 · 0-30 V':'REFERENCE 1 · 5 V';$('ref2Label').textContent=mega?'REFERENCE 2 · 0-30 V':'REFERENCE 2 · 3.3 V';for(const [id,key,nominal] of [['ref1','reference_1_v',5],['ref2','reference_2_v',3.3]]){const v=live?d[key]:null,ok=numeric(v)&&(mega||Math.abs(v-nominal)<=nominal*.05);$(id).textContent=numeric(v)?format(v,2)+' V'+(ok?'':v<nominal?' · LOW':' · HIGH'):'— V';$(id).dataset.state=numeric(v)?(ok?'ok':'fault'):'';}
- if(!live){$('rpm').textContent=locked?'000':'—';$('rpmBar').textContent=locked?'0.0':'—';}
- $('frequency').textContent=live?format(Math.max(0,Math.min(100,d.frequency_hz/1639*100)),1)+'%':'— %';
- if(!live)setGauge(0);$('frequencyFill').style.width=live?Math.min(100,d.frequency_hz/1639*100)+'%':'0%';
+ const uno=!!(d&&d.board==='uno'),mega=!!(d&&d.board==='mega');for(const [id,key,nominal] of [['ref1','reference_1_v',5],['ref2','reference_2_v',3.3]]){const v=live?d[key]:null,ok=numeric(v)&&(mega||Math.abs(v-nominal)<=nominal*.05);$(id).textContent=uno?'n/a':numeric(v)?format(v,2)+' V'+(ok?'':v<nominal?' LOW':' HIGH'):'— V';$(id).dataset.state=numeric(v)?(ok?'ok':'fault'):'';}
+ if(!live)setRpmGauge(0,locked);
  $('needle').setAttribute('visibility',live?'visible':'hidden');
  renderExtras(d,live,locked);
 }
@@ -95,7 +99,7 @@ async function poll(){
 // Source-age deadline, independent of request timeouts. Don't keep old readings
 // alive just because a request is still pending or retrying.
 setInterval(()=>{if(recentPacket&&performance.now()>=freshUntil){recentPacket=null;render(null,'stale');}},250);
-function drawHistory(){const ctx=$('historyChart').getContext('2d'),key=$('channel').value,max=key==='frequency_hz'?1700:key==='engine_rpm'?300:key==='simulated_rpm'?15000:5;ctx.clearRect(0,0,900,320);ctx.fillStyle='#acbdd1';ctx.font='14px sans-serif';ctx.fillText(`${key==='IAT'?'AIT':key==='engine_rpm'?'Simulated speed':key==='simulated_rpm'?'Simulated RPM':key} · scale 0–${max} ${names.includes(key)?'V':key==='frequency_hz'?'Hz':key==='simulated_rpm'?'rpm':'simulated km/h'}`,20,25);ctx.strokeStyle='#66d4f1';ctx.lineWidth=2;ctx.beginPath();let connected=false;samples.forEach((r,i)=>{if(!r.data){connected=false;return;}const v=names.includes(key)?r.data.sensors[key].voltage_v:(key==='engine_rpm'?displaySpeed(r.data):r.data[key]),x=30+i/119*840,y=280-v/max*230;if(connected)ctx.lineTo(x,y);else ctx.moveTo(x,y);connected=true;});ctx.stroke();ctx.fillStyle='#acbdd1';ctx.fillText('Oldest → newest · gaps mean data unavailable',30,310);$('chartLegend').textContent=last?'Live inputs · '+samples.length+' history samples':'Waiting for fresh data';}
+function drawHistory(){const ctx=$('historyChart').getContext('2d'),key=$('channel').value,max=key==='frequency_hz'?1700:key==='engine_rpm'?250:key==='simulated_rpm'?15000:5;ctx.clearRect(0,0,900,320);ctx.fillStyle='#acbdd1';ctx.font='14px sans-serif';ctx.fillText(`${key==='IAT'?'AIT':key==='engine_rpm'?'Simulated speed':key==='simulated_rpm'?'Simulated RPM':key} · scale 0–${max} ${names.includes(key)?'V':key==='frequency_hz'?'Hz':key==='simulated_rpm'?'rpm':'simulated km/h'}`,20,25);ctx.strokeStyle='#66d4f1';ctx.lineWidth=2;ctx.beginPath();let connected=false;samples.forEach((r,i)=>{if(!r.data){connected=false;return;}const v=names.includes(key)?r.data.sensors[key].voltage_v:(key==='engine_rpm'?displaySpeed(r.data):r.data[key]),x=30+i/119*840,y=280-v/max*230;if(connected)ctx.lineTo(x,y);else ctx.moveTo(x,y);connected=true;});ctx.stroke();ctx.fillStyle='#acbdd1';ctx.fillText('Oldest → newest · gaps mean data unavailable',30,310);$('chartLegend').textContent=last?'Live inputs · '+samples.length+' history samples':'Waiting for fresh data';}
 for(const button of document.querySelectorAll('[data-page]'))button.addEventListener('click',()=>{for(const b of document.querySelectorAll('[data-page]')){const active=b===button;b.setAttribute('aria-pressed',String(active));$(b.dataset.page+'Page').hidden=!active;}drawHistory();});
 $('channel').addEventListener('change',drawHistory);
 $('recordButton').addEventListener('click',()=>{if(!recording&&recorded.length>=3600){$('recordStatus').textContent='Recording limit reached. Export CSV before refreshing.';return;}recording=!recording;updateRecording();log(recording?'Live recording started':'Recording stopped');});
@@ -150,16 +154,12 @@ function animateRpm(now){const dt=Math.min(.1,Math.max(0,(now-lastAnimation)/100
  for(const el of document.querySelectorAll('.display,.race'))el.classList.toggle('self-test',selfTest);
  const mil=String(selfTest||milLit(now));if($('engineLamp').dataset.active!==mil)$('engineLamp').dataset.active=mil;
  syncRaceLamps();
- if(selfTest&&!$('dashboardPage').hidden){const sweep=300*(selfTestMs<SELF_TEST_MS/2?selfTestMs:SELF_TEST_MS-selfTestMs)/(SELF_TEST_MS/2);
-  $('needle').setAttribute('visibility','visible');setGauge(sweep);$('raceSpeed').textContent=String(Math.round(sweep));setRpmGauge(sweep/300*RPM_MAX,true);requestAnimationFrame(animateRpm);return;}
- if(last&&!$('dashboardPage').hidden&&!document.hidden){const before=animatedRpm,difference=displaySpeed(last)-animatedRpm;animatedRpm+=Math.sign(difference)*Math.min(Math.abs(difference),150*dt);
- const digits=String(Math.round(animatedRpm)).padStart(3,'0'),barText=format(animatedRpm,1);
- if($('rpm').textContent!==digits)$('rpm').textContent=digits;
- if($('rpmBar').textContent!==barText)$('rpmBar').textContent=barText;
+ if(selfTest&&!$('dashboardPage').hidden){const sweep=250*(selfTestMs<SELF_TEST_MS/2?selfTestMs:SELF_TEST_MS-selfTestMs)/(SELF_TEST_MS/2);
+  $('needle').setAttribute('visibility','visible');$('raceSpeed').textContent=$('speedKmh').textContent=String(Math.round(sweep));setRpmGauge(sweep/250*RPM_MAX,true);requestAnimationFrame(animateRpm);return;}
+ if(last&&!$('dashboardPage').hidden&&!document.hidden){const difference=displaySpeed(last)-animatedRpm;animatedRpm+=Math.sign(difference)*Math.min(Math.abs(difference),150*dt);
  const raceDigits=String(Math.round(animatedRpm));if($('raceSpeed').textContent!==raceDigits)$('raceSpeed').textContent=raceDigits;
- if(before!==animatedRpm||$('rpmFill').style.width!==animatedRpm/3+'%'){
- setGauge(animatedRpm);}
- // Engine RPM moves faster than the speed needle so gear changes read as a quick drop.
+ if($('speedKmh').textContent!==raceDigits)$('speedKmh').textContent=raceDigits;  // Classic km/h cell, like the LCD.
+ // Engine RPM eases at 20,000 rpm/s, like the LCD.
  const rpmDiff=(numeric(last.simulated_rpm)?last.simulated_rpm:0)-animatedEngineRpm;animatedEngineRpm+=Math.sign(rpmDiff)*Math.min(Math.abs(rpmDiff),20000*dt);setRpmGauge(animatedEngineRpm,true);
  }else if(!last){animatedRpm=0;animatedEngineRpm=0;}requestAnimationFrame(animateRpm);}
 requestAnimationFrame(animateRpm);
@@ -235,7 +235,7 @@ function updateMixture(o2){
  const row=lambda===null?-1:Math.round((lambda-LAMBDA_MIN)/0.05);
  $('afrTable').querySelectorAll('tr').forEach(tr=>[...tr.querySelectorAll('td')].forEach((td,i)=>td.classList.toggle('current',i===row)));
 }
-// Race display: curved segmented bar for simulated engine RPM, 0-15,000.
+// Race display: curved segmented bar for engine RPM (Hz x 15000 / 1549), 0-15,000.
 const RPM_MAX=15000;
 let raceTicksDrawn=false;
 function drawRaceTicks(){
@@ -244,16 +244,11 @@ function drawRaceTicks(){
  const x=v===0?p.x+34:v===15?p.x+14:p.x,y=v===0?p.y+4:p.y-21;ticks+=`<text x="${x.toFixed(1)}" y="${y.toFixed(1)}"${v===15?' style="text-anchor:end"':''}>${v}</text>`;}
  $('raceTicks').innerHTML=ticks;raceTicksDrawn=true;
 }
-function setGauge(value){
- const v=Math.max(0,Math.min(300,value)),fill=v/3+'%',dash=v.toFixed(1)+' 300';
- if($('rpmFill').style.width!==fill)$('rpmFill').style.width=fill;
- $('needle').setAttribute('transform',`rotate(${v/300*180} 200 205)`);
-}
 function setRpmGauge(rpm,show){
- const r=Math.max(0,Math.min(RPM_MAX,rpm)),dash=(r/RPM_MAX*300).toFixed(1)+' 300',fill=(r/RPM_MAX*100).toFixed(2)+'%',text=show?String(Math.round(r/10)*10):'—';
+ const r=Math.max(0,Math.min(RPM_MAX,rpm)),dash=(r/RPM_MAX*300).toFixed(1)+' 300',text=show?String(Math.round(r/10)*10):'—';
  if($('raceFill').getAttribute('stroke-dasharray')!==dash)$('raceFill').setAttribute('stroke-dasharray',dash);
- if($('engineRpmFill').style.width!==fill)$('engineRpmFill').style.width=fill;
- for(const id of ['engineRpm','raceRpm'])if($(id).textContent!==text)$(id).textContent=text;
+ for(const id of ['engineRpm','raceRpm','rpm'])if($(id).textContent!==text)$(id).textContent=text;
+ $('needle').setAttribute('transform',`rotate(${r/RPM_MAX*180} 200 205)`);
 }
 function syncRaceLamps(){
  for(const [race,classic] of [['raceKey','keyLamp'],['raceBrake','brakeLamp'],['raceEngine','engineLamp'],['raceCoolant','coolantLamp']]){const v=$(classic).dataset.active;if($(race).dataset.active!==v)$(race).dataset.active=v;}
@@ -262,10 +257,11 @@ function syncRaceLamps(){
 function renderExtras(d,live,locked){
  const s=live?d.sensors:null,pct=s?s.TPS.throttle_percent:null;
  updateThrottle(throttleDeg(pct));updateMixture(s?s.O2:null);
- $('raceEct').textContent=format(s?.ECT.estimate_c,1);$('raceIat').textContent=format(s?.IAT.estimate_c,1);$('raceMap').textContent=format(s?.MAP.estimate_kpa,1);
- $('raceLambda').textContent=format(s?.O2.lambda,2);$('raceAfr').textContent=format(s?.O2.afr,1);$('raceTps').textContent=format(pct,1);
+ const val=(v,n)=>s&&!numeric(v)?'ERR':format(v,n),o2ok=s&&numeric(s.O2.afr);
+ $('raceEct').textContent=val(s?.ECT.estimate_c,1);$('raceIat').textContent=val(s?.IAT.estimate_c,1);$('raceMap').textContent=val(s?.MAP.estimate_kpa,1);
+ $('raceLambda').textContent=val(o2ok?s.O2.voltage_v:null,2);$('raceAfr').textContent=val(s?.O2.afr,1);$('raceTps').textContent=val(pct,1);
  $('raceFreq').textContent=live?format(d.frequency_hz,0):'—';
- if(!live){$('raceSpeed').textContent=locked?'0':'—';setRpmGauge(0,locked);}
+ if(!live){$('raceSpeed').textContent=$('speedKmh').textContent=locked?'0':'—';setRpmGauge(0,locked);}
 }
 function setView(view){
  const race=view==='race';$('raceDisplay').hidden=!race;document.querySelector('.display').hidden=race;
