@@ -83,7 +83,12 @@ bool parseFrame(char* text) {
     if (i < fieldCount - 1) {
       if (*end != ',') return false;
       p = end + 1;
-    } else if (*end) return false;
+    } else if (*end) {
+      // Newer Nano firmware appends the D8 front wheel Hz x100 to U4; not used here.
+      if (fieldCount != 11 || *end != ',' || end[1] < '0' || end[1] > '9') return false;
+      strtoul(end + 1, &end, 10);
+      if (*end) return false;
+    }
   }
   smartKeyOn = values[0] == 1;
   brakePressed = values[1] == 1;

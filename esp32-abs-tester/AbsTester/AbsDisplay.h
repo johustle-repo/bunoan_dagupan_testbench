@@ -5,32 +5,39 @@
 
 // ABS tester screen on the 4.0" ST7796S TFT + XPT2046 touch panel (landscape
 // 480 x 320), same panel and wiring as esp32-universal-v2:
-//   title | 0-200 km/h gauge + speed bar | BATTERY / CURRENT / REF1 tiles |
-//   output and brake state, START/STOP and RESET.
-// The speed is the testbench D7 knob; only what an ABS unit depends on is
-// shown, no engine sensors. Every power-up starts with a splash and a needle
-// sweep, since the Mega has no smart-key button.
+//   title | 0-250 km/h gauge + front / rear speed bars | BATTERY / CURRENT /
+//   REF1 tiles | output and brake state, START/STOP and RESET.
+// Two wheel-speed sensors, each Hz / 6 km/h: rear on D7 (white needle) and
+// front on Nano / Mega D8 (green needle). Only what an ABS unit depends on is
+// shown, no engine sensors. Every power-up plays an ABS lamp
+// splash, and the switch-on self-test (needle sweep + lamp check) runs when
+// live data first arrives, since the Mega has no smart-key button.
 constexpr int8_t PIN_TFT_SCK = 18, PIN_TFT_MISO = 19, PIN_TFT_MOSI = 23;
 constexpr int8_t PIN_TFT_CS = 27, PIN_TFT_DC = 25, PIN_TFT_RST = 26;
 constexpr int8_t PIN_TOUCH_CS = 33, PIN_TOUCH_IRQ = 32;
 constexpr uint32_t TFT_SPI_HZ = 27000000;
 constexpr uint32_t GAUGE_REFRESH_MS = 50, TEXT_REFRESH_MS = 100, TOUCH_POLL_MS = 20;
-constexpr uint32_t INTRO_LOAD_MS = 1200, INTRO_SWEEP_MS = 1600;  // Power-on animation.
+constexpr uint32_t INTRO_MS = 2600, SELF_TEST_MS = 1600;  // Power-on splash, switch-on sweep.
 
-// Wheel-speed output: a 50 % square wave whose frequency follows the speed,
-// like a wheel-speed sensor on a tone ring. -1 = screen only (SIM).
-// Free pins: GPIO4, 13, 14, 21, 22.
-constexpr int8_t ABS_OUTPUT_PIN = -1;
-constexpr uint8_t ABS_LEDC_CHANNEL = 4;
-constexpr float ABS_TONE_TEETH = 48, ABS_WHEEL_CIRCUMFERENCE_M = 1.9f;
-constexpr float ABS_HZ_PER_KMH = ABS_TONE_TEETH / ABS_WHEEL_CIRCUMFERENCE_M / 3.6f;  // About 7 Hz per km/h.
-constexpr float ABS_SPEED_MAX = 200;
+// Speed formula, the same as the Mega and esp32-universal-v2, for each wheel:
+//   speed = Hz / 6 km/h, max 250; the brake pulls it to 0 at 100 km/h/s.
+constexpr float ABS_HZ_PER_KMH = 6, ABS_SPEED_MAX = 250, ABS_AMBER_KMH = 210;
+enum Wheel : uint8_t { REAR, FRONT };  // D7, D8.
+
+// Wheel-speed outputs: a 50 % square wave per wheel at speed x 6 Hz, so each
+// gives back its input frequency (0 while braking). -1 = screen only (SIM).
+// Free pins: GPIO4, 13, 14, 21, 22. The LEDC channels are on separate timers
+// so the two frequencies are independent.
+constexpr int8_t ABS_OUTPUT_PIN[2] = {-1, -1};  // Rear, front.
+constexpr uint8_t ABS_LEDC_CHANNEL[2] = {4, 6};
+constexpr bool ABS_OUTPUT_SIM = ABS_OUTPUT_PIN[REAR] < 0 && ABS_OUTPUT_PIN[FRONT] < 0;
 
 // What the screen shows, filled by the sketch each loop.
 struct AbsData {
   enum Link : uint8_t { WAITING, LIVE, STALE } link;
   bool keyOn, brake;
-  float speedKmh;
+  bool front;                            // Frame carries the D8 front sensor (Mega).
+  float speedKmh[2], frequencyHz[2];     // Per Wheel, speed from its frequency.
   bool batteryAvailable;  // Mega frame (battery A7, current A8).
   float batteryV, currentA;
   bool references;        // Board sends Reference 1 (Nano / Mega).
@@ -121,21 +128,22 @@ LGFX_Sprite gaugeBand[2] = {LGFX_Sprite(&lcd), LGFX_Sprite(&lcd)};
 // Layout: title | gauge + speed bar on the left, tiles on the right | bottom row.
 constexpr int AG_X = 6, AG_Y = 50, AG_W = 316, AG_H = 176, AG_BAND = 22;   // Gauge bands.
 constexpr int AG_CX = 158, AG_CY = 128, AG_R = 122;                        // In band coordinates.
-constexpr int AS_Y = 234, AS_H = 22, AS_X0 = 18, AS_LEN = 280;             // Speed bar sprite (x 6-322).
+constexpr int AS_Y = 234, AS_H = 22, AS_X0 = 18, AS_LEN = 280;             // Front / rear bar sprite (x 6-322).
+constexpr uint16_t WHEEL_COLOR[2] = {TEXT, GREEN};                          // Rear white, front green.
 constexpr int AT_X = 330, AT_W = 146, AT_Y0 = 48, AT_H = 72, AT_STEP = 76; // Right tiles.
 constexpr int AB_Y = 276, AB_H = 42;                                       // Bottom row.
 constexpr int START_X = 150, START_W = 172, RESET_X = 330, RESET_W = 142;
 const char* const TILES[3] = {"BATTERY", "CURRENT", "REF1"};
 
 // Last text / colour drawn in each slot; a slot is redrawn only when it changes.
-enum Slot : uint8_t { S_TILE0, S_STATE = 3, S_START, S_TITLE, S_BRAKE, S_BRAKE_TEXT, SLOT_COUNT };
+enum Slot : uint8_t { S_TILE0, S_STATE = 3, S_START, S_TITLE, S_BRAKE, S_BRAKE_TEXT, S_HZ, SLOT_COUNT };
 char shown[SLOT_COUNT][24];
 uint16_t shownColor[SLOT_COUNT];
 
-float absKmh = -1;  // Shown / output speed; -1 forces the first draw.
+float absKmh[2] = {-1, -1};  // Shown / output speed per Wheel; -1 forces the first draw.
 bool outputOn = false;
-bool wasTouched = false;
-uint32_t lastTapMs = 0, lastPressMs = 0, lastTouchPollMs = 0, lastGaugeMs = 0, lastTextMs = 0;
+bool wasTouched = false, wasRunning = false, selfTestActive = false;
+uint32_t lastTapMs = 0, lastPressMs = 0, lastTouchPollMs = 0, lastGaugeMs = 0, lastTextMs = 0, selfTestStartMs = 0;
 int32_t shownGaugeKey = -1;
 
 bool changed(uint8_t slot, const char* text, uint16_t color) {
@@ -168,6 +176,11 @@ void field(uint8_t slot, int x, int y, textdatum_t datum, const lgfx::IFont* fon
   lcd.setTextPadding(0);
 }
 
+uint16_t lerpColor(uint32_t a, uint32_t b, float t) {
+  auto ch = [&](int shift) { return uint8_t(((a >> shift) & 0xFF) + t * (int((b >> shift) & 0xFF) - int((a >> shift) & 0xFF))); };
+  return rgb(ch(16), ch(8), ch(0));
+}
+
 inline float gaugeAngle(float kmh) { return PI + constrain(kmh, 0.0f, ABS_SPEED_MAX) / ABS_SPEED_MAX * PI; }
 
 inline void gaugePolar(float kmh, float r, int oy, float& x, float& y) {
@@ -176,19 +189,31 @@ inline void gaugePolar(float kmh, float r, int oy, float& x, float& y) {
   y = AG_CY - oy + sinf(a) * r;
 }
 
-// Above 200 km/h the needle stays at full scale and the digits keep counting.
-void renderGauge(float kmh) {
+// Tapered needle from the hub to the speed.
+void drawNeedle(LGFX_Sprite& c, float kmh, int oy, uint16_t color) {
+  float tx, ty;
+  gaugePolar(kmh, AG_R - 20, oy, tx, ty);
+  const float a = gaugeAngle(kmh), px = -sinf(a) * 5, py = cosf(a) * 5;
+  const int cy = AG_CY - oy;
+  c.fillTriangle(AG_CX + px, cy + py, AG_CX - px, cy - py, tx, ty, color);
+}
+
+// Front (green, left) and rear (white, right) needles and readouts; without
+// the D8 sensor the front needle is hidden and its readout shows "--".
+void renderGauge(const float* kmh, bool front) {
   if (!gaugeBand[0].getBuffer() || !gaugeBand[1].getBuffer()) return;
-  char digits[6];
-  snprintf(digits, sizeof(digits), "%d", int(lroundf(kmh)));
+  char digits[2][6];
+  for (uint8_t w = 0; w < 2; ++w) snprintf(digits[w], sizeof(digits[w]), "%d", int(lroundf(kmh[w])));
+  if (!front) strcpy(digits[FRONT], "--");
   for (int oy = 0, band = 0; oy < AG_H; oy += AG_BAND, ++band) {
     LGFX_Sprite& c = gaugeBand[band & 1];
     c.fillScreen(BG);
     const int cy = AG_CY - oy;
-    // Cyan arc to 170 km/h, amber above, ticks every 10 km/h, labels every 50.
-    c.fillArc(AG_CX, cy, AG_R, AG_R - 6, 180, 333, ACCENT);
-    c.fillArc(AG_CX, cy, AG_R, AG_R - 6, 333, 360, AMBER);
-    for (int i = 0; i <= 20; ++i) {
+    // Cyan arc to 210 km/h, amber above, ticks every 10 km/h, labels every 50.
+    constexpr float AMBER_DEG = 180 + ABS_AMBER_KMH / ABS_SPEED_MAX * 180;
+    c.fillArc(AG_CX, cy, AG_R, AG_R - 6, 180, AMBER_DEG, ACCENT);
+    c.fillArc(AG_CX, cy, AG_R, AG_R - 6, AMBER_DEG, 360, AMBER);
+    for (int i = 0; i <= int(ABS_SPEED_MAX) / 10; ++i) {
       const bool major = i % 5 == 0;
       float x1, y1, x2, y2;
       gaugePolar(i * 10, AG_R - 10, oy, x1, y1);
@@ -202,19 +227,17 @@ void renderGauge(float kmh) {
         label(c, text, tx, ty, TEXT, textdatum_t::middle_center, &fonts::FreeSansBold9pt7b);
       }
     }
-    // Speed and unit centred as one group below the hub.
-    c.setFont(&fonts::FreeSansBold24pt7b);
-    const int dw = c.textWidth(digits);
-    c.setFont(&fonts::FreeSansBold9pt7b);
-    const int uw = c.textWidth("km/h");
-    const int gx = AG_CX - (dw + 6 + uw) / 2;
-    label(c, digits, gx, cy + 44, TEXT, textdatum_t::baseline_left, &fonts::FreeSansBold24pt7b);
-    label(c, "km/h", gx + dw + 6, cy + 42, TEXT, textdatum_t::baseline_left, &fonts::FreeSansBold9pt7b);
-    // Tapered white needle with a cyan hub.
-    float tx, ty;
-    gaugePolar(kmh, AG_R - 20, oy, tx, ty);
-    const float a = gaugeAngle(kmh), px = -sinf(a) * 5, py = cosf(a) * 5;
-    c.fillTriangle(AG_CX + px, cy + py, AG_CX - px, cy - py, tx, ty, TEXT);
+    // FRONT readout left of the hub, REAR right, km/h between them.
+    for (uint8_t w = 0; w < 2; ++w) {
+      const int x = w == FRONT ? AG_CX - 68 : AG_CX + 68;
+      const uint16_t color = w == FRONT && !front ? MUTED : WHEEL_COLOR[w];
+      label(c, w == FRONT ? "FRONT" : "REAR", x, cy + 16, color, textdatum_t::middle_center, &fonts::Font2);
+      label(c, digits[w], x, cy + 47, color, textdatum_t::baseline_center, &fonts::FreeSansBold18pt7b);
+    }
+    label(c, "km/h", AG_CX, cy + 44, MUTED, textdatum_t::baseline_center, &fonts::Font2);
+    // Front needle under the rear one, then the cyan hub.
+    if (front) drawNeedle(c, kmh[FRONT], oy, WHEEL_COLOR[FRONT]);
+    drawNeedle(c, kmh[REAR], oy, WHEEL_COLOR[REAR]);
     c.fillCircle(AG_CX, cy, 10, TEXT);
     c.fillCircle(AG_CX, cy, 7, ACCENT);
     lcd.waitDMA();  // The other buffer's transfer must end before this one starts.
@@ -222,30 +245,39 @@ void renderGauge(float kmh) {
   }
 }
 
-// Read-only speed bar with a marker at the current speed.
-void renderBar(float kmh) {
+// Read-only speed bars, F (front) on top and R (rear) below, each with a
+// marker at its speed. The front bar stays empty without the D8 sensor.
+void renderBar(const float* kmh, bool front) {
   LGFX_Sprite& c = gaugeBand[0];
   if (!c.getBuffer()) return;
   lcd.waitDMA();  // The last gauge band may still be sending from this buffer.
   c.fillScreen(BG);
-  const int cy = AS_H / 2, tx = AS_X0 + lroundf(constrain(kmh, 0.0f, ABS_SPEED_MAX) / ABS_SPEED_MAX * AS_LEN);
-  c.fillRoundRect(AS_X0, cy - 4, AS_LEN, 8, 4, TRACK);
-  if (tx > AS_X0) c.fillRoundRect(AS_X0, cy - 4, tx - AS_X0, 8, 4, ACCENT);
-  c.fillCircle(tx, cy, 7, TEXT);
-  c.fillCircle(tx, cy, 5, ACCENT);
+  for (uint8_t w = 0; w < 2; ++w) {
+    const int cy = w == FRONT ? 5 : 16;
+    const bool shown = w == REAR || front;
+    label(c, w == FRONT ? "F" : "R", 3, cy, shown ? WHEEL_COLOR[w] : MUTED, textdatum_t::middle_left, &fonts::Font0);
+    c.fillRoundRect(AS_X0, cy - 2, AS_LEN, 5, 2, TRACK);
+    if (!shown) continue;
+    const int tx = AS_X0 + lroundf(constrain(kmh[w], 0.0f, ABS_SPEED_MAX) / ABS_SPEED_MAX * AS_LEN);
+    if (tx > AS_X0) c.fillRoundRect(AS_X0, cy - 2, tx - AS_X0, 5, 2, ACCENT);
+    c.fillCircle(tx, cy, 5, WHEEL_COLOR[w]);
+    c.fillCircle(tx, cy, 3, ACCENT);
+  }
   c.pushSprite(&lcd, AG_X, AS_Y);
 }
 
 void applyOutput() {
-  if (ABS_OUTPUT_PIN < 0) return;
-  static bool attached = false;
-  if (!attached) {
-    ledcSetup(ABS_LEDC_CHANNEL, 1000, 10);
-    ledcAttachPin(ABS_OUTPUT_PIN, ABS_LEDC_CHANNEL);
-    attached = true;
+  static bool attached[2] = {};
+  for (uint8_t w = 0; w < 2; ++w) {
+    if (ABS_OUTPUT_PIN[w] < 0) continue;
+    if (!attached[w]) {
+      ledcSetup(ABS_LEDC_CHANNEL[w], 1000, 10);
+      ledcAttachPin(ABS_OUTPUT_PIN[w], ABS_LEDC_CHANNEL[w]);
+      attached[w] = true;
+    }
+    const float hz = outputOn ? absKmh[w] * ABS_HZ_PER_KMH : 0;
+    ledcWriteTone(ABS_LEDC_CHANNEL[w], hz >= 1 ? uint32_t(lroundf(hz)) : 0);
   }
-  const float hz = outputOn ? absKmh * ABS_HZ_PER_KMH : 0;
-  ledcWriteTone(ABS_LEDC_CHANNEL, hz >= 1 ? uint32_t(lroundf(hz)) : 0);
 }
 
 void drawFrame() {
@@ -256,7 +288,7 @@ void drawFrame() {
   lcd.drawRoundRect(AG_X - 2, AG_Y - 2, AG_W + 4, AG_H + 4, 4, EDGE);
   lcd.drawRoundRect(AG_X - 2, AS_Y - 2, AG_W + 4, 40, 4, EDGE);
   label(lcd, "0", AG_X + AS_X0, AS_Y + 36, TEXT, textdatum_t::bottom_center, &fonts::Font2);
-  label(lcd, "200", AG_X + AS_X0 + AS_LEN, AS_Y + 36, TEXT, textdatum_t::bottom_center, &fonts::Font2);
+  label(lcd, "250", AG_X + AS_X0 + AS_LEN, AS_Y + 36, TEXT, textdatum_t::bottom_center, &fonts::Font2);
   for (uint8_t i = 0; i < 3; ++i) {
     const int y = AT_Y0 + i * AT_STEP;
     lcd.drawRoundRect(AT_X, y, AT_W, AT_H, 4, EDGE);
@@ -272,33 +304,73 @@ void drawFrame() {
   shownGaugeKey = -1;
 }
 
-// Power-on animation: title and a loading bar on a splash, then the frame
-// appears and the needle sweeps 0 -> 200 -> 0 km/h with the brake lamp lit.
+// Power-on splash: an ABS warning lamp (a ring sweeping round "ABS", side
+// brackets lighting up), the ABS TESTER title fading in and a loading bar with
+// start-up steps. The needle sweep is the switch-on self-test in update().
 void powerOnAnimation() {
-  constexpr int LX = W / 2 - 120, LY = H / 2 + 44, LW = 240;
+  constexpr int RX = W / 2, RY = 100, R = 50;
+  constexpr int BAR_X = 120, BAR_Y = 260, BAR_W = 240, BAR_H = 8;
+  const char* const STEPS[4] = {"Starting display", "Speed = D7 Hz / 6, max 250 km/h", "Opening testbench link", "Ready"};
   lcd.startWrite();
   lcd.fillScreen(BG);
-  label(lcd, "ABS TESTER", W / 2, H / 2 - 20, ACCENT, textdatum_t::middle_center, &fonts::FreeSansBold24pt7b);
-  label(lcd, "Powering on...", W / 2, H / 2 + 20, MUTED, textdatum_t::middle_center);
-  lcd.drawRoundRect(LX, LY, LW, 12, 6, EDGE);
-  lcd.endWrite();
-  for (uint32_t start = millis(), t = 0; t < INTRO_LOAD_MS; t = millis() - start) {
-    lcd.fillRoundRect(LX + 2, LY + 2, max(8, int((LW - 4) * t / INTRO_LOAD_MS)), 8, 4, ACCENT);
-    delay(15);
+  // Faint background grid and corner brackets.
+  for (int x = 0; x < W; x += 24) lcd.drawFastVLine(x, 0, H, rgb(0x10, 0x18, 0x24));
+  for (int y = 0; y < H; y += 24) lcd.drawFastHLine(0, y, W, rgb(0x10, 0x18, 0x24));
+  for (int k = 0; k < 4; ++k) {
+    const int cx = k & 1 ? W - 12 : 12, cy = k & 2 ? H - 12 : 12, dx = k & 1 ? -24 : 24, dy = k & 2 ? -24 : 24;
+    lcd.drawFastHLine(min(cx, cx + dx), cy, 24, EDGE);
+    lcd.drawFastVLine(cx, min(cy, cy + dy), 24, EDGE);
   }
+  // Lamp ring track with a clear centre for the badge.
+  lcd.fillArc(RX, RY, R, R - 8, 0, 360, TRACK);
+  lcd.fillCircle(RX, RY, R - 12, BG);
+  lcd.drawRoundRect(BAR_X - 2, BAR_Y - 2, BAR_W + 4, BAR_H + 4, 5, EDGE);
+  lcd.endWrite();
+
+  float shownDeg = 270;
+  int shownStep = -1;
+  const uint32_t start = millis();
+  for (uint32_t t = 0; t <= INTRO_MS; t = millis() - start) {
+    const float p = float(t) / INTRO_MS;
+    lcd.startWrite();
+    // Ring sweeps clockwise from the top over the first 60 %, amber at the end.
+    const float deg = 270 + 360 * min(1.0f, p / 0.6f);
+    for (; shownDeg < deg; shownDeg += 4) {
+      const uint16_t color = shownDeg - 270 >= 290 ? AMBER : ACCENT;
+      lcd.fillArc(RX, RY, R, R - 8, shownDeg, min(shownDeg + 4, deg), color);
+    }
+    // Lamp brackets, the ABS badge and the title fade in.
+    const float fade = constrain((p - 0.2f) / 0.4f, 0.0f, 1.0f);
+    const uint16_t bracket = lerpColor(0x06090e, 0xffbd64, fade);
+    lcd.fillArc(RX, RY, R + 18, R + 13, 140, 220, bracket);
+    lcd.fillArc(RX, RY, R + 18, R + 13, 320, 400, bracket);
+    label(lcd, "ABS", RX, RY, lerpColor(0x131d29, 0xffbd64, fade), textdatum_t::middle_center, &fonts::FreeSansBold18pt7b);
+    label(lcd, "ABS TESTER", W / 2, 196, lerpColor(0x0d141e, 0x66d4f1, fade), textdatum_t::middle_center,
+          &fonts::FreeSansBold24pt7b);
+    label(lcd, "Wheel speed  |  Battery  |  Brake", W / 2, 230, lerpColor(0x0d141e, 0xacbdd1, fade),
+          textdatum_t::middle_center, &fonts::Font2);
+    // Loading bar and the current start-up step.
+    const int fill = lroundf(min(1.0f, p) * BAR_W);
+    if (fill > 0) lcd.fillRoundRect(BAR_X, BAR_Y, fill, BAR_H, 3, ACCENT);
+    const int step = min(3, int(p * 4));
+    if (step != shownStep) {
+      shownStep = step;
+      lcd.setFont(&fonts::Font2);
+      lcd.setTextColor(step == 3 ? GREEN : MUTED, BG);
+      lcd.setTextDatum(textdatum_t::middle_center);
+      lcd.setTextPadding(BAR_W + 40);
+      lcd.drawString(STEPS[step], W / 2, BAR_Y + 26);
+      lcd.setTextPadding(0);
+    }
+    lcd.endWrite();
+    delay(16);
+  }
+  delay(350);
   drawFrame();
-  lcd.startWrite();
-  lcd.fillCircle(20, AB_Y + 30, 5, RED);  // Lamp check; drawText redraws it afterwards.
-  for (uint32_t start = millis(), t = 0; t < INTRO_SWEEP_MS; t = millis() - start) {
-    const float kmh = ABS_SPEED_MAX * sinf(PI * t / INTRO_SWEEP_MS);  // Eases out and back.
-    renderGauge(kmh);
-    renderBar(kmh);
-  }
-  lcd.endWrite();
 }
 
-void drawText(const AbsData& d, bool running) {
-  char text[16];
+void drawText(const AbsData& d, bool running, bool selfTest) {
+  char text[24];
   const bool havePacket = d.link != AbsData::WAITING;
   for (uint8_t i = 0; i < 3; ++i) {
     uint16_t color = TEXT;
@@ -319,13 +391,21 @@ void drawText(const AbsData& d, bool running) {
   // Output state on top, brake switch (D9) below it.
   field(S_STATE, 14, AB_Y + 13, textdatum_t::middle_left, &fonts::FreeSansBold9pt7b,
         outputOn ? GREEN : TEXT, outputOn ? "OUTPUT ON" : "OUTPUT OFF", 128);
-  const bool braking = havePacket && d.brake;
-  if (changed(S_BRAKE, braking ? "1" : "0", braking ? RED : LAMP_OFF)) {
-    lcd.fillCircle(20, AB_Y + 30, 5, braking ? RED : LAMP_OFF);
-    lcd.drawCircle(20, AB_Y + 30, 5, braking ? RED : LAMP_RING);
+  // The switch-on self-test lights the lamp as a lamp check.
+  const bool braking = havePacket && d.brake, lit = braking || selfTest;
+  if (changed(S_BRAKE, lit ? "1" : "0", lit ? RED : LAMP_OFF)) {
+    lcd.fillCircle(20, AB_Y + 30, 5, lit ? RED : LAMP_OFF);
+    lcd.drawCircle(20, AB_Y + 30, 5, lit ? RED : LAMP_RING);
   }
-  field(S_BRAKE_TEXT, 32, AB_Y + 30, textdatum_t::middle_left, &fonts::Font2, braking ? RED : MUTED,
-        braking ? "BRAKE ON" : "BRAKE OFF", 100);
+  field(S_BRAKE_TEXT, 32, AB_Y + 30, textdatum_t::middle_left, &fonts::Font2, selfTest ? AMBER : braking ? RED : MUTED,
+        selfTest ? "LAMP CHECK" : braking ? "BRAKE ON" : "BRAKE OFF", 100);
+  // The speed formula's input under the speed bar.
+  // Each wheel's input frequency (speed = Hz / 6) under the bars.
+  if (!running) strcpy(text, "F -- Hz | R -- Hz");
+  else if (d.front) snprintf(text, sizeof(text), "F %.0f Hz | R %.0f Hz", d.frequencyHz[FRONT], d.frequencyHz[REAR]);
+  else snprintf(text, sizeof(text), "F n/a | R %.0f Hz", d.frequencyHz[REAR]);
+  field(S_HZ, AG_X + AS_X0 + AS_LEN / 2, AS_Y + 36, textdatum_t::bottom_center, &fonts::Font2,
+        running ? MUTED : LAMP_RING, text, 200);
   // START turns into an amber STOP while the output runs.
   if (changed(S_START, outputOn ? "STOP" : "START", outputOn ? AMBER : ACCENT)) {
     lcd.fillRoundRect(START_X, AB_Y + 4, START_W, AB_H - 8, 6, outputOn ? AMBER : ACCENT);
@@ -334,11 +414,12 @@ void drawText(const AbsData& d, bool running) {
   }
   // Title corner: link problems first, then SIM (no output pin) or the output frequency.
   uint16_t color = AMBER;
-  if (d.link == AbsData::WAITING) { strcpy(text, "WAITING"); color = RED; }
+  if (selfTest) { strcpy(text, "SELF TEST"); color = ACCENT; }
+  else if (d.link == AbsData::WAITING) { strcpy(text, "WAITING"); color = RED; }
   else if (d.link == AbsData::STALE) { strcpy(text, "NO LINK"); color = RED; }
   else if (!d.keyOn) strcpy(text, "KEY OFF");
-  else if (ABS_OUTPUT_PIN < 0) strcpy(text, "SIM");
-  else if (outputOn) snprintf(text, sizeof(text), "%.0f Hz", absKmh * ABS_HZ_PER_KMH);
+  else if (ABS_OUTPUT_SIM) strcpy(text, "SIM");
+  else if (outputOn) strcpy(text, "OUT ON");  // The frequencies are under the bars.
   else strcpy(text, "OFF");
   field(S_TITLE, W - 14, 24, textdatum_t::middle_right, &fonts::FreeSansBold12pt7b, color, text, 130);
 }
@@ -405,23 +486,40 @@ void update(const AbsData& d) {
   const uint32_t now = millis();
   handleTouch(now);
   const bool running = d.link == AbsData::LIVE && d.keyOn;
-  // The output follows the speed, so it is updated whenever the speed changes.
-  const float kmh = running ? roundf(d.speedKmh) : 0;
-  if (kmh != absKmh) { absKmh = kmh; applyOutput(); }
-  if (now - lastGaugeMs >= GAUGE_REFRESH_MS) {
+  // Switch-on self-test: when live data first arrives (or the key turns on)
+  // both needles and bars sweep 0 -> 250 -> 0 km/h with the lamp lit.
+  if (running && !wasRunning) { selfTestActive = true; selfTestStartMs = now; }
+  wasRunning = running;
+  const uint32_t testMs = now - selfTestStartMs;
+  if (selfTestActive && testMs >= SELF_TEST_MS) selfTestActive = false;
+  const bool selfTest = selfTestActive;
+  // The outputs follow the real speeds (also during the self-test), so they
+  // are updated whenever a speed changes.
+  bool speedChanged = false;
+  for (uint8_t w = 0; w < 2; ++w) {
+    const float kmh = running && (w == REAR || d.front) ? roundf(d.speedKmh[w]) : 0;
+    if (kmh != absKmh[w]) { absKmh[w] = kmh; speedChanged = true; }
+  }
+  if (speedChanged) applyOutput();
+  if (now - lastGaugeMs >= GAUGE_REFRESH_MS || selfTest) {
     lastGaugeMs = now;
-    if (int32_t(absKmh) != shownGaugeKey) {
-      shownGaugeKey = int32_t(absKmh);
+    const float sweep = ABS_SPEED_MAX * sinf(PI * testMs / SELF_TEST_MS);  // Eases out and back.
+    const float shownKmh[2] = {selfTest ? sweep : absKmh[REAR], selfTest ? sweep : absKmh[FRONT]};
+    const bool front = selfTest || d.front;
+    const int32_t key = int32_t(lroundf(shownKmh[REAR])) | int32_t(lroundf(shownKmh[FRONT])) << 9 |
+                        int32_t(selfTest) << 18 | int32_t(front) << 19;
+    if (key != shownGaugeKey) {
+      shownGaugeKey = key;
       lcd.startWrite();
-      renderGauge(absKmh);
-      renderBar(absKmh);
+      renderGauge(shownKmh, front);
+      renderBar(shownKmh, front);
       lcd.endWrite();
     }
   }
   if (now - lastTextMs < TEXT_REFRESH_MS) return;
   lastTextMs = now;
   lcd.startWrite();
-  drawText(d, running);
+  drawText(d, running, selfTest);
   lcd.endWrite();
 }
 

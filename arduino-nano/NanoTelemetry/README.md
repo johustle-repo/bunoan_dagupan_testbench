@@ -1,6 +1,8 @@
 # Arduino Nano telemetry (sample set 2: Nano + ESP32)
 
-Same firmware as arduino-uno/DashboardTelemetry. The Nano uses the same ATmega328P and the same pin numbers, so only names changed (sketch name, board check, USB JSON source "nano_live"). The ESP32 link uses the U4 frame (U3 plus the two reference voltages).
+Same firmware as arduino-uno/DashboardTelemetry. The Nano uses the same ATmega328P and the same pin numbers, so only names changed (sketch name, board check, USB JSON source "nano_live"). The ESP32 link uses the U4 frame (U3 plus the two reference voltages, then the D8 front wheel frequency × 100).
+
+**Two wheel-speed sensors, no smart key:** D7 is the rear sensor and D8 the front one (D8 was the smart-key button). Acquisition starts at power-up, like the Mega. Each speed = its Hz ÷ 6 km/h, max 250, and ramps to 0 at 100 km/h per second while the brake is pressed. The U4 speed field and the USB `engine_rpm` value are now the rear speed in km/h (it was the 0–300 mapped RPM); the USB JSON also has `rear_speed_kmh`, `front_frequency_hz` and `front_speed_kmh`. The ESP32 receivers (universal v2, ABS tester, esp32-nano, esp32-universal) accept the longer U4 frame; reflash them with this version.
 
 Open NanoTelemetry.ino with Buttons.h, RpmRamp.h, SensorConversion.h and SerialLink.h in the same folder.
 Board: Tools > Board > Arduino AVR Boards > Arduino Nano. Processor: ATmega328P; for clone Nanos that fail to upload ("not in sync"), choose ATmega328P (Old Bootloader). USB Serial Monitor: 115200 baud.
@@ -16,8 +18,8 @@ Board: Tools > Board > Arduino AVR Boards > Arduino Nano. Processor: ATmega328P;
 | A4 | TPS knob signal |
 | A5 | Reference 1: testbench 5 V output (direct, max 5 V) |
 | A6 | Reference 2: testbench 3.3 V output (direct) |
-| D7 | Frequency input (0–1639 Hz, 0–5 V square wave), sampled by Timer1 at 20 kHz |
-| D8 | Smart-key button, normally open to GND (INPUT_PULLUP, each press toggles) |
+| D7 | Rear wheel-speed sensor / frequency input (0–5 V square wave), sampled by Timer1 at 20 kHz |
+| D8 | Front wheel-speed sensor (0–5 V square wave), sampled with D7 |
 | D9 | Brake switch, released LOW / pressed HIGH (INPUT_PULLUP, normally-closed to GND) |
 | D6 | SoftwareSerial TX, 19200 baud 8N1 → level shifter → ESP32 GPIO17 |
 | D5 | SoftwareSerial RX (unused, one-way link) |

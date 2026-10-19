@@ -34,7 +34,7 @@ Board: Tools > Board > Arduino AVR Boards > Arduino Mega or Mega 2560. Processor
 | A6 | Reference 2, 0–30 V, through the divider below |
 | A7 | Battery voltage, 0–30 V, through the divider below |
 | A8 | Current sensor output, 0–5 V = 0–10 A (direct, max 5 V) |
-| D7 | Frequency input (0–1639 Hz, 0–5 V square wave), sampled by Timer1 at 20 kHz |
+| D7 | RPM / frequency input (0–1639 Hz, 0–5 V square wave), sampled by Timer1 at 20 kHz |
 | D8 | Not used. There is no smart-key button: readings start at power-up and the ESP32 plays its power-on animation |
 | D9 | Brake switch, released LOW / pressed HIGH (INPUT_PULLUP, normally-closed to GND) |
 | D6 | SoftwareSerial TX, 19200 baud 8N1 → divider or level shifter → ESP32 GPIO17 |

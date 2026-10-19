@@ -78,26 +78,26 @@ bool parseFrame(char* text) {
   // U3 (Uno): key, brake, 5 x ADC (1/16 counts), Hz x100, RPM x100.
   // U4 (Nano): the same, plus Reference 1 and 2 in mV.
   // U5 (Mega): U4 plus the battery in mV and the current in mA.
-  uint8_t fieldCount;
+  // U4 and U5 may end with the D8 front wheel Hz x100 (used by the ABS tester only).
+  uint8_t fieldCount, maxFields;
   Board frameBoard;
-  if (strncmp(text, "U3,", 3) == 0) { fieldCount = 9; frameBoard = BOARD_UNO; }
-  else if (strncmp(text, "U4,", 3) == 0) { fieldCount = 11; frameBoard = BOARD_NANO; }
-  else if (strncmp(text, "U5,", 3) == 0) { fieldCount = 13; frameBoard = BOARD_MEGA; }
+  if (strncmp(text, "U3,", 3) == 0) { fieldCount = maxFields = 9; frameBoard = BOARD_UNO; }
+  else if (strncmp(text, "U4,", 3) == 0) { fieldCount = 11; maxFields = 12; frameBoard = BOARD_NANO; }
+  else if (strncmp(text, "U5,", 3) == 0) { fieldCount = 13; maxFields = 14; frameBoard = BOARD_MEGA; }
   else return false;
   // References and battery allow 40 V: a 30 V input reads a little over 30
   // when the Mega's supply is above 5 V.
-  constexpr unsigned long maximum[13] = {
-      1, 1, 16368, 16368, 16368, 16368, 16368, 100000000UL, 30000, 40000, 40000, 40000, 10500};
-  unsigned long values[13];
+  constexpr unsigned long maximum[14] = {
+      1, 1, 16368, 16368, 16368, 16368, 16368, 100000000UL, 30000, 40000, 40000, 40000, 10500, 100000000UL};
+  unsigned long values[14];
   char* p = text + 3;
-  for (uint8_t i = 0; i < fieldCount; ++i) {
+  for (uint8_t i = 0; i < maxFields; ++i) {
     if (*p < '0' || *p > '9') return false;
     values[i] = strtoul(p, &end, 10);
-    if (values[i] > maximum[i]) return false;
-    if (i < fieldCount - 1) {
-      if (*end != ',') return false;
-      p = end + 1;
-    } else if (*end) return false;
+    if (values[i] > (i == fieldCount ? 100000000UL : maximum[i])) return false;  // Front Hz.
+    if (!*end && i + 1 >= fieldCount) break;
+    if (*end != ',' || i + 1 == maxFields) return false;
+    p = end + 1;
   }
   smartKeyOn = values[0] == 1;
   brakePressed = values[1] == 1;

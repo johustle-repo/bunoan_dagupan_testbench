@@ -2,9 +2,10 @@
 #include <Arduino.h>
 
 // Wi-Fi dashboard for the ABS tester, served from flash at http://192.168.4.1/.
-// Same look as the 2.8" LCD: 0-15,000 RPM gauge, REAR and DC LOG bars, REF1 / REF2 /
-// CURRENT / BATTERY tiles, key / brake / frequency footer. It polls /api/live
-// four times a second; with the key off it shows the "PRESS START" panel.
+// Same look as the 2.8" LCD: 0-250 km/h speedometer, ABS / TCS / SENSOR warning
+// lights, REAR / FRONT (0-250 km/h) bars, REF1 / REAR / FRONT / BATTERY tiles,
+// key / brake / frequency + DECLOG footer. It polls /api/live four times a second; until live data arrives it
+// shows the WAITING FOR NANO / NO LINK panel.
 const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -35,6 +36,12 @@ max-width:90px;margin-left:auto}
 .segs i{background:var(--track);border-radius:1px}
 .bar-row strong{text-align:right;font-size:20px;font-weight:500;font-variant-numeric:tabular-nums}
 .bar-row strong.hot{color:var(--red)}
+.lamps{padding:10px 14px;display:flex;gap:10px}
+.tt{flex:1;text-align:center;padding:6px 0;border-radius:8px;font-weight:800;letter-spacing:1px;
+background:#233044;border:1px solid #63738a;color:#63738a}
+.tt.lit{background:var(--amber);border-color:transparent;color:var(--bg)}
+.tt.lit.ok{background:var(--green)}
+.tile strong.hot{color:var(--red)}.tile strong.dim{color:var(--muted)}
 .tiles{display:grid;gap:12px;grid-template-rows:repeat(4,1fr)}
 .tile{position:relative;padding:10px 14px 10px 20px;display:flex;flex-direction:column;justify-content:space-between;min-height:84px}
 .tile:before{content:'';position:absolute;left:7px;top:10px;bottom:10px;width:4px;border-radius:2px;background:var(--c)}
@@ -59,57 +66,68 @@ footer>div:last-child{justify-content:flex-end;color:var(--muted);font-variant-n
 <header><h1>ABS TESTER</h1><div class="slashes"></div><span class="wifi">Wi-Fi ABS-Tester · 192.168.4.1</span><span class="pill" id="pill">WAITING</span></header>
 <div class="grid">
  <div class="left">
-  <section class="panel gauge"><svg viewBox="0 0 260 178" id="gauge" aria-label="RPM gauge">
+  <section class="panel gauge"><svg viewBox="0 0 260 178" id="gauge" aria-label="Speedometer">
    <circle cx="130" cy="138" r="122" fill="var(--steel)"/><circle cx="130" cy="138" r="120" fill="var(--edge)"/>
    <circle cx="130" cy="138" r="117" fill="var(--face)"/>
    <path id="track" d="M18 138A112 112 0 0 1 242 138" fill="none" stroke="var(--track)" stroke-width="8"/>
    <path id="lit" d="M18 138A112 112 0 0 1 242 138" fill="none" stroke="var(--accent)" stroke-width="8" pathLength="200" stroke-dasharray="0 200"/>
    <path id="redline" fill="none" stroke="var(--red)" stroke-width="2.5"/>
    <circle cx="130" cy="138" r="70" fill="#0f1722"/>
-   <text x="200" y="158" text-anchor="middle" font-size="9" fill="var(--muted)">x1000</text>
+   <text x="58" y="158" text-anchor="middle" font-size="9" fill="var(--red)">REAR</text>
+   <text x="202" y="158" text-anchor="middle" font-size="9" fill="var(--green)" id="frontLegend">FRONT</text>
    <g id="ticks"></g>
+   <g id="frontNeedle"><line x1="130" y1="138" x2="30" y2="138" stroke="var(--green)" stroke-width="2"/><circle cx="30" cy="138" r="2.5" fill="var(--green)"/></g>
    <g id="needle"><polygon points="130,134 130,142 30,138" fill="var(--red)"/><polygon points="130,134 130,142 147,138" fill="var(--red)"/>
     <line x1="130" y1="138" x2="30" y2="138" stroke="var(--text)" stroke-width=".8"/></g>
    <circle cx="130" cy="138" r="9" fill="var(--steel)"/><circle cx="130" cy="138" r="6.5" fill="var(--edge)"/><circle cx="130" cy="138" r="2.5" fill="var(--red)"/>
    <rect x="78" y="147" width="104" height="27" rx="5" fill="#050a10" stroke="var(--edge)"/>
-   <text x="130" y="168" text-anchor="middle" fill="var(--text)" font-size="26" font-weight="700"><tspan id="rpmText">0</tspan><tspan dx="4" font-size="10" font-weight="400" fill="var(--muted)">RPM</tspan></text>
+   <text x="130" y="168" text-anchor="middle" fill="var(--text)" font-size="26" font-weight="700"><tspan id="speedText">0</tspan><tspan dx="4" font-size="10" font-weight="400" fill="var(--muted)">km/h</tspan></text>
   </svg></section>
+  <section class="panel lamps">
+   <div class="tt" id="absLamp">(ABS)</div><div class="tt" id="tcsLamp">TCS</div><div class="tt" id="sensorLamp">SENSOR</div>
+  </section>
   <section class="panel bars">
-   <div class="bar-row"><span class="tag">REAR</span><div class="segs" id="rearBar"></div><strong id="rear">0 km/h</strong></div>
-   <div class="bar-row"><span class="tag">DC LOG</span><div class="segs" id="dcBar"></div><strong id="dc">0%</strong></div>
+   <div class="bar-row"><span class="tag">REAR</span><div class="segs" id="rearBar"></div><strong id="rearBarText">0 km/h</strong></div>
+   <div class="bar-row"><span class="tag">FRONT</span><div class="segs" id="frontBar"></div><strong id="frontBarText">0 km/h</strong></div>
   </section>
  </div>
  <div class="tiles">
   <div class="panel tile" style="--c:var(--accent)"><span>REF1</span><strong id="ref1">— V</strong></div>
-  <div class="panel tile" style="--c:var(--accent)"><span>REF2</span><strong id="ref2">— V</strong></div>
-  <div class="panel tile" style="--c:var(--amber)"><span>CURRENT</span><strong id="current">— A</strong></div>
-  <div class="panel tile" style="--c:var(--green)"><span>BATTERY</span><strong id="battery">— V</strong></div>
+  <div class="panel tile" style="--c:var(--text)"><span>REAR</span><strong id="rear">— km/h</strong></div>
+  <div class="panel tile" style="--c:var(--green)"><span>FRONT</span><strong id="front">— km/h</strong></div>
+  <div class="panel tile" style="--c:var(--amber)"><span>BATTERY</span><strong id="battery">— V</strong></div>
  </div>
 </div>
 <footer class="panel"><div><i class="lamp" id="keyLamp"></i><span id="keyText">KEY OFF</span></div>
-<div><i class="lamp" id="brakeLamp"></i><span id="brakeText">BRAKE OFF</span></div><div id="hz">0 Hz</div></footer>
+<div><i class="lamp" id="brakeLamp"></i><span id="brakeText">BRAKE OFF</span></div><div id="hz">0 RPM · DECLOG 0%</div></footer>
 </main>
 <div class="locked" id="locked"><div class="panel">
  <svg width="64" height="34" viewBox="0 0 64 34" aria-hidden="true"><circle cx="16" cy="17" r="13" fill="currentColor"/><circle cx="16" cy="17" r="6" fill="var(--panel)"/>
  <rect x="27" y="14" width="34" height="7" fill="currentColor"/><rect x="47" y="21" width="5" height="8" fill="currentColor"/><rect x="55" y="21" width="5" height="11" fill="currentColor"/></svg>
  <h2 id="lockTitle">WAITING FOR NANO</h2><p id="lockText">Connecting to the ABS tester…</p></div></div>
 <script>
-const $=id=>document.getElementById(id),CX=130,CY=138,MAX=200;
-const pt=(v,r)=>{const a=Math.PI+Math.min(Math.max(v,0),MAX)/MAX*Math.PI;return[CX+Math.cos(a)*r,CY+Math.sin(a)*r];};
+// Speedometer, 0-250 km/h: red needle and readout = rear wheel, green needle = front.
+const $=id=>document.getElementById(id),CX=130,CY=138,SPEED_MAX=250,SPEED_RED=210;
+const pt=(v,r)=>{const a=Math.PI+Math.min(Math.max(v,0),SPEED_MAX)/SPEED_MAX*Math.PI;return[CX+Math.cos(a)*r,CY+Math.sin(a)*r];};
 const arc=(v0,v1,r)=>{const[a,b]=pt(v0,r),[c,d]=pt(v1,r);return`M${a} ${b}A${r} ${r} 0 0 1 ${c} ${d}`;};
-// The dial is drawn on a 0-200 scale; RPM maps onto it (15,000 rpm = 200).
-const RPM_MAX=15000,RPM_RED=12000,rpmV=r=>r/RPM_MAX*MAX;
-$('redline').setAttribute('d',arc(rpmV(RPM_RED),200,118));
-const rpmColor=r=>r>=RPM_RED?'var(--red)':r>=9000?'var(--amber)':'var(--accent)';
-// Ticks every 1,000 rpm, majors (labelled in x1000) every 3,000.
-let ticks='';for(let i=0;i<=15;i++){const major=i%3==0,v=rpmV(i*1000),c=i*1000>=RPM_RED?'var(--red)':'var(--text)';
+$('redline').setAttribute('d',arc(SPEED_RED,SPEED_MAX,118));
+// Ticks every 10 km/h, majors (labelled) every 50.
+let ticks='';for(let v=0;v<=SPEED_MAX;v+=10){const major=v%50==0,c=v>=SPEED_RED?'var(--red)':'var(--text)';
  const[x1,y1]=pt(v,104),[x2,y2]=pt(v,major?92:98);ticks+=`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${c}" stroke-width="${major?3:1.2}"/>`;
- if(major){const[tx,ty]=pt(v,78);ticks+=`<text x="${tx}" y="${ty+4}" text-anchor="middle" fill="${c}" font-size="12">${i}</text>`;}}
+ if(major){const[tx,ty]=pt(v,76);ticks+=`<text x="${tx}" y="${ty+4}" text-anchor="middle" fill="${c}" font-size="12">${v}</text>`;}}
 $('ticks').innerHTML=ticks;
-for(const id of['rearBar','dcBar'])$(id).innerHTML='<i></i>'.repeat(30);
-const speedColor=v=>v>=170?'var(--red)':v>=120?'var(--amber)':'var(--accent)';
+const rotate=v=>`rotate(${Math.min(Math.max(v,0),SPEED_MAX)/SPEED_MAX*180} ${CX} ${CY})`;
+for(const id of['rearBar','frontBar'])$(id).innerHTML='<i></i>'.repeat(30);
+// Warning lights: "on" steady, "flash" blinks (2 Hz), "ok" is the green SENSOR state.
+let lampStates={};
+function lamps(){const blink=Math.floor(Date.now()/250)%2;
+ for(const[id,s]of Object.entries(lampStates)){const lit=s==='on'||s==='ok'||(s==='flash'&&blink);
+  $(id).className='tt'+(lit?' lit':'')+(s==='ok'?' ok':'');}}
+setInterval(lamps,125);
+// Wheel speeds (Hz / 6 km/h) are on a 0-250 scale: amber from 150, red from 210.
+const speedColor=v=>v>=210?'var(--red)':v>=150?'var(--amber)':'var(--accent)';
 function bar(id,f,speed){[...$(id).children].forEach((s,i)=>{const at=i/30,on=at<f;
- s.style.background=!on?'':speed?speedColor(at*MAX):'var(--accent)';});}
+ s.style.background=!on?'':speed?speedColor(at*SPEED_MAX):'var(--accent)';});}
 const fmt=(v,d)=>typeof v==='number'?v.toFixed(d):'—';
 function show(d){
  const live=d.link==='live',on=live&&d.key;
@@ -117,23 +135,27 @@ function show(d){
  $('pill').className='pill'+(on?' live':live?' off':'');
  $('locked').hidden=on;$('locked').className='locked'+(live?'':' fault');
  $('lockTitle').textContent=!live?(d.link==='stale'?'NO LINK':'WAITING FOR NANO'):'PRESS START';
- $('lockText').textContent=live?'Press the starter button (D8)':'Check Nano D6 → ESP32 GPIO17 and GND';
+ $('lockText').textContent=live?'Update the Nano firmware':'Check Nano D5 → ESP32 GPIO16 (RX2) and GND';
  $('locked').querySelector('svg').style.color=live?'var(--amber)':'var(--red)';
  if(!on)return;
- const v=d.speed_kmh,shown=Math.min(Math.max(v,0),MAX);
- const rpm=Math.min(Math.max(d.rpm||0,0),RPM_MAX);
- $('needle').setAttribute('transform',`rotate(${rpmV(rpm)/MAX*180} ${CX} ${CY})`);
- $('lit').setAttribute('stroke-dasharray',`${rpmV(rpm)} 200`);
- $('lit').setAttribute('stroke',rpmColor(rpm));
- $('rpmText').textContent=Math.round(rpm);$('rpmText').setAttribute('fill',rpm>=RPM_RED?'var(--red)':'var(--text)');
- bar('rearBar',shown/MAX,true);bar('dcBar',d.dc_log_percent/100,false);
- $('rear').textContent=Math.round(v)+' km/h';$('rear').className=v>=170?'hot':'';
- $('dc').textContent=Math.round(d.dc_log_percent)+'%';
- $('ref1').textContent=fmt(d.ref1_v,2)+' V';$('ref2').textContent=fmt(d.ref2_v,2)+' V';
- $('current').textContent=fmt(d.current_a,2)+' A';$('battery').textContent=fmt(d.battery_v,2)+' V';
+ const v=d.speed_kmh,shown=Math.min(Math.max(v,0),SPEED_MAX);
+ const fv=d.front?d.front_speed_kmh:0,fShown=Math.min(Math.max(fv,0),SPEED_MAX);
+ $('needle').setAttribute('transform',rotate(v));
+ $('frontNeedle').setAttribute('transform',rotate(fv));$('frontNeedle').style.display=d.front?'':'none';
+ $('frontLegend').setAttribute('fill',d.front?'var(--green)':'#63738a');
+ $('lit').setAttribute('stroke-dasharray',`${shown/SPEED_MAX*200} 200`);
+ $('lit').setAttribute('stroke',speedColor(shown));
+ $('speedText').textContent=Math.round(v);$('speedText').setAttribute('fill',v>=SPEED_RED?'var(--red)':'var(--text)');
+ bar('rearBar',shown/SPEED_MAX,true);bar('frontBar',fShown/SPEED_MAX,true);
+ $('rearBarText').textContent=Math.round(v)+' km/h';
+ $('frontBarText').textContent=d.front?Math.round(fv)+' km/h':'-- km/h';
+ $('rear').textContent=Math.round(v)+' km/h';$('rear').className=v>=210?'hot':'';
+ $('front').textContent=d.front?Math.round(fv)+' km/h':'-- km/h';$('front').className=!d.front?'dim':fv>=210?'hot':'';
+ lampStates={absLamp:d.abs_lamp,tcsLamp:d.tcs_lamp,sensorLamp:d.sensor_lamp};lamps();
+ $('ref1').textContent=fmt(d.ref1_v,2)+' V';$('battery').textContent=fmt(d.battery_v,2)+' V';
  $('keyLamp').className='lamp on';$('keyText').textContent='KEY ON';
  $('brakeLamp').className='lamp'+(d.brake?' on':'');$('brakeText').textContent=d.brake?'BRAKE ON':'BRAKE OFF';
- $('brakeText').style.color=d.brake?'var(--red)':'';$('hz').textContent=Math.round(d.frequency_hz)+' Hz';
+ $('brakeText').style.color=d.brake?'var(--red)':'';$('hz').textContent=(d.rpm||0)+' RPM · DECLOG '+Math.round(d.declog_percent)+'%';
 }
 async function poll(){try{const r=await fetch('/api/live',{cache:'no-store'});show(await r.json());}
  catch(e){show({link:'stale'});}setTimeout(poll,250);}

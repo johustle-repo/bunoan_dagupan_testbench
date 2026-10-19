@@ -4,19 +4,19 @@ A separate sketch from `esp32-universal-v2`. The ESP32 receives the testbench fr
 
 | Screen item | Source |
 |---|---|
-| 0-200 km/h gauge and speed bar | Testbench D7 speed knob (same speed as the universal receiver; above 200 the needle stays at full scale, the digits keep counting) |
+| 0-250 km/h gauge, FRONT / REAR readouts and F / R bars | Two wheel-speed sensors: **rear on D7** (white needle) and **front on Nano / Mega D8** (green needle). Each **speed = Hz ÷ 6 km/h, max 250** (same formula as the Mega and esp32-universal-v2). Eases at 100 km/h per second; the brake (D9) pulls both to 0. Both frequencies are shown under the bars. Uno frames and older Nano / Mega firmware have no front sensor: the front needle is hidden and FRONT shows -- |
 | BATTERY | Mega A7, 0-30 V. Green ≥ 13.2 V, orange < 11.8 V or > 15 V |
 | CURRENT | Mega A8, 0-10 A |
 | REF1 | Mega A5, 0-30 V |
 | BRAKE ON / OFF | Brake switch D9 |
-| Title corner | WAITING / NO LINK / KEY OFF, then SIM (no output pin) or the output frequency |
+| Title corner | SELF TEST, WAITING / NO LINK / KEY OFF, then SIM (no output pin) or the output frequency |
 
-**Power-on animation:** the Mega has no smart-key button (D8 is unused), so every time the system powers up the ESP32 shows an ABS TESTER splash with a loading bar, then sweeps the needle and speed bar 0 → 200 → 0 km/h with the brake lamp lit (about 3 s) before live readings start.
+**Switch-on animation:** the Mega has no smart-key button (D8 is unused), so every power-up plays an ABS warning-lamp splash (about 3 s): a ring sweeps round "ABS", the lamp brackets and the ABS TESTER title fade in, and a loading bar fills with the start-up steps. When live data first arrives (or the key turns on with an Uno / Nano) the switch-on self-test sweeps both needles and bars 0 → 250 → 0 km/h with the lamp lit and LAMP CHECK / SELF TEST shown (1.6 s), then live readings start. It runs again if the link drops and comes back.
 
-**START / STOP** turns the wheel-speed output on and off; **RESET** turns it off. There is no Wi-Fi dashboard.
+**START / STOP** turns the wheel-speed outputs on and off; **RESET** turns it off. There is no Wi-Fi dashboard.
 
 ## Wheel-speed output
-"SIM" means no output pin is set, so START only changes the screen. Set `ABS_OUTPUT_PIN` in AbsDisplay.h to a free pin (GPIO4, 13, 14, 21 or 22) to get a 3.3 V, 50 % square wave that follows the speed: about 7 Hz per km/h, from `ABS_TONE_TEETH` (48) and `ABS_WHEEL_CIRCUMFERENCE_M` (1.9 m). Most ABS inputs need more than 3.3 V, so drive them through a transistor or driver stage.
+"SIM" means no output pin is set, so START only changes the screen. Set `ABS_OUTPUT_PIN` in AbsDisplay.h (`{rear, front}`) to free pins (GPIO4, 13, 14, 21 or 22) to get a 3.3 V, 50 % square wave per wheel at speed × 6 Hz (`ABS_HZ_PER_KMH`), so each gives back its input frequency and drops to 0 while braking. The title corner shows OUT ON while they run. Most ABS inputs need more than 3.3 V, so drive them through a transistor or driver stage.
 
 ## Wiring
 Same as esp32-universal-v2: Mega D6 → 10 kΩ / 20 kΩ divider → ESP32 GPIO17, common GND, 19200 baud. The 4.0" ST7796S + XPT2046 panel uses the same pins (CS 27, DC 25, RST 26, MOSI 23, SCK 18, MISO 19, T_CS 33, T_IRQ 32). Touch calibration is shared (NVS `lgfxtouch/cal`); hold the screen while pressing EN to calibrate again.

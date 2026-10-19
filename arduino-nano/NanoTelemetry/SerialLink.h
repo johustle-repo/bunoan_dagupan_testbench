@@ -17,17 +17,18 @@ inline void beginEspLink() {
   arduino.stopListening(); // One-way telemetry; no incoming commands.
 }
 
-inline void sendEspSnapshot(const float* raw, float hz, bool keyOn, bool brakePressed, float mappedRpm,
-                            const float* referenceV) {
+inline void sendEspSnapshot(const float* raw, float hz, bool keyOn, bool brakePressed, float speedKmh,
+                            const float* referenceV, float frontHz) {
   if (!ESP_LINK_ENABLED) return;
   // Integers avoid AVR printf float support. ADC values in 1/16 counts;
-  // frequency in 1/100 Hz; references in mV. XOR checksum covers the payload before '*'.
+  // frequencies in 1/100 Hz (D7 rear, D8 front last); rear speed (Hz / 6) in
+  // 1/100 km/h; references in mV. XOR checksum covers the payload before '*'.
   const int count = snprintf(linkBuffer, sizeof(linkBuffer),
-    "U4,%u,%u,%u,%u,%u,%u,%u,%lu,%u,%u,%u", unsigned(keyOn), unsigned(brakePressed), unsigned(raw[0] * 16 + 0.5f),
+    "U4,%u,%u,%u,%u,%u,%u,%u,%lu,%u,%u,%u,%lu", unsigned(keyOn), unsigned(brakePressed), unsigned(raw[0] * 16 + 0.5f),
     unsigned(raw[1] * 16 + 0.5f), unsigned(raw[2] * 16 + 0.5f),
     unsigned(raw[3] * 16 + 0.5f), unsigned(raw[4] * 16 + 0.5f),
-    (unsigned long)(hz * 100 + 0.5f), unsigned(mappedRpm * 100 + 0.5f),
-    unsigned(referenceV[0] * 1000 + 0.5f), unsigned(referenceV[1] * 1000 + 0.5f));
+    (unsigned long)(hz * 100 + 0.5f), unsigned(speedKmh * 100 + 0.5f),
+    unsigned(referenceV[0] * 1000 + 0.5f), unsigned(referenceV[1] * 1000 + 0.5f), (unsigned long)(frontHz * 100 + 0.5f));
   if (count < 0 || count > int(sizeof(linkBuffer) - 5)) return;
   uint8_t checksum = 0;
   for (int i = 0; i < count; i++) checksum ^= uint8_t(linkBuffer[i]);

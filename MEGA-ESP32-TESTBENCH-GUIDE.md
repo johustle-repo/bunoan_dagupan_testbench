@@ -12,7 +12,7 @@ Each folder's README has the full pin tables. This guide covers how the parts wo
 
 ## Power-up
 
-There is no smart-key or starter button (D8 is unused). The Mega starts reading as soon as it powers up. The ESP32 receiver plays an **ECU TESTBENCH** boot animation (about 3 s: a tachometer ring sweeps up, the title fades in and a loading bar fills), then shows the CLASSIC screen. The needle and bars sweep once when the first live data arrives. The ABS tester plays its own splash and needle sweep.
+There is no smart-key or starter button (D8 is unused). The Mega is the ECU tester; the ABS tester runs on its own Nano (`arduino-nano/NanoAbsTester`). The Mega starts reading as soon as it powers up. The ESP32 receiver plays an **ECU TESTBENCH** boot animation (about 3 s: a tachometer ring sweeps up, the title fades in and a loading bar fills), then shows the CLASSIC screen. The needle and bars sweep once when the first live data arrives.
 
 ## Wiring
 
@@ -21,7 +21,7 @@ There is no smart-key or starter button (D8 is unused). The Mega starts reading 
 | A0 / A1 / A2 / A3 / A4 | IAT / ECT / O2 / MAP / TPS knob signals (0–5 V) |
 | A5 / A6 / A7 | Reference 1 / Reference 2 / battery, 0–30 V through a 12.5 kΩ / 2.5 kΩ divider (÷ 6) |
 | A8 | Current sensor output, 0–5 V = 0–10 A |
-| D7 | Frequency input (square wave, 0–5 V) |
+| D7 | RPM / frequency input (square wave, 0–5 V) |
 | D9 | Brake switch, released LOW / pressed HIGH |
 | D6 | SoftwareSerial TX, 19200 baud → 10 kΩ / 20 kΩ divider → ESP32 GPIO17 |
 | GND | Common ground with the ESP32 and the simulator |

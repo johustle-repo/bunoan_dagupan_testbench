@@ -1,58 +1,71 @@
 #include <Arduino.h>
 #include <avr/interrupt.h>
 #include <util/atomic.h>
+#include <math.h>
 #include <SoftwareSerial.h>
-#include "Buttons.h"
-#include "SpeedRamp.h"
 
 #if !defined(__AVR_ATmega328P__)
 #error "Select Arduino Nano (ATmega328P)."
 #endif
 
-// Arduino Nano ABS tester sender. The engine sensor knobs are disconnected;
-// the Nano reads only what the ABS tester screen shows and sends it to the
-// ESP32 (esp32-abs-tester-28/AbsTester28) as "A1" frames.
-//   A0 Reference 1, A1 Reference 2, A2 current, A3 battery (all direct, 0-5 V)
-//   D7 speed knob (frequency), D8 starter / key button, D9 brake switch
-//   D6 -> ESP32 GPIO17 (SoftwareSerial 19200 8N1, through a 10k/20k divider),
-//   D5 <- ESP32 GPIO16 (unused, the link is one-way)
-// D8 works like a key: nothing is measured or shown until it is pressed, and
-// each press toggles the tester on / off. Holding D9 eases the speed to 0;
-// releasing it eases back to the knob reading.
+// Arduino Nano ABS tester. Measures the two wheel-speed sensors, drives the
+// TCS / ABS LEDs and sends the readings to the ESP32
+// (esp32-abs-tester-28/AbsTester28) as "A1" frames.
+//   D7 speed 1 (rear) and RPM, D8 speed 2 (front), 0-5 V square waves
+//   speed = Hz / 6 km/h, max 250; RPM = D7 Hz x 15000 / 1560, max 15000
+//   D13 TCS LED: steady when both speeds match (whole km/h), blinking otherwise
+//   D12 ABS LED: on when D7 is at least 10 % and 5 km/h slower than D8
+//   A0 Reference 1, A1 battery, A2 Reference 2, A3 current (direct, 0-5 V)
+//   D5 (TX) -> ESP32 RX2 (GPIO16), common GND, 115200 8N1, one-way
+//   (SoftwareSerial; the USB Serial Monitor stays on the normal Serial port).
+// SoftwareSerial owns the pin-change interrupts, so Timer1 samples D7 and D8
+// at 20 kHz instead (up to about 10 kHz per input).
 
-volatile uint32_t pulseCount = 0;
-volatile bool previousD7High = false;
-uint32_t windowStartUs = 0;
-uint32_t serialPauseUs = 0;
-volatile bool acquisitionEnabled = false;
-DebouncedButton starterButton(8), brakeButton(9, false);
-// Brake wiring (same as the testbench brake): released LOW, pressed HIGH.
-bool keyOn = false;
-float lastFrequencyHz = 0;
-uint32_t lastPublishMs = 0, lastRampMs = 0;
-float speedKmh = 0;
+const byte TCS_LED = LED_BUILTIN;  // D13
+const byte ABS_LED = 12;
 
-constexpr float FREQUENCY_MAX_HZ = 1639.0f;  // Measured maximum knob frequency.
-constexpr float SPEED_MAX_KMH = 200.0f;      // Full knob = 200 km/h, the gauge's full scale.
-constexpr uint16_t PUBLISH_MS = 250;
+const unsigned long TCS_BLINK_INTERVAL = 500;
+const unsigned long PUBLISH_MS = 250;
+
+#define D7_HIGH() ((PIND & _BV(PD7)) != 0)
+#define D8_HIGH() ((PINB & _BV(PB0)) != 0)
+
+volatile unsigned long pulseCount1 = 0;
+volatile unsigned long pulseCount2 = 0;
+
+volatile bool previousHigh1 = false;
+volatile bool previousHigh2 = false;
+volatile bool acquisitionEnabled = true;
+
+unsigned long windowStartUs = 0;
+unsigned long serialPauseUs = 0;
+unsigned long lastTcsBlink = 0;
+unsigned long lastPublish = 0;
+
+bool speedsEqual = true;
+bool tcsLedState = true;
+bool absActive = false;
+
+float frequencyHz1 = 0, frequencyHz2 = 0;
+float ref1V = 0, batteryV = 0;
+float speed1 = 0, speed2 = 0;
+float rpm = 0;
 
 // Analog inputs, all direct 0-5 V: analogRead 0-1023 mapped to the full scale.
-enum Input : uint8_t { REF1, REF2, CURRENT, BATTERY, INPUT_COUNT };
-const uint8_t inputPins[INPUT_COUNT] = {A0, A1, A2, A3};
-const char* const inputNames[INPUT_COUNT] = {"REF1 A0", "REF2 A1", "CURRENT A2", "BATTERY A3"};
-const char* const inputUnits[INPUT_COUNT] = {"V", "V", "A", "V"};
-// Value at analogRead = 1023 (5 V at the pin). Current: 0-5 V = 0-10 A.
-constexpr float INPUT_FULL_SCALE[INPUT_COUNT] = {5.0f, 5.0f, 10.0f, 5.0f};
-float inputValue[INPUT_COUNT] = {};
+// Frame order: REF1, REF2, current, battery.
+const uint8_t inputPins[4] = {A0, A2, A3, A1};    // REF1 A0, REF2 A2, current A3, battery A1.
+const float INPUT_FULL_SCALE[4] = {5.0, 5.0, 10.0, 5.0};  // Current: 0-5 V = 0-10 A.
 
-SoftwareSerial esp(5, 6);  // RX D5 <- GPIO16 (unused), TX D6 -> ESP32 GPIO17.
-char linkBuffer[64];
+SoftwareSerial esp(6, 5);  // RX D6 (unused), TX D5 -> ESP32 GPIO16.
+char linkBuffer[80];
 
-// SoftwareSerial owns PCINT2; Timer1 samples D7 at 20 kHz instead.
+// D7: Speed 1 and RPM, D8: Speed 2. Rising edges, sampled at 20 kHz.
 ISR(TIMER1_COMPA_vect) {
-  const bool highNow = (PIND & _BV(PD7)) != 0;
-  if (acquisitionEnabled && highNow && !previousD7High) pulseCount++;
-  previousD7High = highNow;
+  const bool high1 = D7_HIGH(), high2 = D8_HIGH();
+  if (acquisitionEnabled && high1 && !previousHigh1) pulseCount1++;
+  if (acquisitionEnabled && high2 && !previousHigh2) pulseCount2++;
+  previousHigh1 = high1;
+  previousHigh2 = high2;
 }
 
 float readInput(uint8_t i) {
@@ -60,51 +73,60 @@ float readInput(uint8_t i) {
   delayMicroseconds(200);
   uint32_t sum = 0;
   for (uint8_t n = 0; n < 16; n++) sum += analogRead(inputPins[i]);
-  return sum / 16.0f * INPUT_FULL_SCALE[i] / 1023.0f;
+  return sum / 16.0 * INPUT_FULL_SCALE[i] / 1023.0;
 }
 
-// A1 frame: key, brake, frequency x100, speed x100, REF1 / REF2 mV, current mA,
-// battery mV, then an XOR checksum of everything before '*'.
+// A1 frame: key (always 1), brake (none, 0), D7 Hz x100, speed 1 x100,
+// REF1 / REF2 mV, current mA, battery mV, D8 Hz x100, speed 2 x100, RPM,
+// TCS (1 steady, 0 blinking), ABS (1 active), then an XOR checksum of
+// everything before '*'. The ESP32 shows these values as they are.
 void sendFrame() {
-  const int count = snprintf(linkBuffer, sizeof(linkBuffer), "A1,%u,%u,%lu,%u,%u,%u,%u,%u",
-    unsigned(keyOn), unsigned(brakeButton.pressed()), (unsigned long)(lastFrequencyHz * 100 + 0.5f),
-    unsigned(speedKmh * 100 + 0.5f), unsigned(inputValue[REF1] * 1000 + 0.5f),
-    unsigned(inputValue[REF2] * 1000 + 0.5f), unsigned(inputValue[CURRENT] * 1000 + 0.5f),
-    unsigned(inputValue[BATTERY] * 1000 + 0.5f));
+  unsigned int mv[4];
+  for (uint8_t i = 0; i < 4; i++) mv[i] = unsigned(readInput(i) * 1000 + 0.5);
+  ref1V = mv[0] / 1000.0;
+  batteryV = mv[3] / 1000.0;
+  const int count = snprintf(linkBuffer, sizeof(linkBuffer), "A1,1,0,%lu,%u,%u,%u,%u,%u,%lu,%u,%u,%u,%u",
+    (unsigned long)(frequencyHz1 * 100 + 0.5), unsigned(speed1 * 100 + 0.5), mv[0], mv[1], mv[2], mv[3],
+    (unsigned long)(frequencyHz2 * 100 + 0.5), unsigned(speed2 * 100 + 0.5),
+    unsigned(rpm + 0.5), unsigned(speedsEqual), unsigned(absActive));
   if (count < 0 || count > int(sizeof(linkBuffer) - 5)) return;
   uint8_t checksum = 0;
   for (int i = 0; i < count; i++) checksum ^= uint8_t(linkBuffer[i]);
   snprintf(linkBuffer + count, sizeof(linkBuffer) - count, "*%02X\n", checksum);
-  // SoftwareSerial TX blocks interrupts, so Timer1 can't sample D7 meanwhile;
-  // that time is left out of the frequency window.
-  uint32_t pauseStart;
+  // SoftwareSerial TX blocks interrupts (about 6 ms per frame), so Timer1
+  // can't sample D7 / D8 meanwhile; that time is left out of the window.
+  unsigned long pauseStart;
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
     acquisitionEnabled = false;
     pauseStart = micros();
   }
   esp.write(reinterpret_cast<const uint8_t*>(linkBuffer), count + 4);
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-    if (keyOn) serialPauseUs += uint32_t(micros() - pauseStart);
-    previousD7High = (PIND & _BV(PD7)) != 0;
-    acquisitionEnabled = keyOn;
+    serialPauseUs += micros() - pauseStart;
+    previousHigh1 = D7_HIGH();
+    previousHigh2 = D8_HIGH();
+    acquisitionEnabled = true;
   }
 }
 
 void setup() {
-  Serial.begin(115200);
-  starterButton.begin();
-  brakeButton.begin();
-  esp.begin(19200);
-  esp.stopListening();  // One-way link.
-  analogReference(DEFAULT);
-  for (uint8_t pin : inputPins) {
-    pinMode(pin, INPUT);
-    digitalWrite(pin, LOW);  // Keep internal pull-ups disabled.
-  }
-  // D7: no internal pull-up, provide a valid 0-to-5 V square wave.
+  Serial.begin(115200);  // USB Serial Monitor.
+  esp.begin(115200);     // ESP32 link on D5.
+  esp.stopListening();   // One-way link.
+
   pinMode(7, INPUT);
+  pinMode(8, INPUT);
+  for (uint8_t pin : inputPins) pinMode(pin, INPUT);
+
+  pinMode(TCS_LED, OUTPUT);
+  pinMode(ABS_LED, OUTPUT);
+
+  digitalWrite(TCS_LED, HIGH);
+  digitalWrite(ABS_LED, LOW);
+
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-    previousD7High = (PIND & _BV(PD7)) != 0;
+    previousHigh1 = D7_HIGH();
+    previousHigh2 = D8_HIGH();
     TCCR1A = 0;
     TCCR1B = _BV(WGM12) | _BV(CS11);
     OCR1A = 99;  // 16 MHz / 8 / 100 = 20 kHz.
@@ -113,61 +135,112 @@ void setup() {
     TIMSK1 |= _BV(OCIE1A);
     windowStartUs = micros();
   }
-  Serial.println(F("# NANO ABS TESTER: press the starter (D8) to turn on."));
+
+  lastTcsBlink = millis();
 }
 
 void loop() {
-  const uint32_t nowMs = millis();
-  bool changed = false;
-  if (starterButton.update(nowMs) && starterButton.pressed()) {
-    keyOn = !keyOn;
+  unsigned long now = millis();
+
+  if (micros() - windowStartUs >= 1000000UL) {
+    unsigned long pulses1, pulses2, elapsedUs;
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-      acquisitionEnabled = keyOn;
-      pulseCount = 0;
-      serialPauseUs = 0;
-      windowStartUs = micros();
-      previousD7High = (PIND & _BV(PD7)) != 0;
-    }
-    lastFrequencyHz = 0;
-    speedKmh = 0;
-    lastRampMs = nowMs;
-    changed = true;
-  }
-  if (brakeButton.update(nowMs)) changed = true;
-  if (keyOn && uint32_t(micros() - windowStartUs) >= 1000000UL) {
-    uint32_t pulses, elapsedUs;
-    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-      const uint32_t nowUs = micros();
-      elapsedUs = uint32_t(nowUs - windowStartUs) - serialPauseUs;
+      const unsigned long nowUs = micros();
+      elapsedUs = nowUs - windowStartUs - serialPauseUs;
       serialPauseUs = 0;
       windowStartUs = nowUs;
-      pulses = pulseCount;
-      pulseCount = 0;
+      pulses1 = pulseCount1;
+      pulses2 = pulseCount2;
+      pulseCount1 = 0;
+      pulseCount2 = 0;
     }
-    lastFrequencyHz = elapsedUs ? pulses * 1000000.0f / elapsedUs : 0;
-  }
-  // Brake held: ease to 0. Released: ease back to the knob speed.
-  const bool braking = brakeButton.pressed();
-  float target = !keyOn || braking ? 0
-      : constrain(lastFrequencyHz * SPEED_MAX_KMH / FREQUENCY_MAX_HZ, 0.0f, SPEED_MAX_KMH);
-  if (keyOn && !braking && lastFrequencyHz >= FREQUENCY_MAX_HZ * 0.99f) target = SPEED_MAX_KMH;
-  speedKmh = keyOn ? stepSpeed(speedKmh, target, uint32_t(nowMs - lastRampMs) / 1000.0f) : 0;
-  lastRampMs = nowMs;
 
-  if (!changed && uint32_t(nowMs - lastPublishMs) < PUBLISH_MS) return;
-  lastPublishMs = nowMs;
-  if (keyOn) for (uint8_t i = 0; i < INPUT_COUNT; i++) inputValue[i] = readInput(i);
-  else for (float& v : inputValue) v = 0;  // Nothing is measured with the key off.
-  sendFrame();
+    frequencyHz1 = elapsedUs ? pulses1 * 1000000.0 / elapsedUs : 0;
+    frequencyHz2 = elapsedUs ? pulses2 * 1000000.0 / elapsedUs : 0;
 
-  // USB Serial Monitor, 115200 baud.
-  if (!keyOn) { Serial.println(F("# KEY OFF: press the starter (D8) to turn on.")); return; }
-  Serial.print(F("# KEY ON | BRAKE ")); Serial.print(braking ? F("ON") : F("OFF"));
-  Serial.print(F(" | D7 ")); Serial.print(lastFrequencyHz, 1);
-  Serial.print(F(" Hz | SPEED ")); Serial.print(speedKmh, 1); Serial.print(F(" km/h"));
-  for (uint8_t i = 0; i < INPUT_COUNT; i++) {
-    Serial.print(F(" | ")); Serial.print(inputNames[i]); Serial.print(' ');
-    Serial.print(inputValue[i], 2); Serial.print(' '); Serial.print(inputUnits[i]);
+    float rawSpeed1 = frequencyHz1 / 6.0;
+    float rawSpeed2 = frequencyHz2 / 6.0;
+
+    // Display speeds capped at 250 km/h
+    speed1 = constrain(rawSpeed1, 0.0, 250.0);
+    speed2 = constrain(rawSpeed2, 0.0, 250.0);
+
+    // RPM from D7: 0–1560 Hz maps to 0–15000 RPM
+    rpm = constrain(
+      frequencyHz1 * 15000.0 / 1560.0,
+      0.0,
+      15000.0
+    );
+
+    // TCS: compare displayed speeds to nearest whole km/h
+    speedsEqual = (round(speed1) == round(speed2));
+
+    // Simulated ABS:
+    // D7 wheel is at least 10% slower than D8 reference,
+    // with a minimum difference of 5 km/h.
+    absActive =
+      (rawSpeed2 > 0.0) &&
+      (rawSpeed1 <= rawSpeed2 * 0.90) &&
+      ((rawSpeed2 - rawSpeed1) >= 5.0);
+
+    digitalWrite(ABS_LED, absActive ? HIGH : LOW);
+
+    Serial.print("D7 Frequency: ");
+    Serial.print(frequencyHz1, 1);
+    Serial.println(" Hz");
+
+    Serial.print("Speed 1: ");
+    Serial.print(speed1, 1);
+    Serial.println(" km/h");
+
+    Serial.print("RPM: ");
+    Serial.println(rpm, 0);
+
+    Serial.print("D8 Frequency: ");
+    Serial.print(frequencyHz2, 1);
+    Serial.println(" Hz");
+
+    Serial.print("Speed 2: ");
+    Serial.print(speed2, 1);
+    Serial.println(" km/h");
+
+    Serial.print("TCS: ");
+    Serial.println(speedsEqual ? "ON" : "BLINKING");
+
+    Serial.print("ABS: ");
+    Serial.println(absActive ? "ACTIVE" : "OFF");
+
+    Serial.print("REF1 (A0): ");
+    Serial.print(ref1V, 2);
+    Serial.println(" V");
+
+    Serial.print("Battery (A1): ");
+    Serial.print(batteryV, 2);
+    Serial.println(" V");
+
+    Serial.println();
   }
-  Serial.println();
+
+  // ESP32 link, 4 times a second.
+  if (now - lastPublish >= PUBLISH_MS) {
+    lastPublish = now;
+    sendFrame();
+  }
+
+  // TCS indicator
+  unsigned long ledNow = millis();
+
+  if (speedsEqual) {
+    // Equal speeds: steady ON
+    tcsLedState = true;
+    digitalWrite(TCS_LED, HIGH);
+    lastTcsBlink = ledNow;
+  } else {
+    // Different speeds: blink every 500 ms
+    if (ledNow - lastTcsBlink >= TCS_BLINK_INTERVAL) {
+      lastTcsBlink = ledNow;
+      tcsLedState = !tcsLedState;
+      digitalWrite(TCS_LED, tcsLedState);
+    }
+  }
 }
