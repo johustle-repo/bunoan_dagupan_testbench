@@ -12,9 +12,11 @@
 // Universal receiver v2 (4.0" 480 x 320 ST7796S touch panel): works with the Arduino Uno (U3 frames), the
 // Arduino Nano (U4 frames, adds the A5/A6 supply references) or the Arduino
 // Mega (U5 frames: U4 plus battery and current; Reference 1/2 and the battery
-// are 0-30 V inputs through dividers, the current is 0-10 A from A8). The board is detected from each frame, so
-// no setting is needed. Battery voltage (A7) and current (A8) come only from
-// the Mega; the INA219 is no longer used.
+// are 0-30 V inputs through dividers, the current is 0-10 A from A8) or the
+// Mega 2560 Pro (U6 frames: D8 speed frequency, ABS, Declog and battery, no
+// current). The board is detected from each frame, so no setting is needed.
+// Battery voltage (A7) and current (A8) come only from the Mega; the INA219
+// is no longer used.
 // ESP32 GPIO17 RX receives the Uno/Nano D6 signal at 3.3 V logic.
 // One-way link: no ESP32 TX connection is required.
 SoftwareSerial nodemcu(17, 16); // RX, TX on ESP32 Dev Module.
@@ -29,26 +31,30 @@ bool havePacket = false;
 uint32_t lastPacketMs = 0;
 uint32_t badFrames = 0;
 float rawValues[5] = {};
-float frequencyHz = 0;
-bool smartKeyOn = false, brakePressed = false;
+float frequencyHz = 0;       // D7, for RPM (and speed, except on U6).
+float speedFrequencyHz = 0;  // D8 on U6, otherwise the D7 frequency.
+bool smartKeyOn = false, brakePressed = false;  // U6: brakePressed is the D9 ABS input.
+bool declogOn = false, haveDeclog = false;      // U6 only: D10 Declog switch.
 float referenceVoltage[2] = {}; // Nano: A5 (5 V) / A6 (3.3 V) direct. Mega: 0-30 V divider inputs.
 bool haveReferences = false;    // True for Nano (U4) and Mega (U5) frames, false for Uno (U3).
 float batteryVoltage = 0;       // Mega A7 through a divider, 0-30 V.
 float batteryCurrentA = 0;      // Mega A8, 0-5 V = 0-10 A.
-bool haveBattery = false;       // True for Mega (U5) frames; read with the key off too.
+bool haveBattery = false;       // True for Mega (U5/U6) frames; read with the key off too.
+bool haveCurrent = false;       // True for U5 frames only.
 enum Board : uint8_t { BOARD_UNO, BOARD_NANO, BOARD_MEGA } board = BOARD_UNO;
 const char* const BOARD_NAMES[] = {"Uno", "Nano", "Mega"};      // Display.
 const char* const BOARD_IDS[] = {"uno", "nano", "mega"};        // JSON "board".
 const char* const BOARD_FRAMES[] = {"U3", "U4", "U5"};
+const char* frameId = "U3";     // BOARD_FRAMES[board], or "U6".
 uint32_t sampleSequence = 0;
 uint32_t lastSerialReportMs = 0;
 uint8_t injectedFault = 0;
 float faultLimitedSpeed = 0;
 uint32_t lastSpeedMs = 0;
 
-// Speed and RPM from the D7 frequency, the same for every board (as on the
-// Mega): speed = Hz / 6 km/h, max 250; RPM = Hz x 15000 / 1549, so 1549 Hz
-// = 15,000 rpm, max 15,000. The frame's own speed field is not used.
+// RPM from the D7 frequency and speed from the D8 frequency (U6) or D7 (the
+// other boards): speed = Hz / 6 km/h, max 250; RPM = Hz x 15000 / 1549, so
+// 1549 Hz = 15,000 rpm, max 15,000. The U3-U5 speed field is not used.
 constexpr float HZ_PER_KMH = 6, SPEED_MAX_KMH = 250;
 constexpr float RPM_PER_HZ = 15000.0f / 1549, ENGINE_RPM_MAX = 15000;
 float engineRpm = 0;
@@ -79,22 +85,29 @@ bool parseFrame(char* text) {
   // U4 (Nano): the same, plus Reference 1 and 2 in mV.
   // U5 (Mega): U4 plus the battery in mV and the current in mA.
   // U4 and U5 may end with the D8 front wheel Hz x100 (used by the ABS tester only).
+  // U6 (Mega 2560 Pro): key, ABS, 5 x ADC, D7 Hz x100, D8 Hz x100, Reference 1
+  // and 2 in mV, battery in mV, Declog.
+  const bool u6 = strncmp(text, "U6,", 3) == 0;
   uint8_t fieldCount, maxFields;
   Board frameBoard;
   if (strncmp(text, "U3,", 3) == 0) { fieldCount = maxFields = 9; frameBoard = BOARD_UNO; }
   else if (strncmp(text, "U4,", 3) == 0) { fieldCount = 11; maxFields = 12; frameBoard = BOARD_NANO; }
   else if (strncmp(text, "U5,", 3) == 0) { fieldCount = 13; maxFields = 14; frameBoard = BOARD_MEGA; }
+  else if (u6) { fieldCount = maxFields = 13; frameBoard = BOARD_MEGA; }
   else return false;
   // References and battery allow 40 V: a 30 V input reads a little over 30
   // when the Mega's supply is above 5 V.
   constexpr unsigned long maximum[14] = {
       1, 1, 16368, 16368, 16368, 16368, 16368, 100000000UL, 30000, 40000, 40000, 40000, 10500, 100000000UL};
+  constexpr unsigned long maximumU6[13] = {
+      1, 1, 16368, 16368, 16368, 16368, 16368, 100000000UL, 100000000UL, 40000, 40000, 40000, 1};
+  const unsigned long* const limit = u6 ? maximumU6 : maximum;
   unsigned long values[14];
   char* p = text + 3;
   for (uint8_t i = 0; i < maxFields; ++i) {
     if (*p < '0' || *p > '9') return false;
     values[i] = strtoul(p, &end, 10);
-    if (values[i] > (i == fieldCount ? 100000000UL : maximum[i])) return false;  // Front Hz.
+    if (values[i] > (i == fieldCount ? 100000000UL : limit[i])) return false;  // Front Hz.
     if (!*end && i + 1 >= fieldCount) break;
     if (*end != ',' || i + 1 == maxFields) return false;
     p = end + 1;
@@ -103,11 +116,16 @@ bool parseFrame(char* text) {
   brakePressed = values[1] == 1;
   for (uint8_t i = 0; i < 5; ++i) rawValues[i] = smartKeyOn ? values[i + 2] / 16.0f : 0;
   frequencyHz = smartKeyOn ? values[7] / 100.0f : 0;
+  speedFrequencyHz = !smartKeyOn ? 0 : u6 ? values[8] / 100.0f : frequencyHz;
   haveReferences = fieldCount >= 11;
   haveBattery = fieldCount == 13;
+  haveCurrent = haveBattery && !u6;
+  haveDeclog = u6;
+  declogOn = u6 && values[12] == 1;
   batteryVoltage = haveBattery ? values[11] / 1000.0f : 0;
-  batteryCurrentA = haveBattery ? values[12] / 1000.0f : 0;
+  batteryCurrentA = haveCurrent ? values[12] / 1000.0f : 0;
   board = frameBoard;
+  frameId = u6 ? "U6" : BOARD_FRAMES[frameBoard];
   for (uint8_t i = 0; i < 2; ++i)
     referenceVoltage[i] = smartKeyOn && haveReferences ? values[i + 9] / 1000.0f : 0;
   lastPacketMs = millis();
@@ -178,6 +196,7 @@ void updateLocalDisplay() {
   d.link = !havePacket ? DisplayData::WAITING : stale ? DisplayData::STALE : DisplayData::LIVE;
   d.keyOn = smartKeyOn;
   d.brake = brakePressed;
+  d.declog = declogOn;
   const uint8_t activeInjected = !stale && smartKeyOn ? injectedFault : 0;
   const uint8_t activeAuto = !stale && smartKeyOn ? autoFaultMask : 0;
   d.checkEngine = activeInjected | activeAuto;
@@ -200,11 +219,12 @@ void updateLocalDisplay() {
   d.frequencyHz = frequencyHz;
   d.batteryAvailable = haveBattery && !stale;
   d.batteryV = batteryVoltage;
+  d.currentAvailable = haveCurrent && !stale;
   d.currentA = batteryCurrentA;
   // SENSORS tab.
   d.references = haveReferences;
   d.board = BOARD_NAMES[board];
-  d.boardFrame = BOARD_FRAMES[board];
+  d.boardFrame = frameId;
   for (uint8_t i = 0; i < 5; ++i) d.volts[i] = channelVoltage(i);
   d.reference[0] = referenceVoltage[0];
   d.reference[1] = referenceVoltage[1];
@@ -235,7 +255,9 @@ String telemetryJson() {
   json += F(",\"sample_seq\":"); json += sampleSequence;
   json += F(",\"smart_key\":"); json += smartKeyOn ? F("true") : F("false");
   json += F(",\"acquisition_enabled\":"); json += smartKeyOn ? F("true") : F("false");
+  json += F(",\"frame\":\""); json += frameId; json += '"';
   json += F(",\"brake_pressed\":"); json += brakePressed ? F("true") : F("false");
+  json += F(",\"declog\":"); json += !haveDeclog ? F("null") : declogOn ? F("true") : F("false");
   const uint8_t activeInjected = !stale && smartKeyOn ? injectedFault : 0;
   const uint8_t activeAuto = !stale && smartKeyOn ? autoFaultMask : 0;
   json += F(",\"check_engine\":"); json += activeInjected | activeAuto ? F("true") : F("false");
@@ -250,7 +272,7 @@ String telemetryJson() {
   json += F(",\"battery_v\":");
   json += haveBattery && !stale ? String(batteryVoltage, 2) : String(F("null"));
   json += F(",\"current_a\":");
-  json += haveBattery && !stale ? String(batteryCurrentA, 2) : String(F("null"));
+  json += haveCurrent && !stale ? String(batteryCurrentA, 2) : String(F("null"));
   if (!smartKeyOn) { json += F(",\"sensors\":null,\"frequency_hz\":0,\"engine_rpm\":0}"); return json; }
   if (haveReferences) {
     json += F(",\"reference_1_v\":"); json += String(referenceVoltage[0], 3);
@@ -292,6 +314,7 @@ String telemetryJson() {
     json += '}';
   }
   json += F("},\"frequency_hz\":"); json += String(frequencyHz, 2);
+  json += F(",\"speed_frequency_hz\":"); json += String(speedFrequencyHz, 2);
   // engine_rpm keeps its old meaning for the dashboard: the speed in km/h.
   json += F(",\"engine_rpm\":"); json += String(faultLimitedSpeed, 1);
   json += F(",\"rpm_calibration\":\"1549_hz_is_15000_rpm\",\"speed_calibration\":\"hz_div_6\"}");
@@ -406,10 +429,14 @@ void loop() {
         lastSerialReportMs = millis();
         Serial.println(telemetryJson());
         Serial.print(F("# SMART KEY: ")); Serial.print(smartKeyOn ? F("ON") : F("OFF - acquisition locked"));
-        Serial.print(F(" | BRAKE: ")); Serial.println(brakePressed ? F("PRESSED") : F("RELEASED"));
+        Serial.print(haveDeclog ? F(" | ABS: ") : F(" | BRAKE: "));
+        Serial.print(brakePressed ? F("PRESSED") : F("RELEASED"));
+        if (haveDeclog) { Serial.print(F(" | DECLOG: ")); Serial.print(declogOn ? F("ON") : F("OFF")); }
+        Serial.println();
         if (haveBattery) {
-          Serial.print(F("# BATTERY (Mega A7) ")); Serial.print(batteryVoltage, 2);
-          Serial.print(F(" V | CURRENT (A8) ")); Serial.print(batteryCurrentA, 2); Serial.println(F(" A"));
+          Serial.print(F("# BATTERY (Mega A7) ")); Serial.print(batteryVoltage, 2); Serial.print(F(" V"));
+          if (haveCurrent) { Serial.print(F(" | CURRENT (A8) ")); Serial.print(batteryCurrentA, 2); Serial.print(F(" A")); }
+          Serial.println();
         } else { Serial.print(F("# BATTERY: n/a on ")); Serial.println(BOARD_NAMES[board]); }
         if (!smartKeyOn) { frameLength = 0; discardFrame = false; continue; }
         for (uint8_t i = 0; i < 5; ++i) {
@@ -423,6 +450,7 @@ void loop() {
           Serial.print(F(" V | REF2 A6=")); Serial.print(referenceVoltage[1], 2); Serial.println(F(" V"));
         } else Serial.println(F("# BOARD Uno (no supply references)"));
         Serial.print(F("# D7 frequency=")); Serial.print(frequencyHz, 2);
+        if (haveDeclog) { Serial.print(F(" Hz | D8 frequency=")); Serial.print(speedFrequencyHz, 2); }
         Serial.print(F(" Hz | SPEED=")); Serial.print(faultLimitedSpeed, 1);
         Serial.print(F(" km/h | RPM=")); Serial.println(engineRpm, 0);
       } else if (discardFrame || frameLength) ++badFrames;
@@ -436,8 +464,8 @@ void loop() {
   const bool fresh = havePacket && uint32_t(now-lastPacketMs) <= 3000;
   if (!fresh || !smartKeyOn) { faultLimitedSpeed = 0; engineRpm = 0; injectedFault = 0; }
   else {
-    // Brake and injected faults pull the speed to zero; RPM follows Hz only.
-    const float target = injectedFault || brakePressed ? 0 : min(frequencyHz / HZ_PER_KMH, SPEED_MAX_KMH);
+    // Brake (ABS on U6) and injected faults pull the speed to zero; RPM follows D7 Hz only.
+    const float target = injectedFault || brakePressed ? 0 : min(speedFrequencyHz / HZ_PER_KMH, SPEED_MAX_KMH);
     engineRpm = min(frequencyHz * RPM_PER_HZ, ENGINE_RPM_MAX);
     const float step = 100.0f * uint32_t(now-lastSpeedMs)/1000.0f;
     if (faultLimitedSpeed < target) faultLimitedSpeed = min(target, faultLimitedSpeed+step);

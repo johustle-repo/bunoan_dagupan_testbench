@@ -31,7 +31,8 @@ constexpr float SPEED_MAX = 250, RPM_MAX = 15000;
 // Snapshot of what the panel shows, filled by the sketch each loop.
 struct DisplayData {
   enum Link : uint8_t { WAITING, LIVE, STALE } link;
-  bool keyOn, brake, checkEngine, coolantWarning;
+  bool keyOn, brake, checkEngine, coolantWarning;  // brake: the D9 ABS input on U6.
+  bool declog;             // Mega 2560 Pro (U6) D10 Declog switch.
   uint8_t milBlink;        // Blink code of the first DTC, 0 = none.
   float speedKmh, rpm, frequencyHz;
   const char* dtcCode;     // First active DTC, or nullptr.
@@ -40,11 +41,12 @@ struct DisplayData {
   OxygenReading o2;
   bool batteryAvailable;   // Mega frame with the A7 battery input.
   float batteryV;
-  float currentA;          // Mega A8, 0-10 A; valid when batteryAvailable.
+  bool currentAvailable;   // Mega U5 frame with the A8 current input.
+  float currentA;          // Mega A8, 0-10 A.
   // SENSORS tab.
   bool references;         // Board sends Reference 1/2 (Nano U4: 0-5 V, Mega U5: 0-30 V).
   const char* board;       // "Uno", "Nano" or "Mega".
-  const char* boardFrame;  // "U3", "U4" or "U5".
+  const char* boardFrame;  // "U3", "U4", "U5" or "U6".
   float volts[5];          // IAT, ECT, O2, MAP, TPS at the ADC pin.
   float reference[2];
   uint8_t injectedMask, autoMask, highMask;
@@ -215,10 +217,11 @@ inline uint32_t to888(uint16_t c) {
 }
 
 // ---- Lamps -----------------------------------------------------------------
-// Order matches the browser: smart key, brake, winker, check engine, coolant,
-// ABS, TCS. Winker and TCS have no input on this bench.
+// Order matches the browser: smart key, declog, winker, check engine, coolant,
+// ABS, TCS. Winker and TCS have no input on this bench; Declog only on U6.
+// ABS turns orange with the brake (Uno/Nano/Mega D9) or ABS (Mega 2560 Pro D9) input.
 constexpr uint8_t LAMP_COUNT = 7;
-const char* const LAMP_NAMES[LAMP_COUNT] = {"KEY", "BRAKE", "WINKER", "CHECK", "TEMP", "ABS", "TCS"};
+const char* const LAMP_NAMES[LAMP_COUNT] = {"KEY", "DECLOG", "WINKER", "CHECK", "TEMP", "ABS", "TCS"};
 constexpr bool LAMP_WIRED[LAMP_COUNT] = {true, true, false, true, true, true, false};
 
 // Honda-style blink code: long flashes count tens, short flashes units, then a
@@ -241,7 +244,7 @@ void lampColors(const DisplayData& d, bool selfTest, float speed, uint32_t now, 
   for (uint8_t i = 0; i < LAMP_COUNT; ++i) out[i] = selfTest ? ORANGE : 0;
   if (selfTest) return;
   if (fresh && d.keyOn) out[0] = race ? GREEN : ACCENT;
-  if (fresh && d.brake) out[1] = race ? ORANGE : AMBER;
+  if (fresh && d.declog) out[1] = race ? ORANGE : AMBER;
   if (running && milLit(d, speed, now)) out[3] = ORANGE;
   if (running && d.coolantWarning) out[4] = RED;
   if (running) out[5] = d.brake ? ORANGE : GREEN;
@@ -465,7 +468,7 @@ void classicText(const DisplayData& d, bool running, float speed, float rpm) {
       case 0: if (show) snprintf(value, sizeof(value), "%.0f", speed); else { strcpy(value, "--"); color = MUTED; } break;
       case 1: if (show) snprintf(value, sizeof(value), "%.0f", rpm); else { strcpy(value, "--"); color = MUTED; } break;
       case 2:  // Mega A8, live with the key off like the battery.
-        if (d.batteryAvailable) snprintf(value, sizeof(value), "%.2f A", d.currentA);
+        if (d.currentAvailable) snprintf(value, sizeof(value), "%.2f A", d.currentA);
         else { strcpy(value, havePacket ? "n/a" : "-- A"); color = MUTED; }
         break;
       case 3: case 4:
@@ -763,7 +766,7 @@ void sensorsText(const DisplayData& d, bool running) {
         color = d.batteryV < 11.8f || d.batteryV > 15.0f ? ORANGE : d.batteryV >= 13.2f ? GREEN : TEXT;
         break;
       case 9:
-        if (d.batteryAvailable) snprintf(text, sizeof(text), "%.2f A", d.currentA);
+        if (d.currentAvailable) snprintf(text, sizeof(text), "%.2f A", d.currentA);
         else { strcpy(text, havePacket ? "n/a" : "--"); color = MUTED; }
         break;
       case 10: snprintf(text, sizeof(text), "%.0f - %.0f", d.tpsClosedRaw, d.tpsWotRaw); break;

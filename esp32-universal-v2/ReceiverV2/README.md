@@ -2,17 +2,18 @@
 
 The universal receiver (Arduino Uno, Nano or Mega, detected from each packet) running on the 4.0" ST7796S + XPT2046 panel instead of the 2.8" ILI9341. Telemetry, the Wi-Fi dashboard, the API, DTC logic and TPS learning are the same as `esp32-universal/Receiver`. The INA219 is no longer used: the battery voltage comes from the Mega (A7, 0–30 V divider).
 
-Sender sketches: `Arduino-Uno-Testbench-Firmware/DashboardTelemetry` (Uno, U3 frames), `arduino-nano/NanoTelemetry` (Nano, U4) or `arduino-mega/MegaTelemetry` (Mega 2560, U5: the U4 fields plus battery voltage and current; Reference 1/2 and the battery are 0–30 V divider inputs). /api/live reports `"board": "uno" | "nano" | "mega"` and the source `<board>_via_esp32`.
+Sender sketches: `Arduino-Uno-Testbench-Firmware/DashboardTelemetry` (Uno, U3 frames), `arduino-nano/NanoTelemetry` (Nano, U4) or `arduino-mega/MegaTelemetry` (Mega 2560 Pro, U6: key, ABS, sensors, D7 RPM Hz, D8 speed Hz, Reference 1/2 and battery as 0–30 V divider inputs, Declog). Older Mega firmware sending U5 (U4 plus battery and current) is still accepted. /api/live reports `"board": "uno" | "nano" | "mega"` and the source `<board>_via_esp32`.
 
-- **Speed and RPM** come from the D7 frequency for every board, as on the Mega: speed = Hz ÷ 6 km/h (max 250, ramps to 0 at 100 km/h per second with the brake or an injected fault) and RPM = Hz × 15000 ÷ 1549 (1549 Hz = 15,000 rpm, max 15,000).
+- **RPM** = D7 Hz × 15000 ÷ 1549 (1549 Hz = 15,000 rpm, max 15,000). **Speed** = Hz ÷ 6 km/h (max 250) from D8 on U6 and from D7 on the other boards; it ramps to 0 at 100 km/h per second with the brake / ABS (D9) or an injected fault.
+- **Lamps:** KEY, DECLOG (Mega 2560 Pro D10), WINKER, CHECK, TEMP, ABS (orange while D9 brake / ABS is on), TCS. `/api/live` adds `frame`, `declog` (null without U6) and `speed_frequency_hz`.
 - Wi-Fi: ECU-Testbench, password ECUdemo2026, http://192.168.4.1/
 - /api/live, /api/health, /api/simulate-fault and /api/tps-learn work the same as in v1.
 
 ## What's new on the display
 - **Three screens, no tabs:** CLASSIC, RACE and SENSORS. Double-tap anywhere on the screen to go to the next one; a single tap does nothing.
 - **CLASSIC:** 0–15,000 rpm tachometer on a plain dial-face background (labels 0, 3, 6, 9, 12, 15 ×1000, red zone above 12,000) with the RPM digits in the centre, a km/h cell with the speed under the gauge, glowing lamps, a sensor column in a larger font, and a full-width DTC line.
-- **RACE:** REF 1 and REF 2 across the top, an LED indicator strip (KEY, BRAKE, WINKER, CHECK, TEMP, ABS, TCS), curved 50-segment RPM bar, speed and RPM in seven-segment digits, and tiles for Bat, ECT, IAT, MAP, O2 V, AFR and TPS. The battery tile turns green when charging (≥ 13.2 V).
-- **SENSORS (new):** one row per channel (IAT, ECT, O2, MAP, TPS) with a 0-5 V pin-voltage bar marking the 0.20 / 4.80 V fault thresholds, the voltage, the converted value, and a circuit status: OK, OUT OF SPEC, LOW... / HIGH... (DTC pending), the confirmed DTC code, or "INJ" for a fault injected from the dashboard. Below it: board (Uno U3 / Nano U4 / Mega U5), link state, packet age, bad frames, Reference 1/2, D7 frequency, engine RPM, battery (Mega only), speed, learned TPS endpoints, and the Wi-Fi address.
+- **RACE:** REF 1 and REF 2 across the top, an LED indicator strip (KEY, DECLOG, WINKER, CHECK, TEMP, ABS, TCS), curved 50-segment RPM bar, speed and RPM in seven-segment digits, and tiles for Bat, ECT, IAT, MAP, O2 V, AFR and TPS. The battery tile turns green when charging (≥ 13.2 V).
+- **SENSORS (new):** one row per channel (IAT, ECT, O2, MAP, TPS) with a 0-5 V pin-voltage bar marking the 0.20 / 4.80 V fault thresholds, the voltage, the converted value, and a circuit status: OK, OUT OF SPEC, LOW... / HIGH... (DTC pending), the confirmed DTC code, or "INJ" for a fault injected from the dashboard. Below it: board (Uno U3 / Nano U4 / Mega U5 or U6), link state, packet age, bad frames, Reference 1/2, D7 frequency, engine RPM, battery (Mega only), speed, learned TPS endpoints, and the Wi-Fi address.
 - The header shows the detected board (UNO / NANO / MEGA) next to the LIVE / KEY OFF / NO LINK pill.
 - Gauges are drawn off-screen in bands and pushed to the panel, so there is no flicker and no full-screen buffer is needed (the ESP32 has no PSRAM).
 
@@ -53,7 +54,7 @@ Same wiring as ESP32_Touch_Games:
 The SPI clock is 27 MHz, the value the games sketch was tested with. Most ST7796S modules also run at 40 MHz (`TFT_SPI_HZ` in LocalDisplay.h), which makes the gauges about a third faster.
 
 ## Battery and references (from the Mega)
-The INA219 has been removed (its input also stopped at 26 V). The Mega reads Reference 1 (A5), Reference 2 (A6) and the battery (A7), each through a 12.5 kΩ / 2.5 kΩ divider, as 0–30 V; see `arduino-mega/MegaTelemetry/README.md`. The battery is shown with the key off too. With an Uno or Nano the battery shows "n/a", and the Nano's references stay direct 0–5 V readings (5 V / 3.3 V checks). The current comes from Mega A8 (0–5 V = 0–10 A) and shows in the CLASSIC grid, on SENSORS and in the dashboard battery box. `/api/live` reports `battery_v` and `current_a` (both null without a Mega) and `reference_scale`; `battery_a` is gone. GPIO21/22 are now free.
+The INA219 has been removed (its input also stopped at 26 V). The Mega reads Reference 1 (A5), Reference 2 (A6) and the battery (A7), each through a 12.5 kΩ / 2.5 kΩ divider, as 0–30 V; see `arduino-mega/MegaTelemetry/README.md`. The battery is shown with the key off too. With an Uno or Nano the battery shows "n/a", and the Nano's references stay direct 0–5 V readings (5 V / 3.3 V checks). With U5 firmware the current comes from Mega A8 (0–5 V = 0–10 A) and shows in the CLASSIC grid, on SENSORS and in the dashboard battery box; the Mega 2560 Pro (U6) has no current input, so it shows "n/a". `/api/live` reports `battery_v` (null without a Mega), `current_a` (U5 only) and `reference_scale`; `battery_a` is gone. GPIO21/22 are now free.
 
 ## Source
 UI: ../dashboard/dist (same as v1). After UI edits run `python tools/embed_dashboard.py esp32-universal-v2/dashboard/dist esp32-universal-v2/ReceiverV2/DashboardAssets.h` from the project root.

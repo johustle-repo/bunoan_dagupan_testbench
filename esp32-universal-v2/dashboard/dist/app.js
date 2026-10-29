@@ -21,7 +21,9 @@ for(const [i,name] of names.entries()){
 let ticks='';for(let i=0;i<=15;i++){const a=Math.PI+i/15*Math.PI,p=r=>[200+Math.cos(a)*r,205+Math.sin(a)*r],major=i%3===0,red=i>=12,x=p(163),y=p(major?147:155);ticks+=`<line x1="${x[0]}" y1="${x[1]}" x2="${y[0]}" y2="${y[1]}" stroke="${red?'#ff4d4d':'#8199b5'}" stroke-width="${major?3:1.5}"/>`;if(major){const t=p(125);ticks+=`<text x="${t[0]}" y="${t[1]+7}" text-anchor="middle" fill="${red?'#ff4d4d':'#aebdd0'}" font-size="20" font-weight="700">${i}</text>`;}}$('ticks').innerHTML=ticks;
 function log(message){events.push({time:new Date().toISOString(),message});if(events.length>200)events.shift();const li=document.createElement('li');li.textContent=new Date().toLocaleTimeString()+' · '+message;$('eventLog').prepend(li);while($('eventLog').children.length>100)$('eventLog').lastChild.remove();}
 const SOURCES=['uno_via_esp32','nano_via_esp32','mega_via_esp32'];
-function boardName(d){return d&&d.board==='uno'?'Uno':d&&d.board==='mega'?'Mega':'Nano';}
+function boardName(d){return d&&d.board==='uno'?'Uno':d&&d.frame==='U6'?'Mega 2560 Pro':d&&d.board==='mega'?'Mega':'Nano';}
+function keyPin(d){return d&&d.frame==='U6'?'D11':'D8';}
+function brakeName(d){return d&&d.frame==='U6'?'ABS':'Brake';}
 function valid(d){return d&&SOURCES.includes(d.source)&&d.stale===false&&numeric(d.sample_age_ms)&&d.sample_age_ms>=0&&d.sample_age_ms<=3000&&numeric(d.frequency_hz)&&d.frequency_hz>=0&&numeric(d.engine_rpm)&&d.engine_rpm>=0&&d.engine_rpm<=300&&names.every(n=>d.sensors&&d.sensors[n]&&numeric(d.sensors[n].raw)&&d.sensors[n].raw>=0&&d.sensors[n].raw<=1023&&numeric(d.sensors[n].voltage_v)&&d.sensors[n].voltage_v>=0&&d.sensors[n].voltage_v<=5.1);}
 function render(d,state){
  const live=state==='live';last=live?d:null;
@@ -30,11 +32,11 @@ function render(d,state){
  $('connection').classList.toggle('offline',!live);
  $('sourceBanner').textContent=live?`LIVE INPUTS · Arduino ${boardName(d)} → ESP32 · Actual sensor readings`:'Readings unavailable · Waiting for fresh Uno/Nano/Mega telemetry';
  $('sampleStatus').textContent=live?`Updated ${new Date().toLocaleTimeString()} · sample age ${d.sample_age_ms} ms · rejected packets ${d.bad_frames}`:'Check Uno/Nano/Mega power and the data link. Previous values are hidden.';
- if(locked){$('connection').textContent='SMART KEY OFF';$('connection').classList.remove('offline');$('sourceBanner').textContent=`SMART KEY OFF · Press the ${boardName(d)} D8 button to enable sensor readings`;$('sampleStatus').textContent='Acquisition locked. No testbench sensors are being read.';}
+ if(locked){$('connection').textContent='SMART KEY OFF';$('connection').classList.remove('offline');$('sourceBanner').textContent=`SMART KEY OFF · Press the ${boardName(d)} ${keyPin(d)} button to enable sensor readings`;$('sampleStatus').textContent='Acquisition locked. No testbench sensors are being read.';}
  $('keyLamp').dataset.active=String(fresh&&d.smart_key===true);
- $('keyState').textContent=fresh?(d.smart_key?'On · D8':'Off · press D8'):'Unavailable';
- $('brakeLamp').dataset.active=String(fresh&&d.brake_pressed===true);
- $('brakeState').textContent=fresh?(d.brake_pressed?'Pressed · slowing':'Released · D9'):'Unavailable';
+ $('keyState').textContent=fresh?(d.smart_key?'On · '+keyPin(d):'Off · press '+keyPin(d)):'Unavailable';
+ $('declogLamp').dataset.active=String(fresh&&d.declog===true);
+ $('declogState').textContent=fresh&&typeof d.declog==='boolean'?(d.declog?'On · D10':'Off · D10'):fresh?'n/a on '+boardName(d):'Unavailable';
  const fault=live&&d.check_engine===true,dtcs=fault&&Array.isArray(d.dtc)?d.dtc:[];
  milFault=fault;milBlink=dtcs.length&&numeric(dtcs[0].blink)?dtcs[0].blink:0;
  const codes=dtcs.map(x=>x.code+' '+label(x.sensor)).join(', ');
@@ -50,8 +52,8 @@ function render(d,state){
  if(!faultRequestPending)$('faultStatus').textContent=injected?'Injected sensor fault active · clear it to restore the gauge':live?'Select a sensor and press Simulate sensor fault.':'Enable the smart key and wait for live data.';
  const absState=live&&d.smart_key===true?(d.brake_pressed?'braking':'released'):'off';
  $('absLamp').dataset.state=absState;
- $('absState').textContent=absState==='braking'?'Brake pressed':absState==='released'?'Brake released':fresh?'Off':'Unavailable';
- if(live&&d.brake_pressed){$('sourceBanner').textContent='BRAKE PRESSED · Simulated speed ramps down to zero · Sensor readings remain live';}
+ $('absState').textContent=absState==='braking'?brakeName(d)+' on · slowing':absState==='released'?brakeName(d)+' off · D9':fresh?'Off':'Unavailable';
+ if(live&&d.brake_pressed){$('sourceBanner').textContent=brakeName(d).toUpperCase()+' ON · Simulated speed ramps down to zero · Sensor readings remain live';}
  if(fault){$('sourceBanner').textContent='CHECK ENGINE · '+codes+(injected?' · Demo fault injected · Gauge slowing to zero':' · Sensor circuit fault detected');}
  if(state==='live'&&previousState==='locked')selfTestStart=performance.now();
  if(state!==previousState){log(live?'Live sensor stream connected':locked?'Smart key off; acquisition locked':state==='stale'?'Uno/Nano/Mega data missing or stale':'ESP32 connection unavailable');previousState=state;}
@@ -103,7 +105,7 @@ function drawHistory(){const ctx=$('historyChart').getContext('2d'),key=$('chann
 for(const button of document.querySelectorAll('[data-page]'))button.addEventListener('click',()=>{for(const b of document.querySelectorAll('[data-page]')){const active=b===button;b.setAttribute('aria-pressed',String(active));$(b.dataset.page+'Page').hidden=!active;}drawHistory();});
 $('channel').addEventListener('change',drawHistory);
 $('recordButton').addEventListener('click',()=>{if(!recording&&recorded.length>=3600){$('recordStatus').textContent='Recording limit reached. Export CSV before refreshing.';return;}recording=!recording;updateRecording();log(recording?'Live recording started':'Recording stopped');});
-function csvText(){const header=['timestamp','source','smart_key','brake_pressed','frequency_hz','simulated_speed_kmh','check_engine','fault_mask',...names.flatMap(n=>[(n==='IAT'?'AIT':n)+'_raw',(n==='IAT'?'AIT':n)+'_voltage_v',(n==='IAT'?'AIT':n)+'_knob_percent',(n==='IAT'?'AIT':n)+'_endpoint_status']), 'AIT_c','ECT_c','MAP_kpa','TPS_percent','O2_lambda','O2_afr','O2_mixture','dtc_codes','coolant_warning','throttle_deg','simulated_rpm','reference_1_v','reference_2_v','battery_v','current_a'];const rows=recorded.map(r=>[r.time,r.data.source,r.data.smart_key,r.data.brake_pressed,r.data.frequency_hz,displaySpeed(r.data),r.data.check_engine,r.data.fault_mask,...names.flatMap(n=>{const s=r.data.sensors[n];return[s.raw,s.voltage_v,s.knob_percent,s.endpoint_status];}),r.data.sensors.IAT.estimate_c,r.data.sensors.ECT.estimate_c,r.data.sensors.MAP.estimate_kpa,r.data.sensors.TPS.throttle_percent,r.data.sensors.O2.lambda,r.data.sensors.O2.afr,r.data.sensors.O2.mixture,(r.data.dtc||[]).map(x=>x.code).join(' '),r.data.coolant_warning,throttleDeg(r.data.sensors.TPS.throttle_percent),r.data.simulated_rpm,r.data.reference_1_v,r.data.reference_2_v,r.data.battery_v,r.data.current_a]);return[header,...rows].map(row=>row.map(v=>'"'+String(v??'').replaceAll('"','""')+'"').join(',')).join('\r\n');}
+function csvText(){const header=['timestamp','source','smart_key','brake_pressed','declog','frequency_hz','simulated_speed_kmh','check_engine','fault_mask',...names.flatMap(n=>[(n==='IAT'?'AIT':n)+'_raw',(n==='IAT'?'AIT':n)+'_voltage_v',(n==='IAT'?'AIT':n)+'_knob_percent',(n==='IAT'?'AIT':n)+'_endpoint_status']), 'AIT_c','ECT_c','MAP_kpa','TPS_percent','O2_lambda','O2_afr','O2_mixture','dtc_codes','coolant_warning','throttle_deg','simulated_rpm','reference_1_v','reference_2_v','battery_v','current_a'];const rows=recorded.map(r=>[r.time,r.data.source,r.data.smart_key,r.data.brake_pressed,r.data.declog,r.data.frequency_hz,displaySpeed(r.data),r.data.check_engine,r.data.fault_mask,...names.flatMap(n=>{const s=r.data.sensors[n];return[s.raw,s.voltage_v,s.knob_percent,s.endpoint_status];}),r.data.sensors.IAT.estimate_c,r.data.sensors.ECT.estimate_c,r.data.sensors.MAP.estimate_kpa,r.data.sensors.TPS.throttle_percent,r.data.sensors.O2.lambda,r.data.sensors.O2.afr,r.data.sensors.O2.mixture,(r.data.dtc||[]).map(x=>x.code).join(' '),r.data.coolant_warning,throttleDeg(r.data.sensors.TPS.throttle_percent),r.data.simulated_rpm,r.data.reference_1_v,r.data.reference_2_v,r.data.battery_v,r.data.current_a]);return[header,...rows].map(row=>row.map(v=>'"'+String(v??'').replaceAll('"','""')+'"').join(',')).join('\r\n');}
 $('exportCsv').addEventListener('click',()=>{if(!recorded.length){$('recordStatus').textContent='Start recording to collect fresh samples first.';return;}const url=URL.createObjectURL(new Blob([csvText()],{type:'text/csv;charset=utf-8'})),a=document.createElement('a');a.href=url;a.download='live-testbench-'+Date.now()+'.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);log('Exported '+recorded.length+' live samples');});
 $("printReport").addEventListener("click",()=>{$("printSummary").innerHTML=window.buildSessionReport({model:$("modelName").value,technician:$("technician").value,notes:$("reportNotes").value,generated:Date.now(),latest:last,recorded,history:samples,events});window.print();});
 window.liveDashboard={valid,csvText,getState:()=>({last,recorded:recorded.length,history:samples.length}),render};
@@ -251,7 +253,7 @@ function setRpmGauge(rpm,show){
  $('needle').setAttribute('transform',`rotate(${r/RPM_MAX*180} 200 205)`);
 }
 function syncRaceLamps(){
- for(const [race,classic] of [['raceKey','keyLamp'],['raceBrake','brakeLamp'],['raceEngine','engineLamp'],['raceCoolant','coolantLamp']]){const v=$(classic).dataset.active;if($(race).dataset.active!==v)$(race).dataset.active=v;}
+ for(const [race,classic] of [['raceKey','keyLamp'],['raceDeclog','declogLamp'],['raceEngine','engineLamp'],['raceCoolant','coolantLamp']]){const v=$(classic).dataset.active;if($(race).dataset.active!==v)$(race).dataset.active=v;}
  const abs=$('absLamp').dataset.state;if($('raceAbs').dataset.state!==abs)$('raceAbs').dataset.state=abs;
 }
 function renderExtras(d,live,locked){

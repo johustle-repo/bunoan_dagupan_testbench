@@ -4,52 +4,55 @@
 #include "SensorConversion.h"
 #include "SerialLink.h"
 #include "Buttons.h"
-#include "RpmRamp.h"
 
 #if !defined(__AVR_ATmega2560__)
 #error "Select Arduino Mega or Mega 2560 (ATmega2560)."
 #endif
 
-// Arduino Mega 2560 sender for the universal ESP32 receiver. Same pins and
-// behaviour as the Nano set (A0-A4 sensors, D7 frequency, D9 brake,
-// D6 -> ESP32 GPIO17) but with no smart-key button: acquisition starts as
-// soon as the Mega powers up and the ESP32 plays its power-on animation. Plus three 0-30 V inputs through voltage
-// dividers: Reference 1 on A5, Reference 2 on A6 and the battery on A7, plus
-// a 0-5 V current signal on A8 (0-10 A). The
-// ESP32 link sends the U5 frame, so the receiver shows "Arduino Mega".
+// Arduino Mega 2560 (Pro) sender for the universal ESP32 receiver.
+//   A0-A4 IAT, ECT, O2, MAP, TPS     A5/A6 Reference 1/2, A7 battery (0-30 V dividers)
+//   D7 RPM frequency                 D8 speed frequency
+//   D9 ABS (the old brake input)     D10 Declog switch      D11 smart-key button
+//   D6 -> ESP32 GPIO17 (U6 frames)
+// The smart key toggles acquisition like the Uno set: with the key off the
+// sensors and both frequencies are locked and only the battery is sent.
 // The USB serial monitor (9600 baud) prints one line per update with the
 // 5-sensor diagnostic formulas in SensorConversion.h:
 //   IAT: 25.0 C | ECT: 40.0 C | O2: 0.45 V | AFR: 14.7:1 | MAP: 55 kPa | TPS Angle: 12 % | TPS: 0.5V |
-//   REF1: 12.00 V | REF2: 5.00 V | BATV: 13.80 V
-// On the Mega, D7 is port H bit 4.
-#define D7_HIGH() ((PINH & _BV(PH4)) != 0)
+//   RPM: 3000 | SPEED: 40.0 km/h | ABS: OFF | DECLOG: OFF | REF1: 12.00 V | REF2: 5.00 V | BATV: 13.80 V
+// On the Mega, D7 is port H bit 4 and D8 is port H bit 5.
+constexpr uint8_t RPM_BIT = _BV(PH4), SPEED_BIT = _BV(PH5);
 
-volatile uint32_t pulseCount = 0;
-volatile bool previousD7High = false;
+volatile uint32_t rpmPulses = 0, speedPulses = 0;
+volatile uint8_t previousPortH = 0;
 uint32_t windowStartUs = 0;
 uint32_t serialPauseUs = 0;
-volatile bool acquisitionEnabled = true;
-DebouncedButton brakeButton(9, false);
-// Brake wiring (same as the Uno/Nano sets): released LOW, pressed HIGH (active-high).
-float lastFrequencyHz = 0;
+volatile bool acquisitionEnabled = false;
+bool smartKeyOn = false;
+DebouncedButton smartKeyButton(11);
+// ABS and Declog wiring (same as the old brake): off LOW, on HIGH (active-high).
+DebouncedButton absButton(9, false), declogSwitch(10, false);
+float rpmFrequencyHz = 0, speedFrequencyHz = 0;
 uint32_t lastPublishMs = 0;
-uint32_t lastRampMs = 0;
-float displayedSpeed = 0;
-float lastPublishedSpeed = 0;
 
-// D7 has no external interrupt on the Mega; Timer1 samples it at 20 kHz,
-// as on the Uno/Nano, so the wiring stays the same.
+// D7 and D8 have no external interrupt on the Mega; Timer1 samples both at
+// 20 kHz, as on the Uno/Nano.
 ISR(TIMER1_COMPA_vect) {
-  const bool highNow = D7_HIGH();
-  if (acquisitionEnabled && highNow && !previousD7High) pulseCount++;
-  previousD7High = highNow;
+  const uint8_t portH = PINH;
+  const uint8_t rising = portH & ~previousPortH;
+  if (acquisitionEnabled) {
+    if (rising & RPM_BIT) rpmPulses++;
+    if (rising & SPEED_BIT) speedPulses++;
+  }
+  previousPortH = portH;
 }
 
 const uint8_t sensorPins[] = {A0, A1, A2, A3, A4}; // IAT, ECT, O2, MAP, TPS.
 constexpr uint8_t SENSOR_SAMPLES = 20;
 constexpr uint16_t PUBLISH_INTERVAL_MS = 500;
-// D7 speed = Hz / 6 km/h, max 250. The ESP32 works out RPM from the same
-// frequency (Hz x 15000 / 1549).
+// RPM = D7 Hz x 15000 / 1549; speed = D8 Hz / 6 km/h, max 250. The ESP32 works
+// both out from the frequencies in the frame; these are for the USB output.
+constexpr float RPM_PER_HZ = 15000.0f / 1549, RPM_MAX = 15000;
 constexpr float HZ_PER_KMH = 6.0f;
 constexpr float SPEED_MAX_KMH = 250.0f;
 float rawSnapshot[5]; // Averaged ADC counts, sent to the ESP32.
@@ -60,15 +63,11 @@ float rawSnapshot[5]; // Averaged ADC counts, sent to the ESP32.
 constexpr float VOLTAGE_DIVIDER_RATIO = 6.0f;
 const uint8_t referencePins[] = {A5, A6};
 constexpr uint8_t BATTERY_PIN = A7;
-// Current sensor output on A8: analogRead 0-1023 (0-5 V) mapped to 0-10 A.
-constexpr uint8_t CURRENT_PIN = A8;
-constexpr float CURRENT_FULL_SCALE_A = 10.0f; // Current at analogRead = 1023.
 float referenceVoltage[2] = {};
 float batteryVoltage = 0;
-float currentA = 0;
 
 // Divider input voltage: analogRead 0-1023 (pin 0-5 V) mapped to 0-30 V.
-// Averages 16 readings; the first one after switching pins is discarded.
+// Averages 20 readings 1 ms apart.
 float readDividerInput(uint8_t pin) {
   uint32_t sum = 0;
   for (uint8_t n = 0; n < SENSOR_SAMPLES; n++) {
@@ -78,29 +77,20 @@ float readDividerInput(uint8_t pin) {
   return float(sum) / SENSOR_SAMPLES * 5.0f / 1023.0f * VOLTAGE_DIVIDER_RATIO;
 }
 
-// Battery voltage and current, like the INA219 they replace.
-void readBattery() {
-  batteryVoltage = readDividerInput(BATTERY_PIN);
-  analogRead(CURRENT_PIN);
-  delayMicroseconds(200);
-  uint32_t sum = 0;
-  for (uint8_t n = 0; n < 16; n++) sum += analogRead(CURRENT_PIN);
-  currentA = sum / 16.0f * CURRENT_FULL_SCALE_A / 1023.0f;
-}
-
-// SoftwareSerial TX disables interrupts, so Timer1 can't sample D7 while a
+// SoftwareSerial TX disables interrupts, so Timer1 can't sample D7/D8 while a
 // frame is sent; that time is excluded from the frequency window.
-void publishEspSnapshot(float hz, bool brakePressed, float speedKmh) {
+void publishEspSnapshot() {
   uint32_t pauseStart;
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
     acquisitionEnabled = false;
     pauseStart = micros();
   }
-  sendEspSnapshot(rawSnapshot, hz, true, brakePressed, speedKmh, referenceVoltage, batteryVoltage, currentA);
+  sendEspSnapshot(rawSnapshot, rpmFrequencyHz, speedFrequencyHz, smartKeyOn, absButton.pressed(),
+                  declogSwitch.pressed(), referenceVoltage, batteryVoltage);
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
     serialPauseUs += uint32_t(micros() - pauseStart);
-    previousD7High = D7_HIGH();
-    acquisitionEnabled = true;
+    previousPortH = PINH;
+    acquisitionEnabled = smartKeyOn;
   }
 }
 
@@ -127,23 +117,26 @@ void printReading(const __FlashStringHelper* name, const SensorReading& r, uint8
 
 void setup() {
   Serial.begin(9600);
-  brakeButton.begin();
+  smartKeyButton.begin();
+  absButton.begin();
+  declogSwitch.begin();
   beginEspLink();
   analogReference(DEFAULT);
   for (uint8_t i = 0; i < 5; i++) {
     pinMode(sensorPins[i], INPUT);
     digitalWrite(sensorPins[i], LOW); // Keep internal pull-ups disabled.
   }
-  const uint8_t dividerPins[] = {referencePins[0], referencePins[1], BATTERY_PIN, CURRENT_PIN};
+  const uint8_t dividerPins[] = {referencePins[0], referencePins[1], BATTERY_PIN};
   for (uint8_t pin : dividerPins) {
     pinMode(pin, INPUT);
     digitalWrite(pin, LOW);
   }
   delay(1000);
-  // D7 is sampled by Timer1. No internal pull-up: provide a valid 0-to-VCC waveform.
+  // D7/D8 are sampled by Timer1. No internal pull-up: provide a valid 0-to-VCC waveform.
   pinMode(7, INPUT);
+  pinMode(8, INPUT);
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-    previousD7High = D7_HIGH();
+    previousPortH = PINH;
     TCCR1A = 0;
     TCCR1B = _BV(WGM12) | _BV(CS11);
     OCR1A = 99; // 16 MHz / 8 / 100 = 20 kHz.
@@ -152,41 +145,57 @@ void setup() {
     TIMSK1 |= _BV(OCIE1A);
     windowStartUs = micros();
   }
+  Serial.println(F("# SMART KEY OFF: sensor acquisition locked. Press D11 to enable."));
 }
 
 void loop() {
   const uint32_t nowMs = millis();
   bool changed = false;
-  if (brakeButton.update(nowMs)) changed = true;
-  if (uint32_t(micros() - windowStartUs) >= 1000000UL) {
-    uint32_t pulses, elapsedUs;
+  if (smartKeyButton.update(nowMs) && smartKeyButton.pressed()) {
+    smartKeyOn = !smartKeyOn;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+      acquisitionEnabled = smartKeyOn;
+      rpmPulses = speedPulses = 0;
+      serialPauseUs = 0;
+      previousPortH = PINH;
+      windowStartUs = micros();
+    }
+    rpmFrequencyHz = speedFrequencyHz = 0;
+    changed = true;
+  }
+  if (absButton.update(nowMs)) changed = true;
+  if (declogSwitch.update(nowMs)) changed = true;
+  if (smartKeyOn && uint32_t(micros() - windowStartUs) >= 1000000UL) {
+    uint32_t rpmCount, speedCount, elapsedUs;
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
       const uint32_t nowUs = micros();
       elapsedUs = uint32_t(nowUs - windowStartUs) - serialPauseUs;
       serialPauseUs = 0;
       windowStartUs = nowUs;
-      pulses = pulseCount;
-      pulseCount = 0;
+      rpmCount = rpmPulses;
+      speedCount = speedPulses;
+      rpmPulses = speedPulses = 0;
     }
-    lastFrequencyHz = elapsedUs ? pulses * 1000000.0f / elapsedUs : 0;
+    rpmFrequencyHz = elapsedUs ? rpmCount * 1000000.0f / elapsedUs : 0;
+    speedFrequencyHz = elapsedUs ? speedCount * 1000000.0f / elapsedUs : 0;
     changed = true;
   }
-  const bool brakePressed = brakeButton.pressed();
-  // Speed follows Hz / 6 and ramps to zero while the brake is pressed.
-  const float targetSpeed = brakePressed ? 0 : constrain(lastFrequencyHz / HZ_PER_KMH, 0.0f, SPEED_MAX_KMH);
-  displayedSpeed = stepSpeed(displayedSpeed, targetSpeed, uint32_t(nowMs - lastRampMs) / 1000.0f);
-  lastRampMs = nowMs;
-  const bool transitioning = displayedSpeed != targetSpeed || displayedSpeed != lastPublishedSpeed;
-  // Publish every 500 ms, sooner when the brake or the frequency changes.
-  if (!changed && !transitioning && uint32_t(nowMs - lastPublishMs) < PUBLISH_INTERVAL_MS) return;
+  // Publish every 500 ms, sooner when a switch or the frequencies change.
+  if (!changed && uint32_t(nowMs - lastPublishMs) < PUBLISH_INTERVAL_MS) return;
   if (uint32_t(nowMs - lastPublishMs) < 200) return;
   lastPublishMs = nowMs;
-  lastPublishedSpeed = displayedSpeed;
-  const float frequencyHz = lastFrequencyHz;
-  const float speedKmh = displayedSpeed;
+  // The battery is live with the key off, like a real bike.
+  batteryVoltage = readDividerInput(BATTERY_PIN);
+  if (!smartKeyOn) {
+    for (uint8_t i = 0; i < 5; i++) rawSnapshot[i] = 0;
+    referenceVoltage[0] = referenceVoltage[1] = 0;
+    Serial.print(F("# SMART KEY OFF | BATV: ")); Serial.print(batteryVoltage, 2);
+    Serial.println(F(" V | press D11 to enable"));
+    publishEspSnapshot();
+    return;
+  }
   const float iatV = readSensor(0), ectV = readSensor(1), o2V = readSensor(2);
   const float mapV = readSensor(3), tpsV = readSensor(4);
-  readBattery();
   for (uint8_t i = 0; i < 2; i++) referenceVoltage[i] = readDividerInput(referencePins[i]);
 
   const SensorReading afr = convertAfr(o2V);
@@ -202,8 +211,12 @@ void loop() {
     Serial.print(tps.value, 0); Serial.print(F(" % | "));
     Serial.print(F("TPS: ")); Serial.print(tpsV, 1); Serial.print(F("V"));
   }
+  Serial.print(F(" | RPM: ")); Serial.print(min(rpmFrequencyHz * RPM_PER_HZ, RPM_MAX), 0);
+  Serial.print(F(" | SPEED: ")); Serial.print(min(speedFrequencyHz / HZ_PER_KMH, SPEED_MAX_KMH), 1);
+  Serial.print(F(" km/h | ABS: ")); Serial.print(absButton.pressed() ? F("ON") : F("OFF"));
+  Serial.print(F(" | DECLOG: ")); Serial.print(declogSwitch.pressed() ? F("ON") : F("OFF"));
   Serial.print(F(" | REF1: ")); Serial.print(referenceVoltage[0], 2);
   Serial.print(F(" V | REF2: ")); Serial.print(referenceVoltage[1], 2);
   Serial.print(F(" V | BATV: ")); Serial.print(batteryVoltage, 2); Serial.println(F(" V"));
-  publishEspSnapshot(frequencyHz, brakePressed, speedKmh);
+  publishEspSnapshot();
 }
