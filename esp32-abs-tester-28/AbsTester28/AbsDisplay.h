@@ -8,9 +8,9 @@
 // drawn anti-aliased (AaGraphics.h) with the Barlow Semi Condensed fonts in
 // AaFonts.h, into off-screen strips that are pushed in one SPI burst each, so
 // nothing flickers:
-//   header | 0-250 km/h speedometer (rear + front needles), ABS / TCS /
-//   SENSOR warning lights and REAR / FRONT bars | REF1, REAR, FRONT, BATTERY
-//   tiles | key, RPM and DECLOG along the bottom.
+//   header | 0-250 km/h speedometer (rear + front needles) and the ABS /
+//   TCS / SENSOR warning lights, then the REAR speed bar with the DECLOG bar
+//   below it | REF1 and BATTERY tiles | KEY ON along the bottom.
 // The Nano has no key button any more (D8 is the front sensor), so every
 // power-up plays a splash and the switch-on self-test runs when live data
 // arrives. WAITING FOR NANO / NO LINK show until then.
@@ -86,7 +86,6 @@ constexpr uint16_t FACE = rgb(0x0e, 0x18, 0x25), PLATE = rgb(0x06, 0x0b, 0x12), 
 constexpr uint16_t OFF_FILL = rgb(0x0f, 0x17, 0x22), OFF_EDGE = rgb(0x1f, 0x2b, 0x3a), OFF_TEXT = rgb(0x43, 0x51, 0x67);
 constexpr uint16_t HEAD_TOP = rgb(0x13, 0x20, 0x2f), HEAD_BOTTOM = rgb(0x0a, 0x12, 0x1b);
 constexpr uint16_t NEEDLE_CORE = rgb(0xff, 0xb4, 0xb4);
-const uint16_t WHEEL_COLOR[2] = {RED, GREEN};  // Rear needle red, front green.
 
 Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_RST);
 
@@ -96,12 +95,12 @@ constexpr int GX = 4, GY = 26, GW = 212, GH = 122;            // Speedometer pan
 constexpr float DCX = GX + 106, DCY = GY + 106, DR = 96;      // Dial centre and radius.
 constexpr int PLATE_W = 72, PLATE_H = 46, PLATE_Y = DCY - 38;  // Digital readout.
 constexpr int LY = 151, LH = 24, LW = 68, LGAP = 4;          // Warning lights row.
-constexpr int BX = 4, BY = 178, BW = 212, BH = 36;            // REAR / FRONT bars panel.
-constexpr int TX = 220, TW = 96, TY0 = 26, TH = 44, TSTEP = 48;  // Right tiles.
-constexpr int FY = 218, FH = 22;                              // Footer.
-enum Tile : uint8_t { T_REF1, T_REAR, T_FRONT, T_BATTERY };
-const char* const TILES[4] = {"REF1", "REAR", "FRONT", "BATTERY"};
-const uint16_t TILE_ACCENTS[4] = {ACCENT, RED, GREEN, AMBER};
+constexpr int BX = 4, BY = 178, BW = 212, BH = 36;            // REAR speed + DECLOG bars panel.
+constexpr int TX = 220, TW = 96, TY0 = 26, TH = 91, TSTEP = 97;  // Right tiles.
+constexpr int FY = 218, FH = 22;                              // Footer bar.
+enum Tile : uint8_t { T_REF1, T_BATTERY, TILE_COUNT };
+const char* const TILES[TILE_COUNT] = {"REF1", "BATTERY"};
+const uint16_t TILE_ACCENTS[TILE_COUNT] = {ACCENT, AMBER};
 const char* const LAMP_LABELS[3] = {"(ABS)", "TCS", "SENSOR"};
 
 // Strips of the screen are drawn here, then pushed.
@@ -112,7 +111,7 @@ uint16_t scratch[SCRATCH_PX];
 uint16_t* dialBg = nullptr;
 
 enum Mode : uint8_t { NONE, LOCKED, TESTER } mode = NONE;
-enum Slot : uint8_t { S_TILE0, S_LIGHTS = 4, S_BARS, S_FOOTER, S_HEAD, S_LOCK, SLOT_COUNT };
+enum Slot : uint8_t { S_TILE0, S_LIGHTS = S_TILE0 + TILE_COUNT, S_BARS, S_FOOTER, S_HEAD, S_LOCK, SLOT_COUNT };
 char shown[SLOT_COUNT][40];
 uint32_t lastGaugeMs = 0, lastTextMs = 0, selfTestStartMs = 0;
 bool selfTestActive = false;
@@ -172,7 +171,6 @@ void drawHeader(const char* pill, uint16_t pillColor) {
     aa::fillRect(b, 0, HEAD_H - 1, W, 1, PANEL_EDGE);
     const int x = aa::text(b, aaTitle, "ABS", 10, 17, ACCENT, aa::LEFT, 1);
     aa::text(b, aaTitle, "TESTER", x + 5, 17, TEXT, aa::LEFT, 1);
-    aa::text(b, aaSmall, "REAR D7  |  FRONT D8", 120, 15, DIM, aa::LEFT, 1);
     aa::roundRect(b, 256, 4, 58, 14, 7, pillColor);
     aa::textMid(b, aaSmall, pill, 285, 11, BG, 1);
   });
@@ -259,83 +257,69 @@ void drawLights(const bool lit[3], const uint16_t colors[3]) {
   });
 }
 
-// REAR and FRONT rows: label in the needle colour, a bar to the speed and the
-// speed in km/h.
-void drawBars(const float kmh[2], bool haveFront) {
+// Tile: accent mark and label, then the volts large and centred: the whole
+// volts in the big readout digits, the decimals and unit beside them.
+void drawTile(uint8_t i, float volts) {
+  const int y = TY0 + i * TSTEP;
+  char whole[6], frac[6];
+  const long centi = lroundf(constrain(volts, 0.0f, 99.99f) * 100);
+  snprintf(whole, sizeof(whole), "%ld", centi / 100);
+  snprintf(frac, sizeof(frac), ".%02ld", centi % 100);
+  render(TX, y, TW, TH, [&](aa::Buf& b) {
+    aa::fill(b, BG);
+    panel(b, TX, y, TW, TH);
+    aa::roundRect(b, TX + 8, y + 9, 3, 11, 1.5f, TILE_ACCENTS[i]);
+    aa::text(b, aaLabel, TILES[i], TX + 16, y + 19, MUTED, aa::LEFT, 1);
+    const int wBig = aa::textWidth(aaBig, whole), wFrac = aa::textWidth(aaValue, frac);
+    const int wUnit = aa::textWidth(aaLabel, "V");
+    const int base = y + 66;
+    int x = TX + (TW - (wBig + wFrac + 3 + wUnit)) / 2;
+    x = aa::text(b, aaBig, whole, x, base, TEXT);
+    x = aa::text(b, aaValue, frac, x, base, TEXT);
+    aa::text(b, aaLabel, "V", x + 3, base, MUTED);
+  });
+}
+
+// REAR speed bar (0-250 km/h) with the DECLOG bar (0-100 %) below it.
+void drawBars(float rearKmh, float declogPercent) {
   render(BX, BY, BW, BH, [&](aa::Buf& b) {
     aa::fill(b, BG);
     panel(b, BX, BY, BW, BH);
-    for (uint8_t w = 0; w < 2; ++w) {
-      const int cy = BY + 11 + w * 14;
-      const bool on = w == 0 || haveFront;
-      aa::text(b, aaLabel, w ? "FRONT" : "REAR", BX + 10, cy + 4, on ? WHEEL_COLOR[w] : DIM, aa::LEFT, 1);
-      constexpr int X0 = BX + 52, LEN = 100;
+    constexpr int X0 = BX + 56, LEN = 96;
+    char s[16];
+    for (uint8_t row = 0; row < 2; ++row) {
+      const int cy = BY + 11 + row * 14;
+      const float f = row ? declogPercent / 100 : rearKmh / ABS_SPEED_MAX;
+      const uint16_t c = row ? ACCENT : speedColor(rearKmh);
+      aa::text(b, aaLabel, row ? "DECLOG" : "REAR", BX + 10, cy + 4, row ? MUTED : RED, aa::LEFT, 1);
       aa::roundRect(b, X0, cy - 3, LEN, 6, 3, TRACK);
-      const float f = on ? constrain(kmh[w] / ABS_SPEED_MAX, 0.0f, 1.0f) : 0;
-      if (f > 0.01f) aa::roundRect(b, X0, cy - 3, max(6.0f, f * LEN), 6, 3, speedColor(kmh[w]));
-      char s[16];
-      if (on) snprintf(s, sizeof(s), "%.0f km/h", kmh[w]);
-      else strcpy(s, "-- km/h");
-      aa::text(b, aaLabel, s, BX + BW - 10, cy + 4, on ? MUTED : DIM, aa::RIGHT);
+      if (f > 0.01f) aa::roundRect(b, X0, cy - 3, max(6.0f, constrain(f, 0.0f, 1.0f) * LEN), 6, 3, c);
+      if (row) snprintf(s, sizeof(s), "%.0f%%", declogPercent);
+      else snprintf(s, sizeof(s), "%.0f km/h", rearKmh);
+      aa::text(b, aaLabel, s, BX + BW - 10, cy + 4, TEXT, aa::RIGHT);
     }
   });
 }
 
-// Tile: accent mark, label, then the value with its unit right-aligned.
-void drawTile(uint8_t i, const char* value, const char* unit, uint16_t color) {
-  const int y = TY0 + i * TSTEP;
-  render(TX, y, TW, TH, [&](aa::Buf& b) {
-    aa::fill(b, BG);
-    panel(b, TX, y, TW, TH);
-    aa::roundRect(b, TX + 8, y + 8, 3, 10, 1.5f, TILE_ACCENTS[i]);
-    aa::text(b, aaLabel, TILES[i], TX + 16, y + 17, MUTED, aa::LEFT, 1);
-    const int unitW = aa::textWidth(aaSmall, unit);
-    aa::text(b, aaSmall, unit, TX + TW - 9, y + 37, MUTED, aa::RIGHT);
-    aa::text(b, aaValue, value, TX + TW - 12 - unitW, y + 38, color, aa::RIGHT);
-  });
-}
-
-// KEY ON | RPM (LAMP CHECK during the self-test) | DECLOG.
-void drawFooter(bool selfTest, uint16_t rpm, float percent) {
+// KEY ON.
+void drawFooter() {
   render(GX, FY, W - 2 * GX, FH, [&](aa::Buf& b) {
     aa::fill(b, BG);
     panel(b, GX, FY, W - 2 * GX, FH, 7);
     const int cy = FY + FH / 2;
     aa::circle(b, GX + 13, cy, 3.5f, GREEN);
     aa::text(b, aaLabel, "KEY ON", GX + 22, cy + 5, TEXT, aa::LEFT, 1);
-    aa::fillRect(b, 100, FY + 5, 1, FH - 10, PANEL_EDGE);
-    char r[16];
-    snprintf(r, sizeof(r), "%u RPM", rpm);
-    aa::circle(b, 113, cy, 3.5f, selfTest ? AMBER : rpm ? ACCENT : DIM);
-    aa::text(b, aaLabel, selfTest ? "LAMP CHECK" : r, 122, cy + 5, selfTest ? AMBER : rpm ? TEXT : MUTED, aa::LEFT, 1);
-    aa::fillRect(b, 214, FY + 5, 1, FH - 10, PANEL_EDGE);
-    char s[8];
-    snprintf(s, sizeof(s), "%.0f%%", percent);
-    aa::text(b, aaLabel, s, W - GX - 10, cy + 5, TEXT, aa::RIGHT);
-    aa::text(b, aaLabel, "DECLOG", 226, cy + 5, MUTED, aa::LEFT, 1);
   });
 }
 
 void testerText(const AbsData& d, bool selfTest) {
-  char key[40], value[12];
+  char key[40];
   header(selfTest ? "TEST" : "LIVE", selfTest ? ACCENT : GREEN);
-  // Tiles: REF1 and battery volts, rear and front km/h ("--" without D8).
-  for (uint8_t i = 0; i < 4; ++i) {
-    uint16_t color = TEXT;
-    const char* unit = "km/h";
-    if (i == T_REF1 || i == T_BATTERY) {
-      snprintf(value, sizeof(value), "%.2f", i == T_REF1 ? d.ref1V : d.batteryV);
-      unit = "V";
-    } else if (i == T_FRONT && !d.front) {
-      strcpy(value, "--");
-      color = DIM;
-    } else {
-      const float kmh = i == T_REAR ? d.speedKmh : d.frontKmh;
-      snprintf(value, sizeof(value), "%.0f", kmh);
-      if (kmh >= SPEED_RED) color = RED;
-    }
-    snprintf(key, sizeof(key), "%s%u", value, color);
-    if (changed(S_TILE0 + i, key)) drawTile(i, value, unit, color);
+  // Tiles: REF1 and battery volts.
+  for (uint8_t i = 0; i < TILE_COUNT; ++i) {
+    const float v = i == T_REF1 ? d.ref1V : d.batteryV;
+    snprintf(key, sizeof(key), "%.2f", v);
+    if (changed(S_TILE0 + i, key)) drawTile(i, v);
   }
   // Warning lights; FLASH blinks at 2 Hz and the self-test lights them all.
   const Lamps lamps = warningLamps(d);
@@ -350,14 +334,12 @@ void testerText(const AbsData& d, bool selfTest) {
   }
   snprintf(key, sizeof(key), "%d%d%d%u%u%u", lit[0], lit[1], lit[2], colors[0], colors[1], colors[2]);
   if (changed(S_LIGHTS, key)) drawLights(lit, colors);
-  // Bars.
-  const float kmh[2] = {d.speedKmh, d.frontKmh};
-  snprintf(key, sizeof(key), "%.0f %.0f %d", kmh[0], kmh[1], d.front);
-  if (changed(S_BARS, key)) drawBars(kmh, d.front);
-  // Footer.
+  // REAR speed and DECLOG bars.
   const float percent = constrain(d.frequencyHz / FREQUENCY_MAX_HZ * 100, 0.0f, 100.0f);
-  snprintf(key, sizeof(key), "%d %u %.0f", selfTest, d.rpm, percent);
-  if (changed(S_FOOTER, key)) drawFooter(selfTest, d.rpm, percent);
+  snprintf(key, sizeof(key), "%.0f %.0f", d.speedKmh, percent);
+  if (changed(S_BARS, key)) drawBars(d.speedKmh, percent);
+  // Footer.
+  if (changed(S_FOOTER, "KEY ON")) drawFooter();
 }
 
 // ---- Locked (waiting / no link) and the tester frame ----
@@ -384,7 +366,7 @@ void lockedText(const AbsData& d) {
     aa::roundRect(b, 30, 44, 260, 164, 14, PANEL, PANEL_EDGE, 1);
     absSymbol(b, W / 2, 92, 22, color, aaPill);
     aa::text(b, aaValue, line, W / 2, 152, color, aa::CENTER, 1);
-    aa::text(b, aaLabel, live ? "Flash the new Nano firmware" : "Check Nano D5 -> GPIO16 and GND", W / 2, 174, MUTED,
+    aa::text(b, aaLabel, live ? "Flash the new Nano firmware" : "Check the Nano link", W / 2, 174, MUTED,
              aa::CENTER);
     aa::text(b, aaSmall, "Wi-Fi ABS-Tester  |  192.168.4.1", W / 2, 194, DIM, aa::CENTER, 1);
   });
@@ -399,12 +381,12 @@ void drawTesterFrame() {
 // Power-on splash: the ABS lamp ring sweeps round, the title fades in and a
 // loading bar fills.
 void splash() {
-  constexpr int BAR_X = 80, BAR_Y = 200, BAR_W = 160;
+  constexpr int BAR_X = 100, BAR_Y = 186, BAR_W = 120;
   for (uint32_t start = millis(), t = 0; t <= SPLASH_MS; t = millis() - start) {
     const float p = float(t) / SPLASH_MS, fade = constrain((p - 0.15f) / 0.45f, 0.0f, 1.0f);
     render(0, 0, W, H, [&](aa::Buf& b) {
       aa::fill(b, BG);
-      const float cx = W / 2, cy = 84, r = 30;
+      const float cx = W / 2, cy = 90, r = 30;
       aa::arc(b, cx, cy, r - 4, r, HALF_PI, HALF_PI + TWO_PI, [](float) { return TRACK; });
       const float sweep = 3 * HALF_PI + TWO_PI * min(1.0f, p / 0.6f);
       aa::arc(b, cx, cy, r - 4, r, 3 * HALF_PI, sweep, [](float) { return ACCENT; });
@@ -412,9 +394,7 @@ void splash() {
       aa::arc(b, cx, cy, r + 6, r + 10, PI - 0.6f, PI + 0.6f, [amber](float) { return amber; });
       aa::arc(b, cx, cy, r + 6, r + 10, TWO_PI - 0.6f, TWO_PI + 0.6f, [amber](float) { return amber; });
       aa::textMid(b, aaPill, "ABS", cx, cy, amber, 1);
-      aa::text(b, aaValue, "ABS TESTER", cx, 158, aa::mix(BG, TEXT, fade * 255), aa::CENTER, 3);
-      aa::text(b, aaLabel, "REAR D7   |   FRONT D8   |   SPEED = Hz / 6", cx, 180, aa::mix(BG, MUTED, fade * 255),
-               aa::CENTER, 1);
+      aa::text(b, aaValue, "ABS TESTER", cx, 164, aa::mix(BG, TEXT, fade * 255), aa::CENTER, 3);
       aa::roundRect(b, BAR_X, BAR_Y, BAR_W, 6, 3, TRACK);
       aa::roundRect(b, BAR_X, BAR_Y, max(6.0f, BAR_W * min(1.0f, p)), 6, 3, ACCENT);
     });
@@ -444,8 +424,8 @@ void begin() {
 void update(const AbsData& d) {
   const uint32_t now = millis();
   const bool running = d.link == AbsData::LIVE && d.keyOn;
-  // Switch-on self-test when live data arrives: both needles and bars sweep
-  // up and back with LAMP CHECK and every warning light lit.
+  // Switch-on self-test when live data arrives: both needles and the REAR
+  // bar sweep up and back with the TEST pill and every warning light lit.
   if (running && mode != TESTER) { drawTesterFrame(); selfTestActive = true; selfTestStartMs = now; }
   else if (!running && mode != LOCKED) drawLockedFrame();
   const uint32_t testMs = now - selfTestStartMs;
