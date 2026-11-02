@@ -1,5 +1,7 @@
 'use strict';
-const $=id=>document.getElementById(id),names=['IAT','ECT','O2','MAP','TPS'];
+// Panels removed from the page leave their ids unresolved: hand back a detached stand-in so the
+// code that fills them still runs harmlessly.
+const stubs={},$=id=>document.getElementById(id)||(stubs[id]||(stubs[id]=document.createElement(id==='afrTable'?'table':'div'))),names=['IAT','ECT','O2','MAP','TPS'];
 let last=null,previousState='',recording=false;const samples=[],recorded=[],events=[];
 let recentPacket=null,freshUntil=0,lastSampleKey=null,lastHistoryMs=0;
 const numeric=v=>typeof v==='number'&&Number.isFinite(v);
@@ -22,7 +24,7 @@ let ticks='';for(let i=0;i<=15;i++){const a=Math.PI+i/15*Math.PI,p=r=>[200+Math.
 function log(message){events.push({time:new Date().toISOString(),message});if(events.length>200)events.shift();const li=document.createElement('li');li.textContent=new Date().toLocaleTimeString()+' · '+message;$('eventLog').prepend(li);while($('eventLog').children.length>100)$('eventLog').lastChild.remove();}
 const SOURCES=['uno_via_esp32','nano_via_esp32','mega_via_esp32'];
 function boardName(d){return d&&d.board==='uno'?'Uno':d&&d.frame==='U6'?'Mega 2560 Pro':d&&d.board==='mega'?'Mega':'Nano';}
-function keyPin(d){return d&&d.frame==='U6'?'D11':'D8';}
+function keyPin(d){return d&&d.frame==='U6'?'Mega power':'D8';}
 function brakeName(d){return d&&d.frame==='U6'?'ABS':'Brake';}
 function valid(d){return d&&SOURCES.includes(d.source)&&d.stale===false&&numeric(d.sample_age_ms)&&d.sample_age_ms>=0&&d.sample_age_ms<=3000&&numeric(d.frequency_hz)&&d.frequency_hz>=0&&numeric(d.engine_rpm)&&d.engine_rpm>=0&&d.engine_rpm<=300&&names.every(n=>d.sensors&&d.sensors[n]&&numeric(d.sensors[n].raw)&&d.sensors[n].raw>=0&&d.sensors[n].raw<=1023&&numeric(d.sensors[n].voltage_v)&&d.sensors[n].voltage_v>=0&&d.sensors[n].voltage_v<=5.1);}
 function render(d,state){
@@ -34,9 +36,10 @@ function render(d,state){
  $('sampleStatus').textContent=live?`Updated ${new Date().toLocaleTimeString()} · sample age ${d.sample_age_ms} ms · rejected packets ${d.bad_frames}`:'Check Uno/Nano/Mega power and the data link. Previous values are hidden.';
  if(locked){$('connection').textContent='SMART KEY OFF';$('connection').classList.remove('offline');$('sourceBanner').textContent=`SMART KEY OFF · Press the ${boardName(d)} ${keyPin(d)} button to enable sensor readings`;$('sampleStatus').textContent='Acquisition locked. No testbench sensors are being read.';}
  $('keyLamp').dataset.active=String(fresh&&d.smart_key===true);
- $('keyState').textContent=fresh?(d.smart_key?'On · '+keyPin(d):'Off · press '+keyPin(d)):'Unavailable';
+ $('keyState').textContent=fresh?(d.smart_key?'On · '+keyPin(d):(d.frame==='U6'?'Off · Mega unpowered':'Off · press '+keyPin(d))):'Unavailable';
  $('declogLamp').dataset.active=String(fresh&&d.declog===true);
- $('declogState').textContent=fresh&&typeof d.declog==='boolean'?(d.declog?'On · D10':'Off · D10'):fresh?'n/a on '+boardName(d):'Unavailable';
+ $('declogState').textContent=fresh&&typeof d.declog_hz==='number'?d.declog_hz.toFixed(1)+' Hz · A9':fresh&&typeof d.declog==='boolean'?(d.declog?'On':'Off'):fresh?'n/a on '+boardName(d):'Unavailable';
+ $('raceDeclog').textContent=fresh&&typeof d.declog_hz==='number'?'DECLOG '+d.declog_hz.toFixed(0)+' Hz':'DECLOG';
  const fault=live&&d.check_engine===true,dtcs=fault&&Array.isArray(d.dtc)?d.dtc:[];
  milFault=fault;milBlink=dtcs.length&&numeric(dtcs[0].blink)?dtcs[0].blink:0;
  const codes=dtcs.map(x=>x.code+' '+label(x.sensor)).join(', ');
@@ -67,7 +70,10 @@ function render(d,state){
  // Battery (Mega A7, 0-30 V divider) and current (A8, 0-10 A) are read even with the smart key off.
  {const v=fresh&&d?d.battery_v:null,a=fresh&&d?d.current_a:null,state=!numeric(v)?'':v<11.8?'low':v>15?'over':v>=13.2?'charging':'ok';$('batteryV').textContent=numeric(v)?format(v,2)+' V':'— V';$('batteryV').dataset.state=state;
   // Like the LCD grid: n/a when the board has no battery / current input.
-  const na=fresh&&d&&d.board!=='mega';if(!numeric(v)&&na)$('batteryV').textContent='n/a';$('currentA').textContent=numeric(a)?format(a,2)+' A':na?'n/a':'— A';}
+  const na=fresh&&d&&d.board!=='mega';if(!numeric(v)&&na)$('batteryV').textContent='n/a';$('currentA').textContent=numeric(a)?format(a,2)+' A':na?'n/a':'— A';
+  // Mega 2560 Pro: the cell shows the Declog frequency (A9 pot) instead of the current.
+  const dh=fresh&&d?d.declog_hz:null,cell=$('currentA');cell.previousElementSibling.textContent=numeric(dh)?'DECLOG':'CURRENT';
+  if(numeric(dh)){cell.textContent=format(dh,1)+' Hz';cell.parentElement.title='Mega A9 pot · D2 0-100 Hz';}}
  // References: Mega inputs are plain 0-30 V readings; the Nano's direct 5 V /
  // 3.3 V supply references are flagged LOW or HIGH beyond 5% of nominal.
  const uno=!!(d&&d.board==='uno'),mega=!!(d&&d.board==='mega');for(const [id,key,nominal] of [['ref1','reference_1_v',5],['ref2','reference_2_v',3.3]]){const v=live?d[key]:null,ok=numeric(v)&&(mega||Math.abs(v-nominal)<=nominal*.05);$(id).textContent=uno?'n/a':numeric(v)?format(v,2)+' V'+(ok?'':v<nominal?' LOW':' HIGH'):'— V';$(id).dataset.state=numeric(v)?(ok?'ok':'fault'):'';}
@@ -105,7 +111,7 @@ function drawHistory(){const ctx=$('historyChart').getContext('2d'),key=$('chann
 for(const button of document.querySelectorAll('[data-page]'))button.addEventListener('click',()=>{for(const b of document.querySelectorAll('[data-page]')){const active=b===button;b.setAttribute('aria-pressed',String(active));$(b.dataset.page+'Page').hidden=!active;}drawHistory();});
 $('channel').addEventListener('change',drawHistory);
 $('recordButton').addEventListener('click',()=>{if(!recording&&recorded.length>=3600){$('recordStatus').textContent='Recording limit reached. Export CSV before refreshing.';return;}recording=!recording;updateRecording();log(recording?'Live recording started':'Recording stopped');});
-function csvText(){const header=['timestamp','source','smart_key','brake_pressed','declog','frequency_hz','simulated_speed_kmh','check_engine','fault_mask',...names.flatMap(n=>[(n==='IAT'?'AIT':n)+'_raw',(n==='IAT'?'AIT':n)+'_voltage_v',(n==='IAT'?'AIT':n)+'_knob_percent',(n==='IAT'?'AIT':n)+'_endpoint_status']), 'AIT_c','ECT_c','MAP_kpa','TPS_percent','O2_lambda','O2_afr','O2_mixture','dtc_codes','coolant_warning','throttle_deg','simulated_rpm','reference_1_v','reference_2_v','battery_v','current_a'];const rows=recorded.map(r=>[r.time,r.data.source,r.data.smart_key,r.data.brake_pressed,r.data.declog,r.data.frequency_hz,displaySpeed(r.data),r.data.check_engine,r.data.fault_mask,...names.flatMap(n=>{const s=r.data.sensors[n];return[s.raw,s.voltage_v,s.knob_percent,s.endpoint_status];}),r.data.sensors.IAT.estimate_c,r.data.sensors.ECT.estimate_c,r.data.sensors.MAP.estimate_kpa,r.data.sensors.TPS.throttle_percent,r.data.sensors.O2.lambda,r.data.sensors.O2.afr,r.data.sensors.O2.mixture,(r.data.dtc||[]).map(x=>x.code).join(' '),r.data.coolant_warning,throttleDeg(r.data.sensors.TPS.throttle_percent),r.data.simulated_rpm,r.data.reference_1_v,r.data.reference_2_v,r.data.battery_v,r.data.current_a]);return[header,...rows].map(row=>row.map(v=>'"'+String(v??'').replaceAll('"','""')+'"').join(',')).join('\r\n');}
+function csvText(){const header=['timestamp','source','smart_key','brake_pressed','declog','declog_hz','frequency_hz','simulated_speed_kmh','check_engine','fault_mask',...names.flatMap(n=>[(n==='IAT'?'AIT':n)+'_raw',(n==='IAT'?'AIT':n)+'_voltage_v',(n==='IAT'?'AIT':n)+'_knob_percent',(n==='IAT'?'AIT':n)+'_endpoint_status']), 'AIT_c','ECT_c','MAP_kpa','TPS_percent','O2_lambda','O2_afr','O2_mixture','dtc_codes','coolant_warning','throttle_deg','simulated_rpm','reference_1_v','reference_2_v','battery_v','current_a'];const rows=recorded.map(r=>[r.time,r.data.source,r.data.smart_key,r.data.brake_pressed,r.data.declog,r.data.declog_hz,r.data.frequency_hz,displaySpeed(r.data),r.data.check_engine,r.data.fault_mask,...names.flatMap(n=>{const s=r.data.sensors[n];return[s.raw,s.voltage_v,s.knob_percent,s.endpoint_status];}),r.data.sensors.IAT.estimate_c,r.data.sensors.ECT.estimate_c,r.data.sensors.MAP.estimate_kpa,r.data.sensors.TPS.throttle_percent,r.data.sensors.O2.lambda,r.data.sensors.O2.afr,r.data.sensors.O2.mixture,(r.data.dtc||[]).map(x=>x.code).join(' '),r.data.coolant_warning,throttleDeg(r.data.sensors.TPS.throttle_percent),r.data.simulated_rpm,r.data.reference_1_v,r.data.reference_2_v,r.data.battery_v,r.data.current_a]);return[header,...rows].map(row=>row.map(v=>'"'+String(v??'').replaceAll('"','""')+'"').join(',')).join('\r\n');}
 $('exportCsv').addEventListener('click',()=>{if(!recorded.length){$('recordStatus').textContent='Start recording to collect fresh samples first.';return;}const url=URL.createObjectURL(new Blob([csvText()],{type:'text/csv;charset=utf-8'})),a=document.createElement('a');a.href=url;a.download='live-testbench-'+Date.now()+'.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);log('Exported '+recorded.length+' live samples');});
 $("printReport").addEventListener("click",()=>{$("printSummary").innerHTML=window.buildSessionReport({model:$("modelName").value,technician:$("technician").value,notes:$("reportNotes").value,generated:Date.now(),latest:last,recorded,history:samples,events});window.print();});
 window.liveDashboard={valid,csvText,getState:()=>({last,recorded:recorded.length,history:samples.length}),render};
@@ -185,13 +191,13 @@ function throttleIcon(){
  let ticks='',labels='';
  for(let deg=0;deg<360;deg+=15){const major=deg%90===0,mid=deg%30===0||deg%45===0;if(!major&&!mid)continue;const [x1,y1]=tpPoint(deg,TP.r),[x2,y2]=tpPoint(deg,TP.r-(major?11:6));ticks+=`<line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}"/>`;}
  for(const deg of [0,90,180,270]){const [x,y]=tpPoint(deg,TP.r+11);labels+=`<text x="${x.toFixed(1)}" y="${y.toFixed(1)}">${deg}°</text>`;}
- return `<svg class="throttle-icon" viewBox="0 0 120 120" aria-hidden="true"><circle class="tp-track" cx="${TP.cx}" cy="${TP.cy}" r="${TP.r}"/><path class="tp-wedge" d=""/><path class="tp-arc" d=""/><g class="tp-ticks">${ticks}</g><g class="tp-labels">${labels}</g><line class="tp-plate" x1="${TP.cx}" y1="${TP.cy-TP.r+2}" x2="${TP.cx}" y2="${TP.cy+TP.r-2}" visibility="hidden"/><circle class="tp-shaft" cx="${TP.cx}" cy="${TP.cy}" r="4"/></svg><span class="tp-read"><b class="tp-deg">—</b><small class="tp-open"></small></span>`;
+ return `<svg class="throttle-icon" viewBox="0 0 120 120" aria-hidden="true"><circle class="tp-track" cx="${TP.cx}" cy="${TP.cy}" r="${TP.r}"/><path class="tp-wedge" d=""/><path class="tp-arc" d=""/><g class="tp-ticks">${ticks}</g><g class="tp-labels">${labels}</g><line class="tp-plate" x1="${TP.cx}" y1="${TP.cy-TP.r+2}" x2="${TP.cx}" y2="${TP.cy+TP.r-2}" visibility="hidden"/><circle class="tp-shaft" cx="${TP.cx}" cy="${TP.cy}" r="4"/></svg><span class="tp-read"><b class="tp-deg">—</b><small class="tp-open"></small></span><span class="tp-bar" aria-hidden="true"><i class="tp-fill"></i></span><span class="tp-scale" aria-hidden="true"><em>CLOSED</em><em>WOT</em></span>`;
 }
 for(const slot of document.querySelectorAll('.throttle-slot'))slot.innerHTML=throttleIcon();
 function updateThrottle(deg){
  // Readout is the plate's two end angles, e.g. closed 0° – 180°, wide open 270° – 90°.
  const has=numeric(deg),on=has&&deg>0.2,turn=has?TP_DIR*deg:0,end1=(Math.round(turn)+360)%360,end2=(end1+180)%360;
- const text=has?`${end1}° – ${end2}°`:'—',open=has?`opening ${format(deg,1)}°`:'';
+ const text=has?`${end1}° – ${end2}°`:'—',open=has?`open ${format(deg,1)}°`:'';
  // Arcs are drawn clockwise, so a counter-clockwise turn spans [-deg, 0].
  const a0=TP_DIR>0?0:-deg,a1=TP_DIR>0?deg:0;
  const wedge=on?tpSector(a0,a1,TP.r)+tpSector(180+a0,180+a1,TP.r):'',arc=on?tpArc(a0,a1,16)+tpArc(180+a0,180+a1,16):'';
@@ -201,6 +207,9 @@ function updateThrottle(deg){
  for(const el of document.querySelectorAll('.tp-plate')){el.setAttribute('x1',x1.toFixed(2));el.setAttribute('y1',y1.toFixed(2));el.setAttribute('x2',x2.toFixed(2));el.setAttribute('y2',y2.toFixed(2));el.setAttribute('visibility',has?'visible':'hidden');}
  for(const el of document.querySelectorAll('.tp-deg'))if(el.textContent!==text)el.textContent=text;
  for(const el of document.querySelectorAll('.tp-open'))if(el.textContent!==open)el.textContent=open;
+ // 0-100 % throttle bar under the icon.
+ const w=has?Math.min(100,Math.max(0,deg/THROTTLE_MAX_DEG*100)).toFixed(1)+'%':'0%';
+ for(const el of document.querySelectorAll('.tp-fill'))if(el.style.width!==w)el.style.width=w;
 }
 const lambdaX=v=>10+(v-LAMBDA_MIN)/(LAMBDA_MAX-LAMBDA_MIN)*280;
 $('lambdaScale').innerHTML=`<svg class="lambda-scale" viewBox="0 0 300 58" role="img" aria-label="Lambda scale from 0.70 rich to 1.60 lean"><rect class="zone-rich" x="10" y="20" width="${lambdaX(0.97)-10}" height="12"/><rect class="zone-stoich" x="${lambdaX(0.97)}" y="20" width="${lambdaX(1.03)-lambdaX(0.97)}" height="12"/><rect class="zone-lean" x="${lambdaX(1.03)}" y="20" width="${290-lambdaX(1.03)}" height="12"/>`+
@@ -261,8 +270,11 @@ function renderExtras(d,live,locked){
  updateThrottle(throttleDeg(pct));updateMixture(s?s.O2:null);
  const val=(v,n)=>s&&!numeric(v)?'ERR':format(v,n),o2ok=s&&numeric(s.O2.afr);
  $('raceEct').textContent=val(s?.ECT.estimate_c,1);$('raceIat').textContent=val(s?.IAT.estimate_c,1);$('raceMap').textContent=val(s?.MAP.estimate_kpa,1);
- $('raceLambda').textContent=val(o2ok?s.O2.voltage_v:null,2);$('raceAfr').textContent=val(s?.O2.afr,1);$('raceTps').textContent=val(pct,1);
+ $('raceLambda').textContent=val(o2ok?s.O2.voltage_v:null,2);$('raceAfr').textContent=val(s?.O2.afr,1);$('raceTps').textContent=val(pct,0);
  $('raceFreq').textContent=live?format(d.frequency_hz,0):'—';
+ $('raceBat').textContent=d&&numeric(d.battery_v)?format(d.battery_v,1):'—';
+ // REF 1 / REF 2 across the top, as on the LCD: n/a on boards without them.
+ for(const i of[1,2]){const v=live?d['reference_'+i+'_v']:null;$('raceRef'+i).textContent=numeric(v)?format(v,2)+' V':d&&d.board==='uno'?'n/a':'-- V';}
  if(!live){$('raceSpeed').textContent=$('speedKmh').textContent=locked?'0':'—';setRpmGauge(0,locked);}
 }
 function setView(view){

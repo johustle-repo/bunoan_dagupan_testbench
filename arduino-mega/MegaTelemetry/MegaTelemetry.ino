@@ -4,6 +4,7 @@
 #include "SensorConversion.h"
 #include "SerialLink.h"
 #include "Buttons.h"
+#include "PotGenerator.h"
 
 #if !defined(__AVR_ATmega2560__)
 #error "Select Arduino Mega or Mega 2560 (ATmega2560)."
@@ -12,14 +13,17 @@
 // Arduino Mega 2560 (Pro) sender for the universal ESP32 receiver.
 //   A0-A4 IAT, ECT, O2, MAP, TPS     A5/A6 Reference 1/2, A7 battery (0-30 V dividers)
 //   D7 RPM frequency                 D8 speed frequency
-//   D9 ABS (the old brake input)     D10 Declog switch      D11 smart-key button
+//   D9 ABS (the old brake input)     D10, D11 unused
 //   D6 -> ESP32 GPIO17 (U6 frames)
-// The smart key toggles acquisition like the Uno set: with the key off the
-// sensors and both frequencies are locked and only the battery is sent.
+//   A8 PTV09 10k pot -> D44 0-2000 Hz, A9 second pot -> D2 0-100 Hz (PotGenerator.h)
+//   Declog = the D2 frequency (A9 pot), sent to the ESP32 in Hz; lamp on above 0 Hz.
+// Smart key follows the Mega's power: every frame reports KEY ON, and the
+// ESP32 shows KEY OFF when frames stop arriving (Mega off or unplugged).
 // The USB serial monitor (9600 baud) prints one line per update with the
 // 5-sensor diagnostic formulas in SensorConversion.h:
 //   IAT: 25.0 C | ECT: 40.0 C | O2: 0.45 V | AFR: 14.7:1 | MAP: 55 kPa | TPS Angle: 12 % | TPS: 0.5V |
-//   RPM: 3000 | SPEED: 40.0 km/h | ABS: OFF | DECLOG: OFF | REF1: 12.00 V | REF2: 5.00 V | BATV: 13.80 V
+//   RPM: 3000 | SPEED: 40.0 km/h | ABS: OFF | DECLOG: 50.00 Hz | REF1: 12.00 V | REF2: 5.00 V | BATV: 13.80 V |
+//   A8: 512 | GEN D44: 1000.0 Hz | A9: 512 | GEN D2: 50.00 Hz
 // On the Mega, D7 is port H bit 4 and D8 is port H bit 5.
 constexpr uint8_t RPM_BIT = _BV(PH4), SPEED_BIT = _BV(PH5);
 
@@ -27,11 +31,10 @@ volatile uint32_t rpmPulses = 0, speedPulses = 0;
 volatile uint8_t previousPortH = 0;
 uint32_t windowStartUs = 0;
 uint32_t serialPauseUs = 0;
-volatile bool acquisitionEnabled = false;
-bool smartKeyOn = false;
-DebouncedButton smartKeyButton(11);
-// ABS and Declog wiring (same as the old brake): off LOW, on HIGH (active-high).
-DebouncedButton absButton(9, false), declogSwitch(10, false);
+volatile bool acquisitionEnabled = true;
+constexpr bool smartKeyOn = true;  // Mega powered = key on.
+// ABS wiring (same as the old brake): off LOW, on HIGH (active-high).
+DebouncedButton absButton(9, false);
 float rpmFrequencyHz = 0, speedFrequencyHz = 0;
 uint32_t lastPublishMs = 0;
 
@@ -86,7 +89,7 @@ void publishEspSnapshot() {
     pauseStart = micros();
   }
   sendEspSnapshot(rawSnapshot, rpmFrequencyHz, speedFrequencyHz, smartKeyOn, absButton.pressed(),
-                  declogSwitch.pressed(), referenceVoltage, batteryVoltage);
+                  gen2.outHz, referenceVoltage, batteryVoltage);
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
     serialPauseUs += uint32_t(micros() - pauseStart);
     previousPortH = PINH;
@@ -117,10 +120,10 @@ void printReading(const __FlashStringHelper* name, const SensorReading& r, uint8
 
 void setup() {
   Serial.begin(9600);
-  smartKeyButton.begin();
   absButton.begin();
-  declogSwitch.begin();
   beginEspLink();
+  gen1.begin();
+  gen2.begin();
   analogReference(DEFAULT);
   for (uint8_t i = 0; i < 5; i++) {
     pinMode(sensorPins[i], INPUT);
@@ -145,27 +148,16 @@ void setup() {
     TIMSK1 |= _BV(OCIE1A);
     windowStartUs = micros();
   }
-  Serial.println(F("# SMART KEY OFF: sensor acquisition locked. Press D11 to enable."));
+  Serial.println(F("# SMART KEY ON: Mega powered, sending live data."));
 }
 
 void loop() {
   const uint32_t nowMs = millis();
+  gen1.update(nowMs);
+  gen2.update(nowMs);
   bool changed = false;
-  if (smartKeyButton.update(nowMs) && smartKeyButton.pressed()) {
-    smartKeyOn = !smartKeyOn;
-    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-      acquisitionEnabled = smartKeyOn;
-      rpmPulses = speedPulses = 0;
-      serialPauseUs = 0;
-      previousPortH = PINH;
-      windowStartUs = micros();
-    }
-    rpmFrequencyHz = speedFrequencyHz = 0;
-    changed = true;
-  }
   if (absButton.update(nowMs)) changed = true;
-  if (declogSwitch.update(nowMs)) changed = true;
-  if (smartKeyOn && uint32_t(micros() - windowStartUs) >= 1000000UL) {
+  if (uint32_t(micros() - windowStartUs) >= 1000000UL) {
     uint32_t rpmCount, speedCount, elapsedUs;
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
       const uint32_t nowUs = micros();
@@ -184,16 +176,7 @@ void loop() {
   if (!changed && uint32_t(nowMs - lastPublishMs) < PUBLISH_INTERVAL_MS) return;
   if (uint32_t(nowMs - lastPublishMs) < 200) return;
   lastPublishMs = nowMs;
-  // The battery is live with the key off, like a real bike.
   batteryVoltage = readDividerInput(BATTERY_PIN);
-  if (!smartKeyOn) {
-    for (uint8_t i = 0; i < 5; i++) rawSnapshot[i] = 0;
-    referenceVoltage[0] = referenceVoltage[1] = 0;
-    Serial.print(F("# SMART KEY OFF | BATV: ")); Serial.print(batteryVoltage, 2);
-    Serial.println(F(" V | press D11 to enable"));
-    publishEspSnapshot();
-    return;
-  }
   const float iatV = readSensor(0), ectV = readSensor(1), o2V = readSensor(2);
   const float mapV = readSensor(3), tpsV = readSensor(4);
   for (uint8_t i = 0; i < 2; i++) referenceVoltage[i] = readDividerInput(referencePins[i]);
@@ -214,9 +197,13 @@ void loop() {
   Serial.print(F(" | RPM: ")); Serial.print(min(rpmFrequencyHz * RPM_PER_HZ, RPM_MAX), 0);
   Serial.print(F(" | SPEED: ")); Serial.print(min(speedFrequencyHz / HZ_PER_KMH, SPEED_MAX_KMH), 1);
   Serial.print(F(" km/h | ABS: ")); Serial.print(absButton.pressed() ? F("ON") : F("OFF"));
-  Serial.print(F(" | DECLOG: ")); Serial.print(declogSwitch.pressed() ? F("ON") : F("OFF"));
+  Serial.print(F(" | DECLOG: ")); Serial.print(gen2.outHz, 2); Serial.print(F(" Hz"));
   Serial.print(F(" | REF1: ")); Serial.print(referenceVoltage[0], 2);
   Serial.print(F(" V | REF2: ")); Serial.print(referenceVoltage[1], 2);
-  Serial.print(F(" V | BATV: ")); Serial.print(batteryVoltage, 2); Serial.println(F(" V"));
+  Serial.print(F(" V | BATV: ")); Serial.print(batteryVoltage, 2);
+  Serial.print(F(" V | A8: ")); Serial.print(analogRead(A8));  // Plain analogRead, 0-1023.
+  Serial.print(F(" | GEN D44: ")); Serial.print(gen1.outHz, 1);
+  Serial.print(F(" Hz | A9: ")); Serial.print(analogRead(A9));
+  Serial.print(F(" | GEN D2: ")); Serial.print(gen2.outHz, 2); Serial.println(F(" Hz"));
   publishEspSnapshot();
 }

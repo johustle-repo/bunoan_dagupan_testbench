@@ -17,20 +17,21 @@ inline void beginEspLink() {
   arduino.stopListening(); // One-way telemetry; no incoming commands.
 }
 
-inline void sendEspSnapshot(const float* raw, float rpmHz, float speedHz, bool keyOn, bool absOn, bool declogOn,
+inline void sendEspSnapshot(const float* raw, float rpmHz, float speedHz, bool keyOn, bool absOn, float declogHz,
                             const float* referenceV, float batteryV) {
   if (!ESP_LINK_ENABLED) return;
   // U6 = Mega 2560 Pro: key, ABS, 5 x ADC in 1/16 counts, D7 RPM Hz and D8
   // speed Hz in 1/100 Hz, Reference 1/2 and the battery in mV (0-30 V
-  // inputs), then Declog. Integers avoid AVR printf float support. XOR
+  // inputs), Declog on/off (above 0 Hz) and the Declog Hz x100 (the A9 pot's
+  // 0-100 Hz on D2). Integers avoid AVR printf float support. XOR
   // checksum covers the payload before '*'.
   const int count = snprintf(linkBuffer, sizeof(linkBuffer),
-    "U6,%u,%u,%u,%u,%u,%u,%u,%lu,%lu,%u,%u,%u,%u", unsigned(keyOn), unsigned(absOn), unsigned(raw[0] * 16 + 0.5f),
+    "U6,%u,%u,%u,%u,%u,%u,%u,%lu,%lu,%u,%u,%u,%u,%u", unsigned(keyOn), unsigned(absOn), unsigned(raw[0] * 16 + 0.5f),
     unsigned(raw[1] * 16 + 0.5f), unsigned(raw[2] * 16 + 0.5f),
     unsigned(raw[3] * 16 + 0.5f), unsigned(raw[4] * 16 + 0.5f),
     (unsigned long)(rpmHz * 100 + 0.5f), (unsigned long)(speedHz * 100 + 0.5f),
     unsigned(referenceV[0] * 1000 + 0.5f), unsigned(referenceV[1] * 1000 + 0.5f),
-    unsigned(batteryV * 1000 + 0.5f), unsigned(declogOn));
+    unsigned(batteryV * 1000 + 0.5f), unsigned(declogHz > 0), unsigned(declogHz * 100 + 0.5f));
   if (count < 0 || count > int(sizeof(linkBuffer) - 5)) return;
   uint8_t checksum = 0;
   for (int i = 0; i < count; i++) checksum ^= uint8_t(linkBuffer[i]);

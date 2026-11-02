@@ -13,7 +13,9 @@
 // these pins overlap the Uno/Nano/Mega link on GPIO16/17.
 constexpr int8_t PIN_TFT_SCK = 18, PIN_TFT_MISO = 19, PIN_TFT_MOSI = 23;
 constexpr int8_t PIN_TFT_CS = 27, PIN_TFT_DC = 25, PIN_TFT_RST = 26;
-constexpr int8_t PIN_TOUCH_CS = 33, PIN_TOUCH_IRQ = 32;
+// T_IRQ (GPIO32) is not used: a press is detected from the XPT2046 pressure
+// reading, so a missing or loose IRQ wire can't block touch.
+constexpr int8_t PIN_TOUCH_CS = 33;
 // 27 MHz is what ESP32_Touch_Games was tested with; most ST7796S modules also
 // run at 40 MHz, which makes the gauges about a third quicker to push.
 constexpr uint32_t TFT_SPI_HZ = 27000000;
@@ -32,7 +34,9 @@ constexpr float SPEED_MAX = 250, RPM_MAX = 15000;
 struct DisplayData {
   enum Link : uint8_t { WAITING, LIVE, STALE } link;
   bool keyOn, brake, checkEngine, coolantWarning;  // brake: the D9 ABS input on U6.
-  bool declog;             // Mega 2560 Pro (U6) D10 Declog switch.
+  bool declog;             // Mega 2560 Pro (U6) Declog lamp.
+  bool declogHzAvailable;  // Newer U6 frames: Declog frequency from the Mega's A9 pot.
+  float declogHz;          // 0-100 Hz.
   uint8_t milBlink;        // Blink code of the first DTC, 0 = none.
   float speedKmh, rpm, frequencyHz;
   const char* dtcCode;     // First active DTC, or nullptr.
@@ -104,7 +108,7 @@ class Panel : public lgfx::LGFX_Device {
       cfg.x_max = 319;
       cfg.y_min = 0;
       cfg.y_max = 479;
-      cfg.pin_int = PIN_TOUCH_IRQ;
+      cfg.pin_int = -1;
       cfg.bus_shared = true;
       cfg.offset_rotation = 0;
       cfg.spi_host = SPI3_HOST;
@@ -161,8 +165,8 @@ constexpr uint8_t SLOT_COUNT = 64;
 char shown[SLOT_COUNT][40];
 uint16_t shownColor[SLOT_COUNT];
 enum Slot : uint8_t {
-  S_STATUS, S_DTC, S_BOARD, S_TP_ICON, S_TP_ANGLE, S_REF1, S_REF2,
-  S_LAMP0 = 8, S_VALUE0 = 16
+  S_STATUS, S_DTC, S_BOARD, S_TP_ICON, S_TP_ANGLE, S_REF1, S_REF2, S_GRID_LABEL,
+  S_LAMP0 = 8, S_INFO_LABEL = 15, S_VALUE0 = 16
 };
 
 bool changed(uint8_t slot, const char* text, uint16_t color) {
@@ -467,8 +471,13 @@ void classicText(const DisplayData& d, bool running, float speed, float rpm) {
     switch (i) {
       case 0: if (show) snprintf(value, sizeof(value), "%.0f", speed); else { strcpy(value, "--"); color = MUTED; } break;
       case 1: if (show) snprintf(value, sizeof(value), "%.0f", rpm); else { strcpy(value, "--"); color = MUTED; } break;
-      case 2:  // Mega A8, live with the key off like the battery.
-        if (d.currentAvailable) snprintf(value, sizeof(value), "%.2f A", d.currentA);
+      case 2:  // DECLOG Hz on the Mega 2560 Pro, otherwise the Mega A8 current (live with the key off).
+        field(S_GRID_LABEL, GRID_COL_X[2] + 5, GRID_Y + 4, textdatum_t::top_left, &fonts::Font0, MUTED, PANEL,
+              d.declogHzAvailable ? "DECLOG" : "CURRENT", 60);
+        if (d.declogHzAvailable) {
+          if (running) snprintf(value, sizeof(value), "%.1f Hz", d.declogHz); else { strcpy(value, "-- Hz"); color = MUTED; }
+          if (running && d.declogHz > 0) color = AMBER;
+        } else if (d.currentAvailable) snprintf(value, sizeof(value), "%.2f A", d.currentA);
         else { strcpy(value, havePacket ? "n/a" : "-- A"); color = MUTED; }
         break;
       case 3: case 4:
@@ -531,10 +540,11 @@ void pathAt(float s, float& x, float& y, float& dx, float& dy) {
   y = pathY[i - 1] + t * (pathY[i] - pathY[i - 1]);
 }
 
-// Gradient along x: blue at the foot (low RPM) fading to red at the redline.
+// Gradient along x: green at the foot (low RPM), yellow at mid-range, red at
+// the redline (same stops as the browser's race bar).
 uint16_t raceGradient(float vbX) {
   const float t = constrain((vbX - 24) / (588 - 24), 0.0f, 1.0f);
-  return lerpColor(0x2f6bff, 0xff3b3b, t);
+  return t < 0.55f ? lerpColor(0x3ddc84, 0xffd23f, t / 0.55f) : lerpColor(0xffd23f, 0xff3b3b, (t - 0.55f) / 0.45f);
 }
 
 // Readout centres: speed | RPM.
@@ -766,7 +776,11 @@ void sensorsText(const DisplayData& d, bool running) {
         color = d.batteryV < 11.8f || d.batteryV > 15.0f ? ORANGE : d.batteryV >= 13.2f ? GREEN : TEXT;
         break;
       case 9:
-        if (d.currentAvailable) snprintf(text, sizeof(text), "%.2f A", d.currentA);
+        field(S_INFO_LABEL, (9 % 4) * INFO_COL + 6, INFO_Y0 + (9 / 4) * INFO_ROW + 3, textdatum_t::top_left, &fonts::Font0, MUTED, PANEL,
+              d.declogHzAvailable ? "DECLOG  A9 POT" : "CURRENT  A8", INFO_COL - 10);
+        if (d.declogHzAvailable) {
+          if (running) snprintf(text, sizeof(text), "%.2f Hz", d.declogHz); else { strcpy(text, "--"); color = MUTED; }
+        } else if (d.currentAvailable) snprintf(text, sizeof(text), "%.2f A", d.currentA);
         else { strcpy(text, havePacket ? "n/a" : "--"); color = MUTED; }
         break;
       case 10: snprintf(text, sizeof(text), "%.0f - %.0f", d.tpsClosedRaw, d.tpsWotRaw); break;
@@ -833,74 +847,48 @@ void loadTouchCalibration() {
 // start-up steps underneath.
 constexpr uint32_t INTRO_MS = 2600;
 
+// Start-up: a plain dark screen, the ring sweeping round, "ECU" and the
+// title fading in and a thin loading bar.
 void playIntro() {
-  constexpr int RX = W / 2, RY = 112, R = 70;
-  constexpr int BAR_X = 120, BAR_Y = 266, BAR_W = 240, BAR_H = 8;
-  const char* const STEPS[4] = {"Starting display", "Loading sensor formulas", "Opening Wi-Fi hotspot", "Ready"};
+  constexpr int RX = W / 2, RY = 118, R = 62;
+  constexpr int BAR_X = 170, BAR_Y = 252, BAR_W = 140, BAR_H = 4;
   lcd.startWrite();
   lcd.fillScreen(BG);
-  // Faint background grid and corner brackets.
-  for (int x = 0; x < W; x += 24) lcd.drawFastVLine(x, 0, H, rgb(0x10, 0x18, 0x24));
-  for (int y = 0; y < H; y += 24) lcd.drawFastHLine(0, y, W, rgb(0x10, 0x18, 0x24));
-  for (int k = 0; k < 4; ++k) {
-    const int cx = k & 1 ? W - 12 : 12, cy = k & 2 ? H - 12 : 12, dx = k & 1 ? -24 : 24, dy = k & 2 ? -24 : 24;
-    lcd.drawFastHLine(min(cx, cx + dx), cy, 24, EDGE);
-    lcd.drawFastVLine(cx, min(cy, cy + dy), 24, EDGE);
-  }
-  // Ring track, ticks and centre.
-  lcd.fillArc(RX, RY, R + 4, R + 3, 135, 405, EDGE);
-  lcd.fillArc(RX, RY, R, R - 10, 135, 405, ARC);
-  for (int i = 0; i <= 15; ++i) {
-    const float a = (135 + i * 18) * DEG_TO_RAD;
-    const int r1 = i % 3 ? R - 16 : R - 22;
-    lcd.drawLine(RX + cosf(a) * (R - 13), RY + sinf(a) * (R - 13), RX + cosf(a) * r1, RY + sinf(a) * r1, i >= 12 ? RED : TICK);
-  }
-  lcd.fillCircle(RX, RY, R - 28, PANEL);
-  lcd.drawCircle(RX, RY, R - 28, EDGE);
-  lcd.drawRoundRect(BAR_X - 2, BAR_Y - 2, BAR_W + 4, BAR_H + 4, 5, EDGE);
+  lcd.fillArc(RX, RY, R, R - 6, 0, 360, ARC);        // Ring track.
+  lcd.fillRoundRect(BAR_X, BAR_Y, BAR_W, BAR_H, 2, ARC);
   lcd.endWrite();
 
-  float shownDeg = 135;
-  int shownStep = -1;
+  float shownDeg = 270;
+  int shownFill = 0;
+  uint8_t shownFade = 0;
   const uint32_t start = millis();
   for (uint32_t t = 0; t <= INTRO_MS; t = millis() - start) {
     const float p = float(t) / INTRO_MS;
     lcd.startWrite();
-    // Ring sweeps over the first 70 %, coloured by where it is on the scale.
-    const float deg = 135 + 270 * min(1.0f, p / 0.7f);
-    for (; shownDeg < deg; shownDeg += 3) {
-      const float at = (shownDeg - 135) / 270;
-      const uint16_t color = at >= 0.8f ? RED : at >= 0.6f ? AMBER : ACCENT;
-      lcd.fillArc(RX, RY, R, R - 10, shownDeg, min(shownDeg + 3, deg), color);
+    // Ring sweeps once round from the top over the first 60 %.
+    const float deg = 270 + 360 * min(1.0f, p / 0.6f);
+    for (; shownDeg < deg; shownDeg += 4) lcd.fillArc(RX, RY, R, R - 6, shownDeg, min(shownDeg + 4, deg), ACCENT);
+    // Badge and title fade in (redrawn only when the level steps).
+    const uint8_t fade = uint8_t(constrain((p - 0.2f) / 0.45f, 0.0f, 1.0f) * 16);
+    if (fade != shownFade) {
+      shownFade = fade;
+      const float f = fade / 16.0f;
+      lcd.fillRect(RX - 40, RY - 14, 80, 28, BG);
+      label(lcd, "ECU", RX, RY, lerpColor(0x0d141e, 0x66d4f1, f), textdatum_t::middle_center, &fonts::FreeSansBold12pt7b);
+      lcd.fillRect(60, 196, W - 120, 36, BG);
+      label(lcd, "ECU TESTBENCH", W / 2, 214, lerpColor(0x0d141e, 0xf2f7fc, f), textdatum_t::middle_center,
+            &fonts::FreeSansBold18pt7b);
     }
-    // Centre badge and title fade in.
-    const float fade = constrain((p - 0.15f) / 0.4f, 0.0f, 1.0f);
-    label(lcd, "ECU", RX, RY, lerpColor(0x131d29, 0x66d4f1, fade), textdatum_t::middle_center, &fonts::FreeSansBold12pt7b);
-    label(lcd, "ECU TESTBENCH", W / 2, 210, lerpColor(0x0d141e, 0xf2f7fc, fade), textdatum_t::middle_center,
-          &fonts::FreeSansBold18pt7b);
-    label(lcd, "Arduino Uno / Nano / Mega  +  ESP32", W / 2, 238, lerpColor(0x0d141e, 0xacbdd1, fade),
-          textdatum_t::middle_center, &fonts::Font2);
-    // Loading bar and the current start-up step.
+    // Loading bar.
     const int fill = lroundf(min(1.0f, p) * BAR_W);
-    if (fill > 0) lcd.fillRoundRect(BAR_X, BAR_Y, fill, BAR_H, 3, ACCENT);
-    const int step = min(3, int(p * 4));
-    if (step != shownStep) {
-      shownStep = step;
-      lcd.setFont(&fonts::Font2);
-      lcd.setTextColor(step == 3 ? GREEN : MUTED, BG);
-      lcd.setTextDatum(textdatum_t::middle_center);
-      lcd.setTextPadding(BAR_W);
-      lcd.drawString(STEPS[step], W / 2, BAR_Y + 24);
-      lcd.setTextPadding(0);
-    }
+    if (fill > shownFill) { shownFill = fill; lcd.fillRoundRect(BAR_X, BAR_Y, fill, BAR_H, 2, ACCENT); }
     lcd.endWrite();
     delay(16);
   }
-  delay(350);
+  delay(250);
 }
 
 void begin() {
-  pinMode(PIN_TOUCH_IRQ, INPUT_PULLUP);
   lcd.init();
   lcd.setRotation(1);  // Landscape 480 x 320.
   lcd.setBrightness(255);
@@ -945,6 +933,7 @@ void handleTouch(uint32_t now) {
   int32_t x, y;
   const bool pressed = lcd.getTouch(&x, &y);
   if (pressed && !wasTouched) {
+    Serial.printf("# TOUCH x=%ld y=%ld\n", long(x), long(y));
     if (lastTapMs && now - lastTapMs <= DOUBLE_TAP_MS) {
       lastTapMs = 0;
       view = View((view + 1) % VIEW_COUNT);

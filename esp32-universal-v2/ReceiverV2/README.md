@@ -2,10 +2,10 @@
 
 The universal receiver (Arduino Uno, Nano or Mega, detected from each packet) running on the 4.0" ST7796S + XPT2046 panel instead of the 2.8" ILI9341. Telemetry, the Wi-Fi dashboard, the API, DTC logic and TPS learning are the same as `esp32-universal/Receiver`. The INA219 is no longer used: the battery voltage comes from the Mega (A7, 0–30 V divider).
 
-Sender sketches: `Arduino-Uno-Testbench-Firmware/DashboardTelemetry` (Uno, U3 frames), `arduino-nano/NanoTelemetry` (Nano, U4) or `arduino-mega/MegaTelemetry` (Mega 2560 Pro, U6: key, ABS, sensors, D7 RPM Hz, D8 speed Hz, Reference 1/2 and battery as 0–30 V divider inputs, Declog). Older Mega firmware sending U5 (U4 plus battery and current) is still accepted. /api/live reports `"board": "uno" | "nano" | "mega"` and the source `<board>_via_esp32`.
+Sender sketches: `Arduino-Uno-Testbench-Firmware/DashboardTelemetry` (Uno, U3 frames), `arduino-nano/NanoTelemetry` (Nano, U4) or `arduino-mega/MegaTelemetry` (Mega 2560 Pro, U6: key, ABS, sensors, D7 RPM Hz, D8 speed Hz, Reference 1/2 and battery as 0–30 V divider inputs, Declog on/off and, from newer Mega firmware, the Declog frequency set by the Mega's A9 pot, 0–100 Hz). Older Mega firmware sending U5 (U4 plus battery and current) is still accepted. /api/live reports `"board": "uno" | "nano" | "mega"` and the source `<board>_via_esp32`.
 
 - **RPM** = D7 Hz × 15000 ÷ 1549 (1549 Hz = 15,000 rpm, max 15,000). **Speed** = Hz ÷ 6 km/h (max 250) from D8 on U6 and from D7 on the other boards; it ramps to 0 at 100 km/h per second with the brake / ABS (D9) or an injected fault.
-- **Lamps:** KEY, DECLOG (Mega 2560 Pro D10), WINKER, CHECK, TEMP, ABS (orange while D9 brake / ABS is on), TCS. `/api/live` adds `frame`, `declog` (null without U6) and `speed_frequency_hz`.
+- **Lamps:** KEY, DECLOG (Mega 2560 Pro: on above 0 Hz), WINKER, CHECK, TEMP, ABS (orange while D9 brake / ABS is on), TCS. `/api/live` adds `frame`, `declog` (null without U6), `declog_hz` (null unless the Mega sends it) and `speed_frequency_hz`. On the Mega 2560 Pro the CLASSIC grid's CURRENT cell becomes DECLOG (Hz), the SENSORS screen shows DECLOG A9 POT, and the dashboard shows the Declog Hz under the lamp.
 - Wi-Fi: ECU-Testbench, password ECUdemo2026, http://192.168.4.1/
 - /api/live, /api/health, /api/simulate-fault and /api/tps-learn work the same as in v1.
 
@@ -46,10 +46,10 @@ Same wiring as ESP32_Touch_Games:
 | SCK + T_CLK | GPIO18 |
 | SDO (MISO) + T_DO | GPIO19 |
 | T_CS | GPIO33 |
-| T_IRQ | GPIO32 (**required**: used for touch detection) |
+| T_IRQ | not used (touch is detected from the pressure reading; GPIO32 may stay wired) |
 | SD_* | not connected |
 
-**No touch calibration:** the screen is switched with a double tap, which only needs to detect a press, so there is no calibration screen. At power-up the ESP32 plays an ECU TESTBENCH boot animation (about 3 s: a tachometer ring sweeps up, the title fades in and a loading bar fills) and then shows the CLASSIC screen. A calibration saved earlier in NVS `lgfxtouch/cal` is still applied if present.
+**No touch calibration:** the screen is switched with a double tap, which only needs to detect a press, so there is no calibration screen. At power-up the ESP32 plays an ECU TESTBENCH boot animation (about 3 s: a tachometer ring sweeps up, the title fades in and a loading bar fills) and then shows the CLASSIC screen. A calibration saved earlier in NVS `lgfxtouch/cal` is still applied if present. Each new press prints `# TOUCH x=.. y=..` on the USB serial monitor (115200 baud), to check the touch chip without the screen.
 
 The SPI clock is 27 MHz, the value the games sketch was tested with. Most ST7796S modules also run at 40 MHz (`TFT_SPI_HZ` in LocalDisplay.h), which makes the gauges about a third faster.
 

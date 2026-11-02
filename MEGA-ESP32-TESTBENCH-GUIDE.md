@@ -12,7 +12,7 @@ Each folder's README has the full pin tables. This guide covers how the parts wo
 
 ## Power-up
 
-The Mega starts with the smart key OFF: press the D11 button for KEY ON (readings start) and again for KEY OFF. With the key off the screen shows KEY OFF and only the battery is live. The separate ABS tester still runs on its own Nano (`arduino-nano/NanoAbsTester`). At power-up the ESP32 receiver plays an **ECU TESTBENCH** boot animation (about 3 s: a tachometer ring sweeps up, the title fades in and a loading bar fills), then shows the CLASSIC screen. The needle and bars sweep once when the first live data arrives.
+The smart key follows the Mega's power: while the Mega is on and sending data the ESP32 shows KEY ON; when the Mega is off or unplugged, the ESP32 shows KEY OFF about 3 s after the last frame. The separate ABS tester still runs on its own Nano (`arduino-nano/NanoAbsTester`). At power-up the ESP32 receiver plays an **ECU TESTBENCH** boot animation (about 3 s: a ring sweeps round, the title fades in and a thin loading bar fills), then shows the CLASSIC screen. The needle and bars sweep once when the first live data arrives.
 
 ## Wiring
 
@@ -22,8 +22,9 @@ The Mega starts with the smart key OFF: press the D11 button for KEY ON (reading
 | Speed | D8 (square wave, 0–5 V) |
 | AIT / ECT / O2 / MAP / TPS | A0 / A1 / A2 / A3 / A4 (0–5 V) |
 | ABS | D9, off LOW / on HIGH (ramps the speed to 0, like the old brake) |
-| Declog | D10, off LOW / on HIGH |
-| Smart key | D11, push button to GND (toggles) |
+| Declog | A9 pot (PTV09 10 kΩ) → D2, 0–100 Hz; shown as DECLOG Hz, lamp on above 0 Hz. D10 unused |
+| Frequency generator | A8 pot (PTV09 10 kΩ) → D44, 0–2000 Hz square wave (jumper into D7 / D8 to test) |
+| Smart key | Mega power (on and sending = KEY ON); D11 unused |
 | REF 1 / REF 2 / Battery | A5 / A6 / A7, 0–30 V through a 12.5 kΩ / 2.5 kΩ divider (÷ 6) |
 
 | Mega 2560 Pro | ESP32 |
@@ -103,7 +104,7 @@ python tools/embed_dashboard.py esp32-universal-v2/dashboard/dist esp32-universa
 | Mega upload: "unable to open port" / "Access denied" | The Arduino IDE Serial Monitor has the port open. Close it and upload again. |
 | ESP32 upload: "Wrong boot mode detected" | Hold BOOT, tap EN, release BOOT, then upload. Or hold BOOT while the output shows `Connecting...`. |
 | ESP32 port disappears during upload | Replace the USB cable with a short data cable plugged straight into the PC. |
-| Screen shows KEY OFF | Press the D11 smart-key button. |
+| Screen shows KEY OFF | The ESP32 gets no frames: check the Mega has power and the D6 → GPIO17 wire and common GND. |
 | Screen shows WAITING or NO LINK | Check Mega D6 → divider → ESP32 GPIO17 and the common GND. |
 | A sensor shows ERR | Its voltage is outside the range in the formula table; check the knob and its wiring. |
 | REF / battery read high on USB power | The divider scaling assumes the Mega's 5 V is exactly 5.0 V; USB is often 4.6–4.9 V. |
