@@ -5,21 +5,23 @@
 #include <SoftwareSerial.h>
 
 #if !defined(__AVR_ATmega328P__)
-#error "Select Arduino Nano (ATmega328P)."
+#error "Select Arduino Uno or Arduino Nano (ATmega328P)."
 #endif
 
-// Arduino Nano ABS tester. Measures the two wheel-speed sensors, drives the
-// TCS / ABS LEDs and sends the readings to the ESP32
-// (esp32-abs-tester-28/AbsTester28) as "A1" frames.
-//   D7 speed 1 (rear) and RPM, D8 speed 2 (front), 0-5 V square waves
+// ABS tester for an Arduino Uno or Nano (same pins). Measures the two
+// wheel-speed sensors and the Declog frequency, drives the TCS / ABS LEDs and
+// sends the readings to the ESP32 (esp32-abs-tester-28/AbsTester28) as "A1" frames.
+//   D7 speed 1 (rear) and RPM, D8 speed 2 (front, e.g. Mega D44), 0-5 V square waves
 //   speed = Hz / 6 km/h, max 250; RPM = D7 Hz x 15000 / 1560, max 15000
+//   D2 Declog frequency, 0-100 Hz square wave, 0-5 V (e.g. Mega D2)
 //   D13 TCS LED: steady when both speeds match (whole km/h), blinking otherwise
 //   D12 ABS LED: on when D7 is at least 10 % and 5 km/h slower than D8
-//   A0 Reference 1, A1 battery, A2 Reference 2, A3 current (direct, 0-5 V)
+//   A0 Reference 1, A1 battery: 0-5 V at the pin mapped to 0-30 V
+//   (volts = pin volts / 5 x 30, the ECU testbench x6 formula), filtered. A2 / A3 unused.
 //   D5 (TX) -> ESP32 RX2 (GPIO16), common GND, 115200 8N1, one-way
 //   (SoftwareSerial; the USB Serial Monitor stays on the normal Serial port).
-// SoftwareSerial owns the pin-change interrupts, so Timer1 samples D7 and D8
-// at 20 kHz instead (up to about 10 kHz per input).
+// SoftwareSerial owns the pin-change interrupts, so Timer1 samples D2, D7 and
+// D8 at 20 kHz instead (up to about 10 kHz per input).
 
 const byte TCS_LED = LED_BUILTIN;  // D13
 const byte ABS_LED = 12;
@@ -29,12 +31,15 @@ const unsigned long PUBLISH_MS = 250;
 
 #define D7_HIGH() ((PIND & _BV(PD7)) != 0)
 #define D8_HIGH() ((PINB & _BV(PB0)) != 0)
+#define D2_HIGH() ((PIND & _BV(PD2)) != 0)
 
 volatile unsigned long pulseCount1 = 0;
 volatile unsigned long pulseCount2 = 0;
+volatile unsigned long pulseCount3 = 0;  // D2 Declog.
 
 volatile bool previousHigh1 = false;
 volatile bool previousHigh2 = false;
+volatile bool previousHigh3 = false;
 volatile bool acquisitionEnabled = true;
 
 unsigned long windowStartUs = 0;
@@ -46,55 +51,77 @@ bool speedsEqual = true;
 bool tcsLedState = true;
 bool absActive = false;
 
-float frequencyHz1 = 0, frequencyHz2 = 0;
+float frequencyHz1 = 0, frequencyHz2 = 0, declogHz = 0;
 float ref1V = 0, batteryV = 0;
+float pinV[2] = {0, 0};  // Filtered A0 / A1 pin volts, 0-5 V.
 float speed1 = 0, speed2 = 0;
 float rpm = 0;
 
-// Analog inputs, all direct 0-5 V: analogRead 0-1023 mapped to the full scale.
-// Frame order: REF1, REF2, current, battery.
-const uint8_t inputPins[4] = {A0, A2, A3, A1};    // REF1 A0, REF2 A2, current A3, battery A1.
-const float INPUT_FULL_SCALE[4] = {5.0, 5.0, 10.0, 5.0};  // Current: 0-5 V = 0-10 A.
+// REF1 / battery: the pin reads 0-5 V, mapped to 0-30 V:
+//   volts = pin volts / PIN_FULL_SCALE_V x INPUT_FULL_SCALE_V  (= pin volts x 6,
+//   the same result as the ECU testbench divider formula).
+constexpr float PIN_FULL_SCALE_V = 5.0f, INPUT_FULL_SCALE_V = 30.0f;
+// Noise filter: 20 samples with the highest and lowest dropped, then a
+// running average (each new reading moves the value 20 %, about 1 s to settle).
+constexpr uint8_t SAMPLES = 20;
+constexpr float FILTER = 0.2f;
+bool filterStarted[2] = {false, false};
+const uint8_t inputPins[2] = {A0, A1};          // REF1 A0, battery A1.
 
 SoftwareSerial esp(6, 5);  // RX D6 (unused), TX D5 -> ESP32 GPIO16.
-char linkBuffer[80];
+char linkBuffer[96];
 
-// D7: Speed 1 and RPM, D8: Speed 2. Rising edges, sampled at 20 kHz.
+// D7: Speed 1 and RPM, D8: Speed 2, D2: Declog. Rising edges, sampled at 20 kHz.
 ISR(TIMER1_COMPA_vect) {
-  const bool high1 = D7_HIGH(), high2 = D8_HIGH();
+  const bool high1 = D7_HIGH(), high2 = D8_HIGH(), high3 = D2_HIGH();
   if (acquisitionEnabled && high1 && !previousHigh1) pulseCount1++;
   if (acquisitionEnabled && high2 && !previousHigh2) pulseCount2++;
+  if (acquisitionEnabled && high3 && !previousHigh3) pulseCount3++;
   previousHigh1 = high1;
   previousHigh2 = high2;
+  previousHigh3 = high3;
 }
 
+// Reads A0 / A1 (analogRead 0-1023 = 0-5 V), filters it and returns 0-30 V.
 float readInput(uint8_t i) {
   analogRead(inputPins[i]);  // First reading after switching pins is discarded.
   delayMicroseconds(200);
   uint32_t sum = 0;
-  for (uint8_t n = 0; n < 16; n++) sum += analogRead(inputPins[i]);
-  return sum / 16.0 * INPUT_FULL_SCALE[i] / 1023.0;
+  uint16_t lowest = 1023, highest = 0;
+  for (uint8_t n = 0; n < SAMPLES; n++) {
+    const uint16_t raw = analogRead(inputPins[i]);
+    sum += raw;
+    if (raw < lowest) lowest = raw;
+    if (raw > highest) highest = raw;
+    delayMicroseconds(500);
+  }
+  const float volts = float(sum - lowest - highest) / (SAMPLES - 2) * PIN_FULL_SCALE_V / 1023.0f;
+  if (!filterStarted[i]) { pinV[i] = volts; filterStarted[i] = true; }
+  else pinV[i] += FILTER * (volts - pinV[i]);
+  return pinV[i] / PIN_FULL_SCALE_V * INPUT_FULL_SCALE_V;
 }
 
 // A1 frame: key (always 1), brake (none, 0), D7 Hz x100, speed 1 x100,
-// REF1 / REF2 mV, current mA, battery mV, D8 Hz x100, speed 2 x100, RPM,
-// TCS (1 steady, 0 blinking), ABS (1 active), then an XOR checksum of
-// everything before '*'. The ESP32 shows these values as they are.
+// REF1 mV, REF2 (unused, 0), current (unused, 0), battery mV, D8 Hz x100,
+// speed 2 x100, RPM, TCS (1 steady, 0 blinking), ABS (1 active), D2 Declog
+// Hz x100, then an XOR checksum of everything before '*'. The ESP32 shows
+// these values as they are.
 void sendFrame() {
-  unsigned int mv[4];
-  for (uint8_t i = 0; i < 4; i++) mv[i] = unsigned(readInput(i) * 1000 + 0.5);
+  unsigned int mv[2];
+  for (uint8_t i = 0; i < 2; i++) mv[i] = unsigned(readInput(i) * 1000 + 0.5);
   ref1V = mv[0] / 1000.0;
-  batteryV = mv[3] / 1000.0;
-  const int count = snprintf(linkBuffer, sizeof(linkBuffer), "A1,1,0,%lu,%u,%u,%u,%u,%u,%lu,%u,%u,%u,%u",
-    (unsigned long)(frequencyHz1 * 100 + 0.5), unsigned(speed1 * 100 + 0.5), mv[0], mv[1], mv[2], mv[3],
+  batteryV = mv[1] / 1000.0;
+  const int count = snprintf(linkBuffer, sizeof(linkBuffer), "A1,1,0,%lu,%u,%u,0,0,%u,%lu,%u,%u,%u,%u,%lu",
+    (unsigned long)(frequencyHz1 * 100 + 0.5), unsigned(speed1 * 100 + 0.5), mv[0], mv[1],
     (unsigned long)(frequencyHz2 * 100 + 0.5), unsigned(speed2 * 100 + 0.5),
-    unsigned(rpm + 0.5), unsigned(speedsEqual), unsigned(absActive));
+    unsigned(rpm + 0.5), unsigned(speedsEqual), unsigned(absActive),
+    (unsigned long)(declogHz * 100 + 0.5));
   if (count < 0 || count > int(sizeof(linkBuffer) - 5)) return;
   uint8_t checksum = 0;
   for (int i = 0; i < count; i++) checksum ^= uint8_t(linkBuffer[i]);
   snprintf(linkBuffer + count, sizeof(linkBuffer) - count, "*%02X\n", checksum);
   // SoftwareSerial TX blocks interrupts (about 6 ms per frame), so Timer1
-  // can't sample D7 / D8 meanwhile; that time is left out of the window.
+  // can't sample D2 / D7 / D8 meanwhile; that time is left out of the window.
   unsigned long pauseStart;
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
     acquisitionEnabled = false;
@@ -105,6 +132,7 @@ void sendFrame() {
     serialPauseUs += micros() - pauseStart;
     previousHigh1 = D7_HIGH();
     previousHigh2 = D8_HIGH();
+    previousHigh3 = D2_HIGH();
     acquisitionEnabled = true;
   }
 }
@@ -116,6 +144,7 @@ void setup() {
 
   pinMode(7, INPUT);
   pinMode(8, INPUT);
+  pinMode(2, INPUT);
   for (uint8_t pin : inputPins) pinMode(pin, INPUT);
 
   pinMode(TCS_LED, OUTPUT);
@@ -127,6 +156,7 @@ void setup() {
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
     previousHigh1 = D7_HIGH();
     previousHigh2 = D8_HIGH();
+    previousHigh3 = D2_HIGH();
     TCCR1A = 0;
     TCCR1B = _BV(WGM12) | _BV(CS11);
     OCR1A = 99;  // 16 MHz / 8 / 100 = 20 kHz.
@@ -143,7 +173,7 @@ void loop() {
   unsigned long now = millis();
 
   if (micros() - windowStartUs >= 1000000UL) {
-    unsigned long pulses1, pulses2, elapsedUs;
+    unsigned long pulses1, pulses2, pulses3, elapsedUs;
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
       const unsigned long nowUs = micros();
       elapsedUs = nowUs - windowStartUs - serialPauseUs;
@@ -151,12 +181,15 @@ void loop() {
       windowStartUs = nowUs;
       pulses1 = pulseCount1;
       pulses2 = pulseCount2;
+      pulses3 = pulseCount3;
       pulseCount1 = 0;
       pulseCount2 = 0;
+      pulseCount3 = 0;
     }
 
     frequencyHz1 = elapsedUs ? pulses1 * 1000000.0 / elapsedUs : 0;
     frequencyHz2 = elapsedUs ? pulses2 * 1000000.0 / elapsedUs : 0;
+    declogHz = elapsedUs ? pulses3 * 1000000.0 / elapsedUs : 0;
 
     float rawSpeed1 = frequencyHz1 / 6.0;
     float rawSpeed2 = frequencyHz2 / 6.0;
@@ -210,13 +243,21 @@ void loop() {
     Serial.print("ABS: ");
     Serial.println(absActive ? "ACTIVE" : "OFF");
 
+    Serial.print("Declog (D2): ");
+    Serial.print(declogHz, 1);
+    Serial.println(" Hz");
+
     Serial.print("REF1 (A0): ");
     Serial.print(ref1V, 2);
-    Serial.println(" V");
+    Serial.print(" V (pin ");
+    Serial.print(pinV[0], 2);
+    Serial.println(" V)");
 
     Serial.print("Battery (A1): ");
     Serial.print(batteryV, 2);
-    Serial.println(" V");
+    Serial.print(" V (pin ");
+    Serial.print(pinV[1], 2);
+    Serial.println(" V)");
 
     Serial.println();
   }

@@ -8,8 +8,9 @@
 // Nano running arduino-nano/NanoAbsTester. The Nano sends "A1" frames:
 //   key, brake, D7 rear frequency x100, rear speed x100, REF1 / REF2 mV,
 //   current mA, battery mV, D8 front frequency x100, front speed x100, RPM,
-//   TCS (1 steady, 0 blinking) and ABS (1 active). Older Nano firmware stops
-//   after the battery or the front speed.
+//   TCS (1 steady, 0 blinking), ABS (1 active) and D2 Declog Hz x100. Older
+//   firmware stops after the battery, the front speed or ABS. REF2 and
+//   current are not wired (sent as 0) and are ignored.
 // Speed 1 (rear), speed 2 (front), RPM, TCS and ABS are shown exactly as the
 // Nano works them out (speed = Hz / 6 km/h, RPM = D7 Hz x 15000 / 1560).
 // Nano D5 (SoftwareSerial TX) -> ESP32 RX2 (GPIO16), common GND,
@@ -38,10 +39,11 @@ bool parseFrame(char* text) {
   if (*end || expected != checksum) return false;
   *star = '\0';
   if (strncmp(text, "A1,", 3) != 0) return false;
-  // 8 fields (oldest Nano), 10 (+ front sensor) or 13 (+ RPM, TCS, ABS).
-  constexpr uint8_t MIN_FIELDS = 8, FRONT_FIELDS = 10, MAX_FIELDS = 13;
-  constexpr unsigned long maximum[MAX_FIELDS] = {1, 1, 100000000UL, 25000, 5500, 5500, 10500, 5500, 100000000UL, 25000,
-                                                 15000, 1, 1};
+  // 8 fields (oldest Nano), 10 (+ front sensor), 13 (+ RPM, TCS, ABS) or 14 (+ Declog Hz).
+  constexpr uint8_t MIN_FIELDS = 8, FRONT_FIELDS = 10, LAMP_FIELDS = 13, MAX_FIELDS = 14;
+  // REF1 and battery: up to 30 V (0-30 V dividers, as on the ECU testbench).
+  constexpr unsigned long maximum[MAX_FIELDS] = {1, 1, 100000000UL, 25000, 31000, 5500, 10500, 31000, 100000000UL, 25000,
+                                                 15000, 1, 1, 100000000UL};
   unsigned long values[MAX_FIELDS];
   uint8_t parsed = 0;
   char* p = text + 3;
@@ -50,7 +52,7 @@ bool parseFrame(char* text) {
     values[i] = strtoul(p, &end, 10);
     if (values[i] > maximum[i]) return false;
     parsed = i + 1;
-    if (!*end && (parsed == MIN_FIELDS || parsed == FRONT_FIELDS || parsed == MAX_FIELDS)) break;
+    if (!*end && (parsed == MIN_FIELDS || parsed == FRONT_FIELDS || parsed == LAMP_FIELDS || parsed == MAX_FIELDS)) break;
     if (*end != ',' || parsed == MAX_FIELDS) return false;
     p = end + 1;
   }
@@ -59,25 +61,24 @@ bool parseFrame(char* text) {
   latest.frequencyHz = values[2] / 100.0f;
   latest.speedKmh = values[3] / 100.0f;
   latest.ref1V = values[4] / 1000.0f;
-  latest.ref2V = values[5] / 1000.0f;
-  latest.currentA = values[6] / 1000.0f;
   latest.batteryV = values[7] / 1000.0f;
   latest.front = parsed >= FRONT_FIELDS;
   latest.frontHz = latest.front ? values[8] / 100.0f : 0;
   latest.frontKmh = latest.front ? values[9] / 100.0f : 0;
-  latest.nanoLamps = parsed == MAX_FIELDS;
+  latest.nanoLamps = parsed >= LAMP_FIELDS;
   latest.rpm = latest.nanoLamps ? values[10] : 0;
   latest.tcsSteady = latest.nanoLamps && values[11] == 1;
   latest.absActive = latest.nanoLamps && values[12] == 1;
+  latest.declogHz = parsed == MAX_FIELDS ? values[13] / 100.0f : 0;
   lastPacketMs = millis();
   havePacket = true;
   return true;
 }
 
-// Same values the LCD shows; DECLOG (0-100 %) follows the D7 frequency.
+// Same values the LCD shows; DECLOG is the D2 frequency (0-100 Hz = 0-100 %).
 String liveJson() {
   const bool fresh = havePacket && uint32_t(millis() - lastPacketMs) <= 3000;
-  const float percent = constrain(latest.frequencyHz / FREQUENCY_MAX_HZ * 100, 0.0f, 100.0f);
+  const float percent = constrain(latest.declogHz / DECLOG_MAX_HZ * 100, 0.0f, 100.0f);
   String json;
   json.reserve(400);
   json = F("{\"link\":\"");
@@ -90,10 +91,9 @@ String liveJson() {
   json += F(",\"front_speed_kmh\":"); json += String(latest.frontKmh, 1);
   json += F(",\"front_frequency_hz\":"); json += String(latest.frontHz, 1);
   json += F(",\"rpm\":"); json += latest.rpm;
+  json += F(",\"declog_hz\":"); json += String(latest.declogHz, 1);
   json += F(",\"declog_percent\":"); json += String(percent, 1);
   json += F(",\"ref1_v\":"); json += String(latest.ref1V, 3);
-  json += F(",\"ref2_v\":"); json += String(latest.ref2V, 3);
-  json += F(",\"current_a\":"); json += String(latest.currentA, 3);
   json += F(",\"battery_v\":"); json += String(latest.batteryV, 3);
   // Warning lights, the same as the LCD: "off", "on", "flash" or (SENSOR) "ok".
   const Lamps lamps = warningLamps(latest);
@@ -161,7 +161,8 @@ void loop() {
         Serial.print(latest.frontHz, 1); Serial.print(F(" Hz = "));
         Serial.print(latest.frontKmh, 1); Serial.print(F(" km/h"));
       } else Serial.print(F("n/a (old Nano firmware)"));
-      Serial.print(F(" | REF1 ")); Serial.print(latest.ref1V, 2);
+      Serial.print(F(" | DECLOG D2 ")); Serial.print(latest.declogHz, 1);
+      Serial.print(F(" Hz | REF1 ")); Serial.print(latest.ref1V, 2);
       Serial.print(F(" V | BATTERY ")); Serial.print(latest.batteryV, 2);
       Serial.print(F(" V | bad frames ")); Serial.println(badFrames);
     } else {

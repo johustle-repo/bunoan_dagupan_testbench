@@ -20,9 +20,9 @@ constexpr uint8_t TFT_CS = 27, TFT_DC = 25, TFT_RST = 26, TOUCH_CS = 33;
 constexpr uint32_t GAUGE_REFRESH_MS = 40, TEXT_REFRESH_MS = 100;
 constexpr uint32_t SPLASH_MS = 1800, SELF_TEST_MS = 1600;  // Power-on splash, switch-on sweep.
 // REAR (D7) and FRONT (D8): wheel speed = Hz / 6 km/h, 0-250 km/h, the same
-// formula as the Nano. DECLOG: the D7 frequency as a duty percentage, 0-1639 Hz = 0-100 %.
+// formula as the Nano. DECLOG: the D2 frequency, bar 0-100 Hz.
 constexpr float ABS_SPEED_MAX = 250, SPEED_RED = 210, HZ_PER_KMH = 6;
-constexpr float FREQUENCY_MAX_HZ = 1639;
+constexpr float DECLOG_MAX_HZ = 100;
 
 // What the screen shows, filled by the sketch each loop.
 struct AbsData {
@@ -31,10 +31,11 @@ struct AbsData {
   float speedKmh, frequencyHz;   // Rear, D7.
   bool front;                    // Frame carries the D8 front sensor.
   float frontKmh, frontHz;
-  float ref1V, ref2V, currentA, batteryV;  // REF2 and current are sent but not shown.
+  float ref1V, batteryV;         // A0, A1.
   bool nanoLamps;                // Frame carries the Nano's RPM, TCS and ABS.
   uint16_t rpm;                  // D7 Hz x 15000 / 1560, from the Nano.
   bool tcsSteady, absActive;     // The Nano's TCS (D13) and ABS (D12) LED states.
+  float declogHz;                // D2, 0 with older firmware.
 };
 
 // Warning lights, the same as the Nano's LEDs:
@@ -280,8 +281,8 @@ void drawTile(uint8_t i, float volts) {
   });
 }
 
-// REAR speed bar (0-250 km/h) with the DECLOG bar (0-100 %) below it.
-void drawBars(float rearKmh, float declogPercent) {
+// REAR speed bar (0-250 km/h) with the DECLOG bar (0-100 Hz) below it.
+void drawBars(float rearKmh, float declogHz) {
   render(BX, BY, BW, BH, [&](aa::Buf& b) {
     aa::fill(b, BG);
     panel(b, BX, BY, BW, BH);
@@ -289,12 +290,12 @@ void drawBars(float rearKmh, float declogPercent) {
     char s[16];
     for (uint8_t row = 0; row < 2; ++row) {
       const int cy = BY + 11 + row * 14;
-      const float f = row ? declogPercent / 100 : rearKmh / ABS_SPEED_MAX;
+      const float f = row ? declogHz / DECLOG_MAX_HZ : rearKmh / ABS_SPEED_MAX;
       const uint16_t c = row ? ACCENT : speedColor(rearKmh);
       aa::text(b, aaLabel, row ? "DECLOG" : "REAR", BX + 10, cy + 4, row ? MUTED : RED, aa::LEFT, 1);
       aa::roundRect(b, X0, cy - 3, LEN, 6, 3, TRACK);
       if (f > 0.01f) aa::roundRect(b, X0, cy - 3, max(6.0f, constrain(f, 0.0f, 1.0f) * LEN), 6, 3, c);
-      if (row) snprintf(s, sizeof(s), "%.0f%%", declogPercent);
+      if (row) snprintf(s, sizeof(s), "%.0f Hz", declogHz);
       else snprintf(s, sizeof(s), "%.0f km/h", rearKmh);
       aa::text(b, aaLabel, s, BX + BW - 10, cy + 4, TEXT, aa::RIGHT);
     }
@@ -335,9 +336,8 @@ void testerText(const AbsData& d, bool selfTest) {
   snprintf(key, sizeof(key), "%d%d%d%u%u%u", lit[0], lit[1], lit[2], colors[0], colors[1], colors[2]);
   if (changed(S_LIGHTS, key)) drawLights(lit, colors);
   // REAR speed and DECLOG bars.
-  const float percent = constrain(d.frequencyHz / FREQUENCY_MAX_HZ * 100, 0.0f, 100.0f);
-  snprintf(key, sizeof(key), "%.0f %.0f", d.speedKmh, percent);
-  if (changed(S_BARS, key)) drawBars(d.speedKmh, percent);
+  snprintf(key, sizeof(key), "%.0f %.0f", d.speedKmh, d.declogHz);
+  if (changed(S_BARS, key)) drawBars(d.speedKmh, d.declogHz);
   // Footer.
   if (changed(S_FOOTER, "KEY ON")) drawFooter();
 }

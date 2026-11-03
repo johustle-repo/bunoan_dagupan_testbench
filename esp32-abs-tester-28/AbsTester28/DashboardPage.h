@@ -106,7 +106,7 @@ background:rgba(5,8,13,.9);backdrop-filter:blur(4px);-webkit-backdrop-filter:blu
   </section>
   <section class="panel bars">
    <div class="bar-row"><span style="color:var(--red)">REAR</span><div class="track"><div class="fill" id="rearBar"></div></div><strong class="num"><span id="rearText">0</span><small>km/h</small></strong></div>
-   <div class="bar-row"><span style="color:var(--muted)">DECLOG</span><div class="track"><div class="fill" id="declogBar" style="background:var(--accent)"></div></div><strong class="num"><span id="declogText">0</span><small>%</small></strong></div>
+   <div class="bar-row"><span style="color:var(--muted)">DECLOG</span><div class="track"><div class="fill" id="declogBar" style="background:var(--accent)"></div></div><strong class="num"><span id="declogText">0</span><small>Hz</small></strong></div>
   </section>
  </div>
  <div class="tiles">
@@ -170,8 +170,8 @@ function show(d){
  $('lit').setAttribute('stroke-dasharray',`${v/MAX*200} 200`);$('lit').setAttribute('stroke',speedColor(v));
  $('speedText').textContent=Math.round(v);$('speedText').setAttribute('fill',v>=RED?'var(--red)':'var(--text)');
  $('rearBar').style.width=v/MAX*100+'%';$('rearBar').style.background=speedColor(v);$('rearText').textContent=Math.round(v);
- const p=Math.min(Math.max(+d.declog_percent||0,0),100);
- $('declogBar').style.width=p+'%';$('declogText').textContent=Math.round(p);
+ const hz=Math.max(+d.declog_hz||0,0),p=Math.min(hz,100);
+ $('declogBar').style.width=p+'%';$('declogText').textContent=Math.round(hz);
  lampStates={absLamp:d.abs_lamp,tcsLamp:d.tcs_lamp,sensorLamp:d.sensor_lamp};lamps();
  volts('ref1',d.ref1_v);volts('battery',d.battery_v);
  $('stamp').textContent='Updated '+new Date().toLocaleTimeString();
