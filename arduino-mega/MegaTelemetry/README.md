@@ -2,7 +2,7 @@
 
 For the Mega 2560 Pro (also runs on a full-size Mega 2560: same ATmega2560 and pin numbers). The sensor knobs and the ESP32 link (SoftwareSerial, D6 TX → ESP32 GPIO17, D5 ↔ GPIO16) are wired as on the Nano. The differences:
 
-- **Separate RPM and speed inputs:** D7 is the RPM frequency, RPM = Hz × 15000 ÷ 1549 (1549 Hz = 15,000 rpm, max 15,000). D8 is the speed frequency, speed = Hz ÷ 6 km/h (max 250). Timer1 samples both at 20 kHz.
+- **Separate RPM and speed inputs:** D7 is the RPM frequency, RPM = Hz × 15000 ÷ 1549 (1549 Hz = 15,000 rpm, max 15,000). D8 is the speed frequency, speed = Hz ÷ 6 km/h (max 250 at 1500 Hz). To drive it from the A8 pot, jumper D44 → D8. Timer1 samples both at 20 kHz.
 - **ABS on D9:** works like the old brake: while it is on, the speed on the ESP32 ramps to 0 at 100 km/h per second, and the ABS lamp turns orange.
 - **Declog from the A9 pot:** Declog is the 0–100 Hz the A9 pot sets on D2. It is sent to the ESP32 and shown as DECLOG xx Hz on the 4" screen and the dashboard; the DECLOG lamp is on above 0 Hz. D10 is no longer used.
 - **Smart key follows the Mega's power:** while the Mega is on and sending, every U6 frame reports KEY ON. When the Mega is off or unplugged, the ESP32 gets no frames for 3 s and shows KEY OFF. D11 is no longer used.
@@ -17,7 +17,7 @@ For the Mega 2560 Pro (also runs on a full-size Mega 2560: same ATmega2560 and p
   - O2 / AFR (fault > 1.20 V or < 0.02 V): 0.1 V = 15.2:1, 0.9 V = 14.0:1.
   - MAP (fault > 4.60 V): 0 V = 10 kPa, 4.21 V = 100 kPa.
   - TPS (fault > 4.75 V): 0 V = 0 %, 4.25 V = 100 %.
-  - REF1 (A5), REF2 (A6) and BATV (A7): pin volts × 6 (12.5 kΩ / 2.5 kΩ divider).
+  - REF1 (A5), REF2 (A6) and BATV (A7): pin volts mapped to 0–30 V through the PCB calibration table (see below).
   - Each input is the average of 20 readings 1 ms apart. The ESP32 gets the averaged ADC counts in the U6 frame.
 
 **Receiver:** use `esp32-universal-v2/ReceiverV2`, which accepts U3 (Uno), U4 (Nano), U5 (older Mega firmware) and U6 (this firmware). The older receivers (esp32-universal, esp32-nano) reject U6 frames and count them as bad frames.
@@ -42,7 +42,7 @@ Board: Tools > Board > Arduino AVR Boards > Arduino Mega or Mega 2560. Processor
 | A9 | Second frequency pot (PTV09 10 kΩ) wiper: pin 1 → GND, pin 2 → A9, pin 3 → 5V |
 | D2 | Second frequency generator output, 0–100 Hz square wave, 0–5 V (set by the A9 pot) |
 | D7 | RPM frequency (0–1639 Hz, 0–5 V square wave), sampled by Timer1 at 20 kHz |
-| D8 | Speed frequency (0–1500 Hz = 0–250 km/h, 0–5 V square wave), sampled by Timer1 at 20 kHz |
+| D8 | Speed frequency (0–1500 Hz = 0–250 km/h, 0–5 V square wave), sampled by Timer1 at 20 kHz. Jumper D44 → D8 to use the A8 pot |
 | D9 | ABS, off LOW / on HIGH (INPUT_PULLUP, normally-closed to GND, like the old brake) |
 | D10 | Unused (Declog now comes from the A9 pot) |
 | D11 | Unused (smart key now follows the Mega's power) |
@@ -57,12 +57,22 @@ D9 has the internal pull-up on, so an unconnected D9 reads ABS ON (and the ESP32
 
 One divider per input: **input → 12.5 kΩ → Mega pin → 2.5 kΩ → GND**. It divides by 6, so 30 V reaches the pin as 5.0 V, and draws 2 mA at 30 V. The input's ground must be connected to the Mega GND.
 
-- **Scaling:** input volts = pin volts × 6 (`VOLTAGE_DIVIDER_RATIO`), so 0–5 V at the pin is 0–30 V. With a 12 kΩ / 2 kΩ divider (divide by 7) set `VOLTAGE_DIVIDER_RATIO = 7.0`.
+- **Scaling:** `getTrueVoltage()` interpolates linearly between measured calibration points (`calPinV` / `calTrueV`), clamped to 0–30 V:
+
+  | Pin (V) | 0.00 | 0.15 | 0.85 | 1.72 | 2.59 | 3.48 | 4.35 | 5.00 |
+  |---|---|---|---|---|---|---|---|---|
+  | Input (V) | 0 | 1 | 5 | 10 | 15 | 20 | 25 | 30 |
+
+  To recalibrate, feed known voltages, note the pin volts and edit the two arrays.
 - **Supply:** the mapping assumes the Mega's 5 V is exactly 5.0 V. On USB it is often 4.6–4.9 V, which makes all three readings read high by the same percentage (about 6 % at 4.7 V).
 - **Protection (recommended):** a 5.1 V Zener and a 100 nF capacitor from each pin to GND, against spikes, a reversed battery and alternator noise.
 - **Accuracy:** 1 % resistors give about ±2 %. About 30 mV per ADC step.
 
 To check a divider, compare the reported value with a multimeter reading at its input.
+
+## No sensor attached = ERR
+
+After reading each of A0–A7, the Mega switches the pin's internal pull-up on for about 1 ms. An empty pin rises to 5 V (1015 counts or more) and is reported as **ERR**; a connected sensor or PCB output stays near its own voltage. A0–A4 then send 1023 counts, which the ESP32 shows as ERR (circuit high). REF1, REF2 and the battery send 65535 mV in the U6 frame, which the ESP32 (ReceiverV2) shows as ERR. A sensor that is really stuck at 5 V also shows ERR.
 
 SoftwareSerial blocks interrupts while it sends a frame (about 26 ms), so Timer1 can't sample D7/D8 during that time. The sketch leaves that time out of the 1 s frequency window, as on the Nano.
 

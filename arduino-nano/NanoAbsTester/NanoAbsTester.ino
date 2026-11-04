@@ -57,10 +57,25 @@ float pinV[2] = {0, 0};  // Filtered A0 / A1 pin volts, 0-5 V.
 float speed1 = 0, speed2 = 0;
 float rpm = 0;
 
-// REF1 / battery: the pin reads 0-5 V, mapped to 0-30 V:
-//   volts = pin volts / PIN_FULL_SCALE_V x INPUT_FULL_SCALE_V  (= pin volts x 6,
-//   the same result as the ECU testbench divider formula).
-constexpr float PIN_FULL_SCALE_V = 5.0f, INPUT_FULL_SCALE_V = 30.0f;
+// REF1 / battery: the pin reads 0-5 V, mapped to 0-30 V through the PCB
+// calibration table (same as the ECU testbench): pin volts (x) -> true volts (y).
+constexpr float PIN_FULL_SCALE_V = 5.0f;
+constexpr uint8_t CAL_POINTS = 8;
+const float calPinV[CAL_POINTS] = {0.00f, 0.15f, 0.85f, 1.72f, 2.59f, 3.48f, 4.35f, 5.00f};
+const float calTrueV[CAL_POINTS] = {0.00f, 1.00f, 5.00f, 10.0f, 15.0f, 20.0f, 25.0f, 30.0f};
+
+// Linear interpolation between the calibration points, clamped to 0-30 V.
+float getTrueVoltage(float x) {
+  if (x <= calPinV[0]) return calTrueV[0];
+  if (x >= calPinV[CAL_POINTS - 1]) return calTrueV[CAL_POINTS - 1];
+  for (uint8_t i = 0; i < CAL_POINTS - 1; i++) {
+    if (x <= calPinV[i + 1]) {
+      return calTrueV[i] + (x - calPinV[i]) * (calTrueV[i + 1] - calTrueV[i]) /
+                               (calPinV[i + 1] - calPinV[i]);
+    }
+  }
+  return 0.0f;
+}
 // Noise filter: 20 samples with the highest and lowest dropped, then a
 // running average (each new reading moves the value 20 %, about 1 s to settle).
 constexpr uint8_t SAMPLES = 20;
@@ -82,7 +97,8 @@ ISR(TIMER1_COMPA_vect) {
   previousHigh3 = high3;
 }
 
-// Reads A0 / A1 (analogRead 0-1023 = 0-5 V), filters it and returns 0-30 V.
+// Reads A0 / A1 (analogRead 0-1023 = 0-5 V), filters it and returns 0-30 V
+// through the calibration table.
 float readInput(uint8_t i) {
   analogRead(inputPins[i]);  // First reading after switching pins is discarded.
   delayMicroseconds(200);
@@ -98,7 +114,7 @@ float readInput(uint8_t i) {
   const float volts = float(sum - lowest - highest) / (SAMPLES - 2) * PIN_FULL_SCALE_V / 1023.0f;
   if (!filterStarted[i]) { pinV[i] = volts; filterStarted[i] = true; }
   else pinV[i] += FILTER * (volts - pinV[i]);
-  return pinV[i] / PIN_FULL_SCALE_V * INPUT_FULL_SCALE_V;
+  return getTrueVoltage(pinV[i]);
 }
 
 // A1 frame: key (always 1), brake (none, 0), D7 Hz x100, speed 1 x100,

@@ -12,7 +12,8 @@
 
 // Arduino Mega 2560 (Pro) sender for the universal ESP32 receiver.
 //   A0-A4 IAT, ECT, O2, MAP, TPS     A5/A6 Reference 1/2, A7 battery (0-30 V dividers)
-//   D7 RPM frequency                 D8 speed frequency
+//   Any of A0-A7 with nothing attached shows ERR (pull-up test, inputOpen()).
+//   D7 RPM frequency                 D8 speed frequency (jumper from the D44 generator)
 //   D9 ABS (the old brake input)     D10, D11 unused
 //   D6 -> ESP32 GPIO17 (U6 frames)
 //   A8 PTV09 10k pot -> D44 0-2000 Hz, A9 second pot -> D2 0-100 Hz (PotGenerator.h)
@@ -53,31 +54,64 @@ ISR(TIMER1_COMPA_vect) {
 const uint8_t sensorPins[] = {A0, A1, A2, A3, A4}; // IAT, ECT, O2, MAP, TPS.
 constexpr uint8_t SENSOR_SAMPLES = 20;
 constexpr uint16_t PUBLISH_INTERVAL_MS = 500;
-// RPM = D7 Hz x 15000 / 1549; speed = D8 Hz / 6 km/h, max 250. The ESP32 works
+// RPM = D7 Hz x 15000 / 1549; speed = D8 Hz / 6 km/h, max 250 (1500 Hz). The ESP32 works
 // both out from the frequencies in the frame; these are for the USB output.
 constexpr float RPM_PER_HZ = 15000.0f / 1549, RPM_MAX = 15000;
 constexpr float HZ_PER_KMH = 6.0f;
 constexpr float SPEED_MAX_KMH = 250.0f;
 float rawSnapshot[5]; // Averaged ADC counts, sent to the ESP32.
 
-// 0-30 V inputs, each through a divider: input -> R_TOP -> pin -> R_BOTTOM -> GND.
-// 12.5k / 2.5k divides by 6, so the pin sees 0-5 V for a 0-30 V input.
-// Input volts = pin volts x (12.5k + 2.5k) / 2.5k.
-constexpr float VOLTAGE_DIVIDER_RATIO = 6.0f;
+// 0-30 V inputs from the PCB (0-5 V outputs) on A5/A6 (REF1/REF2) and A7 (battery).
 const uint8_t referencePins[] = {A5, A6};
 constexpr uint8_t BATTERY_PIN = A7;
 float referenceVoltage[2] = {};
 float batteryVoltage = 0;
+constexpr float V_REF = 5.0f;  // Mega 5 V rail.
 
-// Divider input voltage: analogRead 0-1023 (pin 0-5 V) mapped to 0-30 V.
-// Averages 20 readings 1 ms apart.
+// Calibration table measured on the PCB: pin volts (x) -> true input volts (y).
+constexpr uint8_t CAL_POINTS = 8;
+const float calPinV[CAL_POINTS] = {0.00f, 0.15f, 0.85f, 1.72f, 2.59f, 3.48f, 4.35f, 5.00f};
+const float calTrueV[CAL_POINTS] = {0.00f, 1.00f, 5.00f, 10.0f, 15.0f, 20.0f, 25.0f, 30.0f};
+
+// Linear interpolation between the calibration points, clamped to 0-30 V.
+float getTrueVoltage(float x) {
+  if (x <= calPinV[0]) return calTrueV[0];
+  if (x >= calPinV[CAL_POINTS - 1]) return calTrueV[CAL_POINTS - 1];
+  for (uint8_t i = 0; i < CAL_POINTS - 1; i++) {
+    if (x <= calPinV[i + 1]) {
+      return calTrueV[i] + (x - calPinV[i]) * (calTrueV[i + 1] - calTrueV[i]) /
+                               (calPinV[i + 1] - calPinV[i]);
+    }
+  }
+  return 0.0f;
+}
+
+// No-sensor check: with the internal pull-up (about 35k) switched on, an empty
+// pin rises to 5 V, while a connected sensor or PCB output stays near its own
+// voltage. Every reading of 1015 counts (4.96 V) or more = nothing attached.
+// The pull-up is on for about 1 ms, after the pin has been read.
+constexpr uint16_t OPEN_PIN_COUNTS = 1015;
+bool inputOpen(uint8_t pin) {
+  pinMode(pin, INPUT_PULLUP);
+  delayMicroseconds(500);
+  analogRead(pin);  // Discard: the ADC is switching channels.
+  bool open = true;
+  for (uint8_t n = 0; n < 4 && open; n++) open = analogRead(pin) >= OPEN_PIN_COUNTS;
+  pinMode(pin, INPUT);  // Pull-up off again.
+  return open;
+}
+
+// Divider input voltage: averages 20 readings 1 ms apart, converts to pin
+// volts, then maps through the calibration table to 0-30 V. NAN = no input
+// attached (printed and shown as ERR).
 float readDividerInput(uint8_t pin) {
   uint32_t sum = 0;
   for (uint8_t n = 0; n < SENSOR_SAMPLES; n++) {
     sum += analogRead(pin);
     delay(1);
   }
-  return float(sum) / SENSOR_SAMPLES * 5.0f / 1023.0f * VOLTAGE_DIVIDER_RATIO;
+  if (inputOpen(pin)) return NAN;
+  return getTrueVoltage(float(sum) / SENSOR_SAMPLES * (V_REF / 1023.0f));
 }
 
 // SoftwareSerial TX disables interrupts, so Timer1 can't sample D7/D8 while a
@@ -98,14 +132,16 @@ void publishEspSnapshot() {
 }
 
 // Hardware smoothing filter: 20 readings 1 ms apart. Keeps the averaged
-// counts for the ESP32 frame and returns the pin voltage.
+// counts for the ESP32 frame and returns the pin voltage. With no sensor
+// attached it reports 1023 counts (5 V), which every sensor formula here and
+// on the ESP32 treats as a fault, so it shows ERR.
 float readSensor(uint8_t i) {
   uint32_t sum = 0;
   for (uint8_t n = 0; n < SENSOR_SAMPLES; n++) {
     sum += analogRead(sensorPins[i]);
     delay(1);
   }
-  rawSnapshot[i] = float(sum) / SENSOR_SAMPLES;
+  rawSnapshot[i] = inputOpen(sensorPins[i]) ? 1023.0f : float(sum) / SENSOR_SAMPLES;
   return rawSnapshot[i] * 5.0f / 1023.0f;
 }
 
@@ -116,6 +152,12 @@ void printReading(const __FlashStringHelper* name, const SensorReading& r, uint8
   if (r.fault) Serial.print(F("ERR"));
   else { Serial.print(r.value, digits); Serial.print(unit); }
   Serial.print(F(" | "));
+}
+
+// 0-30 V input: "12.00" or "ERR" with no input attached.
+void printVolts(float v) {
+  if (isnan(v)) Serial.print(F("ERR"));
+  else { Serial.print(v, 2); Serial.print(F(" V")); }
 }
 
 void setup() {
@@ -198,10 +240,10 @@ void loop() {
   Serial.print(F(" | SPEED: ")); Serial.print(min(speedFrequencyHz / HZ_PER_KMH, SPEED_MAX_KMH), 1);
   Serial.print(F(" km/h | ABS: ")); Serial.print(absButton.pressed() ? F("ON") : F("OFF"));
   Serial.print(F(" | DECLOG: ")); Serial.print(gen2.outHz, 2); Serial.print(F(" Hz"));
-  Serial.print(F(" | REF1: ")); Serial.print(referenceVoltage[0], 2);
-  Serial.print(F(" V | REF2: ")); Serial.print(referenceVoltage[1], 2);
-  Serial.print(F(" V | BATV: ")); Serial.print(batteryVoltage, 2);
-  Serial.print(F(" V | A8: ")); Serial.print(analogRead(A8));  // Plain analogRead, 0-1023.
+  Serial.print(F(" | REF1: ")); printVolts(referenceVoltage[0]);
+  Serial.print(F(" | REF2: ")); printVolts(referenceVoltage[1]);
+  Serial.print(F(" | BATV: ")); printVolts(batteryVoltage);
+  Serial.print(F(" | A8: ")); Serial.print(analogRead(A8));  // Plain analogRead, 0-1023.
   Serial.print(F(" | GEN D44: ")); Serial.print(gen1.outHz, 1);
   Serial.print(F(" Hz | A9: ")); Serial.print(analogRead(A9));
   Serial.print(F(" | GEN D2: ")); Serial.print(gen2.outHz, 2); Serial.println(F(" Hz"));

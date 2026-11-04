@@ -221,12 +221,13 @@ inline uint32_t to888(uint16_t c) {
 }
 
 // ---- Lamps -----------------------------------------------------------------
-// Order matches the browser: smart key, declog, winker, check engine, coolant,
-// ABS, TCS. Winker and TCS have no input on this bench; Declog only on U6.
-// ABS turns orange with the brake (Uno/Nano/Mega D9) or ABS (Mega 2560 Pro D9) input.
-constexpr uint8_t LAMP_COUNT = 7;
-const char* const LAMP_NAMES[LAMP_COUNT] = {"KEY", "DECLOG", "WINKER", "CHECK", "TEMP", "ABS", "TCS"};
-constexpr bool LAMP_WIRED[LAMP_COUNT] = {true, true, false, true, true, true, false};
+// Smart key, winker, check engine, ABS, TCS (no Declog or Temp lamp). Winker
+// and TCS have no input on this bench. ABS turns orange with the brake
+// (Uno/Nano/Mega D9) or ABS (Mega 2560 Pro D9) input.
+constexpr uint8_t LAMP_COUNT = 5;
+enum Lamp : uint8_t { L_KEY, L_WINKER, L_CHECK, L_ABS, L_TCS };
+const char* const LAMP_NAMES[LAMP_COUNT] = {"KEY", "WINKER", "CHECK ENGINE", "ABS", "TCS"};
+constexpr bool LAMP_WIRED[LAMP_COUNT] = {true, false, true, true, false};
 
 // Honda-style blink code: long flashes count tens, short flashes units, then a
 // pause. Steady while moving or when no blink code is known.
@@ -247,19 +248,18 @@ void lampColors(const DisplayData& d, bool selfTest, float speed, uint32_t now, 
   const bool race = view == RACE;
   for (uint8_t i = 0; i < LAMP_COUNT; ++i) out[i] = selfTest ? ORANGE : 0;
   if (selfTest) return;
-  if (fresh && d.keyOn) out[0] = race ? GREEN : ACCENT;
-  if (fresh && d.declog) out[1] = race ? ORANGE : AMBER;
-  if (running && milLit(d, speed, now)) out[3] = ORANGE;
-  if (running && d.coolantWarning) out[4] = RED;
-  if (running) out[5] = d.brake ? ORANGE : GREEN;
+  if (fresh && d.keyOn) out[L_KEY] = race ? GREEN : ACCENT;
+  if (running && milLit(d, speed, now)) out[L_CHECK] = ORANGE;
+  if (running) out[L_ABS] = d.brake ? ORANGE : GREEN;
 }
 
 void drawClassicLamp(uint8_t i, uint16_t color) {
   char tag[8];
   snprintf(tag, sizeof(tag), "%u", color);
   if (!changed(S_LAMP0 + i, tag, color)) return;
-  const int y = 40 + i * 40, cx = 17, cy = y + 20;
-  lcd.fillRect(0, y, 87, 40, BG);
+  constexpr int ROW = 56;  // 5 lamps fill the old 7 x 40 px column (y 40-320).
+  const int y = 40 + i * ROW, cx = 17, cy = y + ROW / 2;
+  lcd.fillRect(0, y, 87, ROW, BG);
   if (color) {
     lcd.fillCircle(cx, cy, 13, lerpColor(0x0d141e, to888(color), 0.35f));  // Soft glow.
     lcd.fillCircle(cx, cy, 10, color);
@@ -269,7 +269,11 @@ void drawClassicLamp(uint8_t i, uint16_t color) {
   } else {
     for (int a = 0; a < 360; a += 30) lcd.fillArc(cx, cy, 10, 9, a, a + 12, LAMP_RING);  // Dashed: not wired.
   }
-  label(lcd, LAMP_NAMES[i], 34, cy, color ? color : LAMP_WIRED[i] ? MUTED : LAMP_RING, textdatum_t::middle_left);
+  const uint16_t text = color ? color : LAMP_WIRED[i] ? MUTED : LAMP_RING;
+  if (i == L_CHECK) {  // Two lines: the column is too narrow for "CHECK ENGINE".
+    label(lcd, "CHECK", 34, cy - 8, text, textdatum_t::middle_left);
+    label(lcd, "ENGINE", 34, cy + 8, text, textdatum_t::middle_left);
+  } else label(lcd, LAMP_NAMES[i], 34, cy, text, textdatum_t::middle_left);
 }
 
 // RACE indicator strip: one LED per lamp with its name beside it.
@@ -277,7 +281,7 @@ void drawRaceLamp(uint8_t i, uint16_t color) {
   char tag[8];
   snprintf(tag, sizeof(tag), "%u", color);
   if (!changed(S_LAMP0 + i, tag, color)) return;
-  const int x = 3 + i * 68, y = 41, w = 66, h = 24, cx = x + 10, cy = y + h / 2;
+  const int x = 3 + i * 95, y = 41, w = 93, h = 24, cx = x + 10, cy = y + h / 2;  // 5 lamps across 480 px.
   lcd.fillRect(x, y, w, h, RACE_BG);
   if (color) {
     lcd.fillCircle(cx, cy, 9, lerpColor(0x06090e, to888(color), 0.35f));  // Glow.
@@ -289,7 +293,9 @@ void drawRaceLamp(uint8_t i, uint16_t color) {
   } else {
     for (int a = 0; a < 360; a += 45) lcd.fillArc(cx, cy, 6, 5, a, a + 20, RACE_NA);  // Dashed: not wired.
   }
-  label(lcd, LAMP_NAMES[i], x + 20, cy, color ? color : LAMP_WIRED[i] ? RACE_DIM : RACE_NA, textdatum_t::middle_left);
+  // "CHECK ENGINE" in the small font so it fits the 73 px beside the LED.
+  label(lcd, LAMP_NAMES[i], x + 20, cy, color ? color : LAMP_WIRED[i] ? RACE_DIM : RACE_NA, textdatum_t::middle_left,
+        i == L_CHECK ? static_cast<const lgfx::IFont*>(&fonts::Font0) : &fonts::Font2);
 }
 
 // ---- Throttle angle --------------------------------------------------------
@@ -482,11 +488,13 @@ void classicText(const DisplayData& d, bool running, float speed, float rpm) {
         break;
       case 3: case 4:
         if (havePacket && !d.references) { strcpy(value, "n/a"); color = MUTED; }
+        else if (running && isnan(d.reference[i - 3])) { strcpy(value, "ERR"); color = RED; }  // Nothing on the pin.
         else if (running) snprintf(value, sizeof(value), "%.2f V", d.reference[i - 3]);
         else { strcpy(value, "-- V"); color = MUTED; }
         break;
       case 5:  // Live with the key off, like the RACE battery tile.
-        if (d.batteryAvailable) {
+        if (d.batteryAvailable && isnan(d.batteryV)) { strcpy(value, "ERR"); color = RED; }  // Nothing on A7.
+        else if (d.batteryAvailable) {
           snprintf(value, sizeof(value), "%.2f V", d.batteryV);
           color = d.batteryV < 11.8f || d.batteryV > 15.0f ? ORANGE : d.batteryV >= 13.2f ? GREEN : TEXT;
         } else { strcpy(value, havePacket ? "n/a" : "-- V"); color = MUTED; }
@@ -627,7 +635,8 @@ void raceText(const DisplayData& d, bool running) {
   for (uint8_t i = 0; i < TILE_COUNT - 1; ++i) {
     uint16_t color = TEXT;
     if (i == 0) {  // Battery is live with the key off, like a real bike.
-      if (d.batteryAvailable) {
+      if (d.batteryAvailable && isnan(d.batteryV)) { strcpy(value, "ERR"); color = RED; }
+      else if (d.batteryAvailable) {
         snprintf(value, sizeof(value), "%.1f", d.batteryV);
         color = d.batteryV < 11.8f || d.batteryV > 15.0f ? ORANGE : d.batteryV >= 13.2f ? GREEN : TEXT;
       } else { strcpy(value, "--"); color = MUTED; }
@@ -757,6 +766,7 @@ void sensorsText(const DisplayData& d, bool running) {
         break;
       case 4: case 5:
         if (havePacket && !d.references) { snprintf(text, sizeof(text), "n/a on %s", d.board); color = MUTED; }
+        else if (running && isnan(d.reference[i - 4])) { strcpy(text, "ERR"); color = RED; }
         else if (running) snprintf(text, sizeof(text), "%.2f V", d.reference[i - 4]);
         else { strcpy(text, "--"); color = MUTED; }
         break;
@@ -771,6 +781,7 @@ void sensorsText(const DisplayData& d, bool running) {
           if (havePacket) snprintf(text, sizeof(text), "n/a on %s", d.board); else strcpy(text, "--");
           color = MUTED; break;
         }
+        if (isnan(d.batteryV)) { strcpy(text, "ERR"); color = RED; break; }
         snprintf(text, sizeof(text), "%.2f V %s", d.batteryV,
                  d.batteryV > 15.0f ? "OVER" : d.batteryV >= 13.2f ? "CHG" : d.batteryV < 11.8f ? "LOW" : "");
         color = d.batteryV < 11.8f || d.batteryV > 15.0f ? ORANGE : d.batteryV >= 13.2f ? GREEN : TEXT;
@@ -919,6 +930,7 @@ void drawStatus(const DisplayData& d) {
     char value[12];
     uint16_t color = TEXT;
     if (d.link != DisplayData::WAITING && !d.references) { strcpy(value, "n/a"); color = MUTED; }
+    else if (running && isnan(d.reference[i])) { strcpy(value, "ERR"); color = RED; }
     else if (running) snprintf(value, sizeof(value), "%.2f V", d.reference[i]);
     else { strcpy(value, "-- V"); color = MUTED; }
     field(S_REF1 + i, REF_X[i] + REF_W - 8, TAB_Y + TAB_H / 2, textdatum_t::middle_right, &fonts::Font4,

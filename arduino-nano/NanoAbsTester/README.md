@@ -17,7 +17,7 @@ Measures the two wheel-speed sensors and the Declog frequency, drives the TCS an
 
 A2 and A3 are not used (REF2 and current are sent as 0).
 
-D2, D7 and D8 are sampled by Timer1 at 20 kHz (rising edges counted over 1 s windows, up to about 10 kHz per input). There is no brake input (D9 is unused). **REF1 / battery mapping:** A0 and A1 read 0–5 V at the pin, mapped to 0–30 V: volts = pin volts ÷ 5 × 30 (= pin volts × 6, the ECU testbench formula; `PIN_FULL_SCALE_V` / `INPUT_FULL_SCALE_V`). Noise filter: 20 samples with the highest and lowest dropped, then a running average (about 1 s to settle). The Serial Monitor shows the pin volts too. Never put more than 5 V on the pin; a pot or knob there needs its ends on 5V and GND (a floating pin reads random values).
+D2, D7 and D8 are sampled by Timer1 at 20 kHz (rising edges counted over 1 s windows, up to about 10 kHz per input). There is no brake input (D9 is unused). **REF1 / battery mapping:** A0 and A1 read 0–5 V at the pin, mapped to 0–30 V by `getTrueVoltage()`, which interpolates linearly between the PCB calibration points (`calPinV` / `calTrueV`, same table as the ECU testbench): pin 0.00 / 0.15 / 0.85 / 1.72 / 2.59 / 3.48 / 4.35 / 5.00 V = 0 / 1 / 5 / 10 / 15 / 20 / 25 / 30 V, clamped to 0–30 V. Noise filter: 20 samples with the highest and lowest dropped, then a running average (about 1 s to settle). The Serial Monitor shows the pin volts too. Never put more than 5 V on the pin; a pot or knob there needs its ends on 5V and GND (a floating pin reads random values).
 
 USB output, once a second:
 
@@ -30,8 +30,8 @@ Speed 2: 250.0 km/h
 TCS: ON
 ABS: OFF
 Declog (D2): 50.0 Hz
-REF1 (A0): 12.00 V (pin 2.00 V)
-Battery (A1): 13.80 V (pin 2.30 V)
+REF1 (A0): 12.00 V (pin 2.07 V)
+Battery (A1): 13.80 V (pin 2.38 V)
 ```
 
 ## Nano → ESP32

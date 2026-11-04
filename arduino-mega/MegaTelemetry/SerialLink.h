@@ -17,6 +17,9 @@ inline void beginEspLink() {
   arduino.stopListening(); // One-way telemetry; no incoming commands.
 }
 
+// 0-30 V input in mV; 65535 = no input attached (NAN), shown as ERR.
+inline unsigned toMillivolts(float v) { return isnan(v) ? 65535u : unsigned(v * 1000 + 0.5f); }
+
 inline void sendEspSnapshot(const float* raw, float rpmHz, float speedHz, bool keyOn, bool absOn, float declogHz,
                             const float* referenceV, float batteryV) {
   if (!ESP_LINK_ENABLED) return;
@@ -30,8 +33,7 @@ inline void sendEspSnapshot(const float* raw, float rpmHz, float speedHz, bool k
     unsigned(raw[1] * 16 + 0.5f), unsigned(raw[2] * 16 + 0.5f),
     unsigned(raw[3] * 16 + 0.5f), unsigned(raw[4] * 16 + 0.5f),
     (unsigned long)(rpmHz * 100 + 0.5f), (unsigned long)(speedHz * 100 + 0.5f),
-    unsigned(referenceV[0] * 1000 + 0.5f), unsigned(referenceV[1] * 1000 + 0.5f),
-    unsigned(batteryV * 1000 + 0.5f), unsigned(declogHz > 0), unsigned(declogHz * 100 + 0.5f));
+    toMillivolts(referenceV[0]), toMillivolts(referenceV[1]), toMillivolts(batteryV), unsigned(declogHz > 0), unsigned(declogHz * 100 + 0.5f));
   if (count < 0 || count > int(sizeof(linkBuffer) - 5)) return;
   uint8_t checksum = 0;
   for (int i = 0; i < count; i++) checksum ^= uint8_t(linkBuffer[i]);

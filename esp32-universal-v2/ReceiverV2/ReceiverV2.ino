@@ -42,6 +42,7 @@ bool haveReferences = false;    // True for Nano (U4) and Mega (U5) frames, fals
 float batteryVoltage = 0;       // Mega A7 through a divider, 0-30 V.
 float batteryCurrentA = 0;      // Mega A8, 0-5 V = 0-10 A.
 bool haveBattery = false;       // True for Mega (U5/U6) frames; read with the key off too.
+constexpr unsigned long NO_INPUT_MV = 65535;  // U6: Reference / battery input open (NAN, ERR).
 bool haveCurrent = false;       // True for U5 frames only.
 enum Board : uint8_t { BOARD_UNO, BOARD_NANO, BOARD_MEGA } board = BOARD_UNO;
 const char* const BOARD_NAMES[] = {"Uno", "Nano", "Mega"};      // Display.
@@ -112,7 +113,9 @@ bool parseFrame(char* text) {
     if (*p < '0' || *p > '9') return false;
     values[i] = strtoul(p, &end, 10);
     parsed = i + 1;
-    if (values[i] > (i == fieldCount ? 100000000UL : limit[i])) return false;  // Front Hz / Declog Hz.
+    // U6: 65535 mV on Reference 1/2 or the battery = nothing attached (ERR).
+    const bool openInput = u6 && i >= 9 && i <= 11 && values[i] == NO_INPUT_MV;
+    if (!openInput && values[i] > (i == fieldCount ? 100000000UL : limit[i])) return false;  // Front Hz / Declog Hz.
     if (!*end && i + 1 >= fieldCount) break;
     if (*end != ',' || i + 1 == maxFields) return false;
     p = end + 1;
@@ -129,12 +132,13 @@ bool parseFrame(char* text) {
   declogOn = u6 && values[12] == 1;
   haveDeclogHz = u6 && parsed == 14;
   declogHz = haveDeclogHz && smartKeyOn ? values[13] / 100.0f : 0;
-  batteryVoltage = haveBattery ? values[11] / 1000.0f : 0;
+  batteryVoltage = !haveBattery ? 0 : values[11] == NO_INPUT_MV ? NAN : values[11] / 1000.0f;
   batteryCurrentA = haveCurrent ? values[12] / 1000.0f : 0;
   board = frameBoard;
   frameId = u6 ? "U6" : BOARD_FRAMES[frameBoard];
   for (uint8_t i = 0; i < 2; ++i)
-    referenceVoltage[i] = smartKeyOn && haveReferences ? values[i + 9] / 1000.0f : 0;
+    referenceVoltage[i] = !(smartKeyOn && haveReferences) ? 0
+                          : values[i + 9] == NO_INPUT_MV ? NAN : values[i + 9] / 1000.0f;
   lastPacketMs = millis();
   havePacket = true;
   if (!smartKeyOn) injectedFault = 0;
@@ -280,13 +284,15 @@ String telemetryJson() {
   json += F(",\"simulated_speed_kmh\":"); json += String(faultLimitedSpeed, 1);
   json += F(",\"simulated_rpm\":"); json += String(engineRpm, 0);
   json += F(",\"battery_v\":");
-  json += haveBattery && !stale ? String(batteryVoltage, 2) : String(F("null"));
+  json += haveBattery && !stale && !isnan(batteryVoltage) ? String(batteryVoltage, 2) : String(F("null"));
   json += F(",\"current_a\":");
   json += haveCurrent && !stale ? String(batteryCurrentA, 2) : String(F("null"));
   if (!smartKeyOn) { json += F(",\"sensors\":null,\"frequency_hz\":0,\"engine_rpm\":0}"); return json; }
   if (haveReferences) {
-    json += F(",\"reference_1_v\":"); json += String(referenceVoltage[0], 3);
-    json += F(",\"reference_2_v\":"); json += String(referenceVoltage[1], 3);
+    for (uint8_t i = 0; i < 2; ++i) {
+      json += i ? F(",\"reference_2_v\":") : F(",\"reference_1_v\":");
+      json += isnan(referenceVoltage[i]) ? String(F("null")) : String(referenceVoltage[i], 3);
+    }
     json += F(",\"reference_scale\":\""); json += board == BOARD_MEGA ? F("0_30v_divider") : F("direct_0_5v");
     json += '"';
   } else json += F(",\"reference_1_v\":null,\"reference_2_v\":null");

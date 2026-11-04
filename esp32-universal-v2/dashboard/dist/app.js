@@ -37,16 +37,11 @@ function render(d,state){
  if(locked){$('connection').textContent='SMART KEY OFF';$('connection').classList.remove('offline');$('sourceBanner').textContent=`SMART KEY OFF · Press the ${boardName(d)} ${keyPin(d)} button to enable sensor readings`;$('sampleStatus').textContent='Acquisition locked. No testbench sensors are being read.';}
  $('keyLamp').dataset.active=String(fresh&&d.smart_key===true);
  $('keyState').textContent=fresh?(d.smart_key?'On · '+keyPin(d):(d.frame==='U6'?'Off · Mega unpowered':'Off · press '+keyPin(d))):'Unavailable';
- $('declogLamp').dataset.active=String(fresh&&d.declog===true);
- $('declogState').textContent=fresh&&typeof d.declog_hz==='number'?d.declog_hz.toFixed(1)+' Hz · A9':fresh&&typeof d.declog==='boolean'?(d.declog?'On':'Off'):fresh?'n/a on '+boardName(d):'Unavailable';
- $('raceDeclog').textContent=fresh&&typeof d.declog_hz==='number'?'DECLOG '+d.declog_hz.toFixed(0)+' Hz':'DECLOG';
  const fault=live&&d.check_engine===true,dtcs=fault&&Array.isArray(d.dtc)?d.dtc:[];
  milFault=fault;milBlink=dtcs.length&&numeric(dtcs[0].blink)?dtcs[0].blink:0;
  const codes=dtcs.map(x=>x.code+' '+label(x.sensor)).join(', ');
  $('engineState').textContent=fault?(codes||'Fault'):live?'No fault':'Off';
  $('dtcLine').textContent=fault?'CHECK ENGINE  '+(codes||'Fault'):live?'NO DTC':'';$('dtcLine').classList.toggle('fault',fault);
- $('coolantLamp').dataset.active=String(live&&d.coolant_warning===true);
- $('coolantState').textContent=live?(d.coolant_warning?'Overheat · ≥105 °C':'Normal'):'Unavailable';
  const injected=live&&(d.injected_fault_mask||0)!==0;
  $('learnClosed').disabled=$('learnWot').disabled=!live||tpsRequestPending;
  if(!tpsRequestPending&&d&&numeric(d.tps_closed_raw)&&numeric(d.tps_wot_raw))$('tpsLearnStatus').textContent=`Learned endpoints · closed ${(d.tps_closed_raw*5/1023).toFixed(3)} V (ADC ${d.tps_closed_raw.toFixed(1)}) · wide-open ${(d.tps_wot_raw*5/1023).toFixed(3)} V (ADC ${d.tps_wot_raw.toFixed(1)})`;
@@ -262,7 +257,7 @@ function setRpmGauge(rpm,show){
  $('needle').setAttribute('transform',`rotate(${r/RPM_MAX*180} 200 205)`);
 }
 function syncRaceLamps(){
- for(const [race,classic] of [['raceKey','keyLamp'],['raceDeclog','declogLamp'],['raceEngine','engineLamp'],['raceCoolant','coolantLamp']]){const v=$(classic).dataset.active;if($(race).dataset.active!==v)$(race).dataset.active=v;}
+ for(const [race,classic] of [['raceKey','keyLamp'],['raceEngine','engineLamp']]){const v=$(classic).dataset.active;if($(race).dataset.active!==v)$(race).dataset.active=v;}
  const abs=$('absLamp').dataset.state;if($('raceAbs').dataset.state!==abs)$('raceAbs').dataset.state=abs;
 }
 function renderExtras(d,live,locked){
