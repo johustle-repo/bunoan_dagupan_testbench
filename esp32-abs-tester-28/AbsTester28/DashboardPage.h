@@ -4,7 +4,8 @@
 // Wi-Fi dashboard for the ABS tester, served from flash at http://192.168.4.1/.
 // Same layout as the 2.8" LCD: 0-250 km/h speedometer (red rear needle and
 // readout, green front needle), ABS / TCS / SENSOR warning lights, the REAR
-// speed bar with the DECLOG bar below it, REF1 and BATTERY tiles and KEY ON.
+// speed bar with the DECLOG bar below it, REF1 and BATTERY tiles and KEY ON
+// with the A2 / A3 / A4 pot generator settings.
 // Opens with a short splash like the LCD, then polls /api/live four times a
 // second; until live data arrives it shows the WAITING FOR NANO / NO LINK panel.
 // No external files or fonts: the hotspot has no internet.
@@ -58,9 +59,11 @@ background:var(--off);border:1px solid var(--offEdge);color:var(--offText);trans
 .tile strong{margin:auto 0;padding-bottom:10px;text-align:center;font-size:48px;font-weight:800;line-height:1}
 .tile strong small{font-size:.5em;font-weight:700}
 .tile strong em{font-style:normal;font-size:16px;font-weight:600;color:var(--muted);margin-left:4px}
-footer{display:flex;align-items:center;gap:10px;margin-top:12px;padding:10px 16px;font-size:15px;font-weight:700;letter-spacing:1px}
+footer{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-top:12px;padding:10px 16px;font-size:15px;font-weight:700;letter-spacing:1px}
 .dot{width:10px;height:10px;border-radius:50%;background:var(--dim)}
 .dot.on{background:var(--green);box-shadow:0 0 10px rgba(61,220,132,.7)}
+.gens{display:flex;flex-wrap:wrap;gap:6px 16px;margin-left:8px;font-weight:600;color:var(--muted)}
+.gens b{color:var(--accent);font-weight:700}
 .stamp{margin-left:auto;font-weight:500;font-size:12px;color:var(--muted);letter-spacing:.5px}
 .overlay{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:16px;
 background:rgba(5,8,13,.9);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);transition:opacity .4s}
@@ -114,7 +117,7 @@ background:rgba(5,8,13,.9);backdrop-filter:blur(4px);-webkit-backdrop-filter:blu
   <div class="panel tile" style="--c:var(--amber)"><span>BATTERY</span><strong class="num" id="battery">—</strong></div>
  </div>
 </div>
-<footer class="panel"><i class="dot" id="keyDot"></i><span id="keyText">KEY OFF</span><span class="stamp" id="stamp"></span></footer>
+<footer class="panel"><i class="dot" id="keyDot"></i><span id="keyText">KEY OFF</span><span class="gens" id="gens"></span><span class="stamp" id="stamp"></span></footer>
 </main>
 <div class="overlay" id="locked"><div class="panel">
  <svg class="absring" width="96" height="64" viewBox="-48 -32 96 64" aria-hidden="true" id="lockIcon" style="color:var(--amber)">
@@ -162,6 +165,9 @@ function show(d){
  $('lockText').textContent=live?'Flash the new Nano firmware':d.link==='stale'?'Check the Nano link':'Connecting to the ABS tester…';
  const c=live?'var(--amber)':'var(--red)';$('lockIcon').style.color=c;$('lockTitle').style.color=c;
  $('keyDot').className='dot'+(on?' on':'');$('keyText').textContent=on?'KEY ON':'KEY OFF';
+ // Pot generator settings (A2 / A3 / A4), when the Nano sends them.
+ const g=[d.gen_a2_hz,d.gen_a3_hz,d.gen_a4_hz];
+ $('gens').innerHTML=on&&g.every(v=>typeof v==='number')?g.map((v,i)=>`<span>A${i+2} <b>${i==2?v.toFixed(1):Math.round(v)}</b> Hz</span>`).join(''):'';
  if(!on)return;
  const v=clamp(d.speed_kmh),fv=d.front?clamp(d.front_speed_kmh):0;
  $('needle').style.transform=deg(v);

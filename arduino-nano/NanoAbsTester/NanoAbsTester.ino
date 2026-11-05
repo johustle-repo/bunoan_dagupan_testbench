@@ -17,17 +17,26 @@
 //   D13 TCS LED: steady when both speeds match (whole km/h), blinking otherwise
 //   D12 ABS LED: on when D7 is at least 10 % and 5 km/h slower than D8
 //   A0 Reference 1, A1 battery: 0-5 V at the pin mapped to 0-30 V
-//   (volts = pin volts / 5 x 30, the ECU testbench x6 formula), filtered. A2 / A3 unused.
+//   (volts = pin volts / 5 x 30, the ECU testbench x6 formula), filtered.
+//   No pot frequency generators in this version (the Mega 2560 Pro ABS tester,
+//   arduino-mega/MegaAbsTester, has them); A2-A4, D3, D9 and D10 are free.
 //   D5 (TX) -> ESP32 RX2 (GPIO16), common GND, 115200 8N1, one-way
 //   (SoftwareSerial; the USB Serial Monitor stays on the normal Serial port).
-// SoftwareSerial owns the pin-change interrupts, so Timer1 samples D2, D7 and
-// D8 at 20 kHz instead (up to about 10 kHz per input).
+// SoftwareSerial owns the pin-change interrupts, so Timer2 (compare A) samples
+// D2, D7 and D8 at 20 kHz instead (up to about 10 kHz per input).
 
 const byte TCS_LED = LED_BUILTIN;  // D13
 const byte ABS_LED = 12;
 
 const unsigned long TCS_BLINK_INTERVAL = 500;
-const unsigned long PUBLISH_MS = 250;
+// Speeds and Declog are measured every 100 ms and sent to the ESP32 10 times
+// a second, so the gauges follow the pots without lag. REF1 / battery are
+// read 4 times a second (each read takes about 13 ms); the Serial Monitor
+// report stays once a second.
+const unsigned long MEASURE_US = 100000UL;
+const unsigned long PUBLISH_MS = 100;
+const unsigned long VOLTS_MS = 250;
+const unsigned long REPORT_MS = 1000;
 
 #define D7_HIGH() ((PIND & _BV(PD7)) != 0)
 #define D8_HIGH() ((PINB & _BV(PB0)) != 0)
@@ -40,12 +49,12 @@ volatile unsigned long pulseCount3 = 0;  // D2 Declog.
 volatile bool previousHigh1 = false;
 volatile bool previousHigh2 = false;
 volatile bool previousHigh3 = false;
-volatile bool acquisitionEnabled = true;
+volatile unsigned long lastEdgeUs[3] = {0, 0, 0};  // micros() of the latest rising edge (D7, D8, D2).
 
 unsigned long windowStartUs = 0;
-unsigned long serialPauseUs = 0;
 unsigned long lastTcsBlink = 0;
-unsigned long lastPublish = 0;
+unsigned long lastPublish = 0, lastVoltsMs = 0, lastReportMs = 0;
+unsigned int voltsMv[2] = {0, 0};  // REF1, battery, as sent to the ESP32.
 
 bool speedsEqual = true;
 bool tcsLedState = true;
@@ -84,14 +93,23 @@ bool filterStarted[2] = {false, false};
 const uint8_t inputPins[2] = {A0, A1};          // REF1 A0, battery A1.
 
 SoftwareSerial esp(6, 5);  // RX D6 (unused), TX D5 -> ESP32 GPIO16.
-char linkBuffer[96];
+char linkBuffer[128];
 
-// D7: Speed 1 and RPM, D8: Speed 2, D2: Declog. Rising edges, sampled at 20 kHz.
-ISR(TIMER1_COMPA_vect) {
+// D7: Speed 1 and RPM, D8: Speed 2, D2: Declog. Rising edges, sampled at 20 kHz:
+// Timer2 runs free at 500 kHz, so each sample
+// moves compare A on by 25 ticks (50 us).
+ISR(TIMER2_COMPA_vect) {
+  uint8_t next = OCR2A + 25;
+  if (uint8_t(next - TCNT2 - 1) > 24) next = TCNT2 + 2;  // Held off (SoftwareSerial byte): resume now.
+  OCR2A = next;
   const bool high1 = D7_HIGH(), high2 = D8_HIGH(), high3 = D2_HIGH();
-  if (acquisitionEnabled && high1 && !previousHigh1) pulseCount1++;
-  if (acquisitionEnabled && high2 && !previousHigh2) pulseCount2++;
-  if (acquisitionEnabled && high3 && !previousHigh3) pulseCount3++;
+  const bool rise1 = high1 && !previousHigh1, rise2 = high2 && !previousHigh2, rise3 = high3 && !previousHigh3;
+  if (rise1 || rise2 || rise3) {
+    const unsigned long nowUs = micros();
+    if (rise1) { pulseCount1++; lastEdgeUs[0] = nowUs; }
+    if (rise2) { pulseCount2++; lastEdgeUs[1] = nowUs; }
+    if (rise3) { pulseCount3++; lastEdgeUs[2] = nowUs; }
+  }
   previousHigh1 = high1;
   previousHigh2 = high2;
   previousHigh3 = high3;
@@ -122,11 +140,14 @@ float readInput(uint8_t i) {
 // speed 2 x100, RPM, TCS (1 steady, 0 blinking), ABS (1 active), D2 Declog
 // Hz x100, then an XOR checksum of everything before '*'. The ESP32 shows
 // these values as they are.
+void readVolts() {
+  for (uint8_t i = 0; i < 2; i++) voltsMv[i] = unsigned(readInput(i) * 1000 + 0.5);
+  ref1V = voltsMv[0] / 1000.0;
+  batteryV = voltsMv[1] / 1000.0;
+}
+
 void sendFrame() {
-  unsigned int mv[2];
-  for (uint8_t i = 0; i < 2; i++) mv[i] = unsigned(readInput(i) * 1000 + 0.5);
-  ref1V = mv[0] / 1000.0;
-  batteryV = mv[1] / 1000.0;
+  const unsigned int* mv = voltsMv;
   const int count = snprintf(linkBuffer, sizeof(linkBuffer), "A1,1,0,%lu,%u,%u,0,0,%u,%lu,%u,%u,%u,%u,%lu",
     (unsigned long)(frequencyHz1 * 100 + 0.5), unsigned(speed1 * 100 + 0.5), mv[0], mv[1],
     (unsigned long)(frequencyHz2 * 100 + 0.5), unsigned(speed2 * 100 + 0.5),
@@ -136,21 +157,31 @@ void sendFrame() {
   uint8_t checksum = 0;
   for (int i = 0; i < count; i++) checksum ^= uint8_t(linkBuffer[i]);
   snprintf(linkBuffer + count, sizeof(linkBuffer) - count, "*%02X\n", checksum);
-  // SoftwareSerial TX blocks interrupts (about 6 ms per frame), so Timer1
-  // can't sample D2 / D7 / D8 meanwhile; that time is left out of the window.
-  unsigned long pauseStart;
-  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-    acquisitionEnabled = false;
-    pauseStart = micros();
-  }
+  // SoftwareSerial holds interrupts off for one byte at a time (about 87 us),
+  // shorter than a half period up to about 5 kHz, so the sampler (which
+  // catches up after each byte) keeps counting through the frame.
   esp.write(reinterpret_cast<const uint8_t*>(linkBuffer), count + 4);
-  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-    serialPauseUs += micros() - pauseStart;
-    previousHigh1 = D7_HIGH();
-    previousHigh2 = D8_HIGH();
-    previousHigh3 = D2_HIGH();
-    acquisitionEnabled = true;
+}
+
+// Reciprocal frequency: the edges counted since the previous window's last
+// edge, divided by the time between that edge and this window's last edge.
+// That spans whole periods, so the reading doesn't jump by a count
+// (+-10 Hz on a 100 ms window) from window to window; the error is the 50 us
+// sampling step over the ~100 ms span (about +-1 Hz at 2000 Hz, 0.2 km/h). With no edge in a window the
+// last value is held for up to 2.5 s (slow signals), then it drops to 0.
+float measureHz(uint8_t i, unsigned long pulses, unsigned long edgeUs, unsigned long nowUs, unsigned long elapsedUs) {
+  static unsigned long prevEdgeUs[3];
+  static bool prevValid[3] = {false, false, false};
+  static float lastHz[3] = {0, 0, 0};
+  if (pulses == 0) {
+    if (!prevValid[i] || nowUs - prevEdgeUs[i] > 2500000UL) { prevValid[i] = false; lastHz[i] = 0; }
+    return lastHz[i];
   }
+  const unsigned long spanUs = edgeUs - prevEdgeUs[i];
+  lastHz[i] = prevValid[i] && spanUs ? pulses * 1000000.0f / spanUs : pulses * 1000000.0f / elapsedUs;
+  prevEdgeUs[i] = edgeUs;
+  prevValid[i] = true;
+  return lastHz[i];
 }
 
 void setup() {
@@ -173,12 +204,16 @@ void setup() {
     previousHigh1 = D7_HIGH();
     previousHigh2 = D8_HIGH();
     previousHigh3 = D2_HIGH();
-    TCCR1A = 0;
-    TCCR1B = _BV(WGM12) | _BV(CS11);
-    OCR1A = 99;  // 16 MHz / 8 / 100 = 20 kHz.
-    TCNT1 = 0;
-    TIFR1 = _BV(OCF1A);
-    TIMSK1 |= _BV(OCIE1A);
+    // Timer2 free-running in normal mode at 500 kHz (/32) for the sampler.
+    // analogWrite() on D3 / D11 and tone() can't be used; Timer1 (D9 / D10)
+    // is left as Arduino set it up.
+    TIMSK2 = 0;
+    TCCR2A = 0;
+    TCCR2B = _BV(CS21) | _BV(CS20);
+    TCNT2 = 0;
+    OCR2A = TCNT2 + 25;      // 16 MHz / 32 / 25 = 20 kHz.
+    TIFR2 = _BV(OCF2A);
+    TIMSK2 |= _BV(OCIE2A);
     windowStartUs = micros();
   }
 
@@ -188,12 +223,11 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  if (micros() - windowStartUs >= 1000000UL) {
-    unsigned long pulses1, pulses2, pulses3, elapsedUs;
+  if (micros() - windowStartUs >= MEASURE_US) {
+    unsigned long pulses1, pulses2, pulses3, elapsedUs, nowUs, edge[3];
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-      const unsigned long nowUs = micros();
-      elapsedUs = nowUs - windowStartUs - serialPauseUs;
-      serialPauseUs = 0;
+      nowUs = micros();
+      elapsedUs = nowUs - windowStartUs;
       windowStartUs = nowUs;
       pulses1 = pulseCount1;
       pulses2 = pulseCount2;
@@ -201,11 +235,12 @@ void loop() {
       pulseCount1 = 0;
       pulseCount2 = 0;
       pulseCount3 = 0;
+      for (uint8_t i = 0; i < 3; i++) edge[i] = lastEdgeUs[i];
     }
 
-    frequencyHz1 = elapsedUs ? pulses1 * 1000000.0 / elapsedUs : 0;
-    frequencyHz2 = elapsedUs ? pulses2 * 1000000.0 / elapsedUs : 0;
-    declogHz = elapsedUs ? pulses3 * 1000000.0 / elapsedUs : 0;
+    frequencyHz1 = measureHz(0, pulses1, edge[0], nowUs, elapsedUs);
+    frequencyHz2 = measureHz(1, pulses2, edge[1], nowUs, elapsedUs);
+    declogHz = measureHz(2, pulses3, edge[2], nowUs, elapsedUs);
 
     float rawSpeed1 = frequencyHz1 / 6.0;
     float rawSpeed2 = frequencyHz2 / 6.0;
@@ -233,6 +268,16 @@ void loop() {
       ((rawSpeed2 - rawSpeed1) >= 5.0);
 
     digitalWrite(ABS_LED, absActive ? HIGH : LOW);
+  }
+
+  if (now - lastVoltsMs >= VOLTS_MS || lastVoltsMs == 0) {
+    lastVoltsMs = now;
+    readVolts();
+  }
+
+  // USB Serial Monitor report, once a second.
+  if (now - lastReportMs >= REPORT_MS) {
+    lastReportMs = now;
 
     Serial.print("D7 Frequency: ");
     Serial.print(frequencyHz1, 1);
@@ -278,7 +323,7 @@ void loop() {
     Serial.println();
   }
 
-  // ESP32 link, 4 times a second.
+  // ESP32 link, 10 times a second.
   if (now - lastPublish >= PUBLISH_MS) {
     lastPublish = now;
     sendFrame();
