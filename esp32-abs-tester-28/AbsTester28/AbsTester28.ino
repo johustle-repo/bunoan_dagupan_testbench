@@ -33,7 +33,8 @@ bool discardFrame = false;
 bool havePacket = false;
 uint32_t lastPacketMs = 0, badFrames = 0, lastSerialReportMs = 0, bytesReceived = 0;
 AbsData latest{};
-uint8_t page = 1;  // LCD page: swipe left -> 2, swipe right -> 1.
+uint8_t page = 1;  // LCD page, 1-3: the Mega's A5 page pot, or swipe left (next) / right (previous).
+uint32_t frameCount = 0;  // Good frames so far (the page pot is read once per frame).
 AbsLamp absLamp;   // ABS light (switch-on check from the rear speed), LCD and JSON.
 
 bool parseFrame(char* text) {
@@ -47,11 +48,11 @@ bool parseFrame(char* text) {
   *star = '\0';
   if (strncmp(text, "A1,", 3) != 0) return false;
   // 8 fields (oldest Nano), 10 (+ front sensor), 13 (+ RPM, TCS, ABS), 14 (+ Declog Hz)
-  // or 17 (+ the three pot generator settings).
-  constexpr uint8_t MIN_FIELDS = 8, FRONT_FIELDS = 10, LAMP_FIELDS = 13, DECLOG_FIELDS = 14, MAX_FIELDS = 17;
+  // 17 (+ the three pot generator settings) or 19 (+ the Mega's A5 page pot reading 0-1023 and page 1-3).
+  constexpr uint8_t MIN_FIELDS = 8, FRONT_FIELDS = 10, LAMP_FIELDS = 13, DECLOG_FIELDS = 14, GEN_FIELDS = 17, MAX_FIELDS = 19;
   // REF1 and battery: up to 30 V (0-30 V dividers, as on the ECU testbench).
   constexpr unsigned long maximum[MAX_FIELDS] = {1, 1, 100000000UL, 25000, 31000, 5500, 10500, 31000, 100000000UL, 25000,
-                                                 15000, 1, 1, 100000000UL, 250000, 250000, 25000};
+                                                 15000, 1, 1, 100000000UL, 250000, 250000, 25000, 1023, 3};
   unsigned long values[MAX_FIELDS];
   uint8_t parsed = 0;
   char* p = text + 3;
@@ -61,7 +62,7 @@ bool parseFrame(char* text) {
     if (values[i] > maximum[i]) return false;
     parsed = i + 1;
     if (!*end && (parsed == MIN_FIELDS || parsed == FRONT_FIELDS || parsed == LAMP_FIELDS ||
-                    parsed == DECLOG_FIELDS || parsed == MAX_FIELDS)) break;
+                    parsed == DECLOG_FIELDS || parsed == GEN_FIELDS || parsed == MAX_FIELDS)) break;
     if (*end != ',' || parsed == MAX_FIELDS) return false;
     p = end + 1;
   }
@@ -79,8 +80,12 @@ bool parseFrame(char* text) {
   latest.tcsSteady = latest.nanoLamps && values[11] == 1;
   latest.absActive = latest.nanoLamps && values[12] == 1;
   latest.declogHz = parsed >= DECLOG_FIELDS ? values[13] / 100.0f : 0;
-  latest.gens = parsed == MAX_FIELDS;
+  latest.gens = parsed >= GEN_FIELDS;
   for (uint8_t i = 0; i < 3; ++i) latest.genHz[i] = latest.gens ? values[14 + i] / 100.0f : 0;
+  latest.pagePot = parsed == MAX_FIELDS && values[18] >= 1;
+  latest.potRaw = latest.pagePot ? values[17] : 0;
+  latest.potPage = latest.pagePot ? values[18] : 0;
+  ++frameCount;
   lastPacketMs = millis();
   havePacket = true;
   return true;
@@ -123,6 +128,32 @@ String liveJson() {
   json += '}';
   return json;
 }
+
+// Pages 1-3, wrapping round.
+inline uint8_t wrapPage(int p) {
+  const int n = absDisplay::PAGE_COUNT;
+  return uint8_t(((p - 1) % n + n) % n + 1);
+}
+
+// Page navigation with the Mega's A5 page pot: the Mega splits the 0-1023
+// reading into pages (0-341 page 1, 342-682 page 2, 683-1023 page 3) and
+// sends the page in every frame. The screen goes to that page whenever the
+// pot's page changes, and when the link (re)starts. A swipe still changes the
+// page in between; it holds until the pot is turned into another page.
+struct PagePotFollow {
+  uint8_t lastPotPage = 0;  // 0 = not seen yet (or link lost).
+  uint32_t seenFrame = 0;
+
+  void update(bool fresh) {
+    if (!fresh || !latest.pagePot) { lastPotPage = 0; return; }
+    if (frameCount == seenFrame) return;
+    seenFrame = frameCount;
+    if (latest.potPage == lastPotPage) return;
+    lastPotPage = latest.potPage;
+    page = latest.potPage;
+    Serial.print(F("# PAGE POT A5 ")); Serial.print(latest.potRaw); Serial.print(F(" -> page ")); Serial.println(page);
+  }
+} pagePotFollow;
 
 void setup() {
   Serial.begin(115200);
@@ -205,10 +236,11 @@ void loop() {
   // (the next start begins with it on).
   if (fresh) absLamp.update(latest.speedKmh); else absLamp.reset();
   d.absLamp = absLamp.on;
-  // Swipe left: page 2, swipe right: page 1.
+  pagePotFollow.update(fresh);
+  // Swipe left: next page, swipe right: previous page.
   const int8_t s = absDisplay::swipe();
   if (s) {
-    if (s < 0) page = 2; else page = 1;
+    page = wrapPage(page - s);
     Serial.print(F("# SWIPE ")); Serial.print(s < 0 ? F("left") : F("right"));
     Serial.print(F(" (raw dx ")); Serial.print(absDisplay::lastSwipeDx); Serial.print(F(", dy "));
     Serial.print(absDisplay::lastSwipeDy); Serial.print(F(") -> page ")); Serial.println(page);

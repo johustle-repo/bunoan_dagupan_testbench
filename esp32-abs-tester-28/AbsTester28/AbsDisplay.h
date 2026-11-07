@@ -13,7 +13,10 @@
 //           each with its speed bar below.
 //   Page 2: one 0-2000 Hz gauge for the ESP32's own frequency input (GPIO32)
 //           and the DECLOG bar (the Nano's D2, 0-100 Hz shown as 0-100 %).
-//   Footer (both pages): ABS light | page dots | TCS light.
+//   Page 3: placeholder.
+//   Footer (all pages): PAGE n/3 | ABS light | page dots | TCS light | page name.
+// Page change: the Mega's A5 page pot (0-341 page 1, 342-682 page 2,
+// 683-1023 page 3), or a swipe left / right on the touchscreen.
 // Page 1 needs the Nano (WAITING FOR MEGA / NO LINK until data arrives, then
 // the switch-on self-test); page 2 works without it (DECLOG then shows --).
 // Touch: the XPT2046 shares the display's SPI bus (T_CLK 18, T_DIN 23,
@@ -53,6 +56,9 @@ struct AbsData {
   bool gens;                     // Frame carries the Nano's pot generator settings.
   float genHz[3];                // Mega pots: rear A1 -> D44, front A0 -> D3 (0-1500 Hz), Declog A2 -> D11 (0-100 Hz).
   float inputHz;                 // ESP32 GPIO32 frequency input (page 2), measured here.
+  bool pagePot;                  // Frame carries the Mega's A5 page pot.
+  uint16_t potRaw;               // A5 reading, 0-1023.
+  uint8_t potPage;               // Page picked by the pot, 1-3.
   bool absLamp;                  // ABS light, from AbsLamp.
 };
 
@@ -125,6 +131,11 @@ constexpr int DY = 183, DH = 36;                 // DECLOG panel.
 // Footer (both pages): ABS light | page dots | TCS light.
 constexpr int DOTS_X = 140, DOTS_Y = 222, DOTS_W = 40, DOTS_H = 16;
 constexpr int LAMP_X[2] = {88, 188}, LAMP_W = 44, LAMP_H = 16, LAMP_Y = 222;
+constexpr int NAV_X = 6, NAME_X = 234, NAV_W = 80;   // Footer: "PAGE 1/3" left, page name right.
+constexpr uint8_t PAGE_COUNT = 3;
+const char* const PAGE_NAMES[PAGE_COUNT] = {"SPEED", "INPUT", "PAGE 3"};
+// Page 3 (placeholder for now).
+constexpr int P3X = 4, P3Y = 37, P3W = 312, P3H = 182;
 
 const char* const TOP_LABELS[2] = {"REF1", "BAT"};
 const uint16_t TOP_ACCENTS[2] = {ACCENT, AMBER};
@@ -140,9 +151,9 @@ uint16_t scratch[SCRATCH_PX];
 // then drawn again with every gauge frame.
 uint16_t* dialBg = nullptr;
 
-enum Mode : uint8_t { NONE, LOCKED, PAGE1, PAGE2 } mode = NONE;
+enum Mode : uint8_t { NONE, LOCKED, PAGE1, PAGE2, PAGE3 } mode = NONE;
 uint8_t dialFor = 0;  // Page whose dial is in dialBg (0 = none).
-enum Slot : uint8_t { S_TOP0, S_TOP1, S_LAMPS, S_DOTS, S_BAR0, S_BAR1, S_DECLOG, S_LOCK, SLOT_COUNT };
+enum Slot : uint8_t { S_TOP0, S_TOP1, S_LAMPS, S_DOTS, S_BAR0, S_BAR1, S_DECLOG, S_LOCK, S_PAGE3, SLOT_COUNT };
 char shown[SLOT_COUNT][40];
 uint32_t lastGaugeMs = 0, lastTextMs = 0, selfTestStartMs = 0;
 bool selfTestActive = false;
@@ -262,18 +273,46 @@ void drawLamps(const bool lit[2]) {
   }
 }
 
-void drawDots(uint8_t page) {
+// Page navigation in the footer: "PAGE 1/3" at the left, the page name at
+// the right and one dot per page (the shown page in cyan). While the knob is
+// selecting (sel 1-3), the left reads "SELECT 2/3" in amber, the right names
+// the page that a press will lock, and that page's dot blinks amber.
+void drawNav(uint8_t page, uint8_t sel, bool blinkOn) {
+  const bool selecting = sel != 0;
+  const uint8_t target = selecting ? sel : page;
+  char s[16];
+  snprintf(s, sizeof(s), "%s %u/%u", selecting ? "SELECT" : "PAGE", target, PAGE_COUNT);
+  render(NAV_X, DOTS_Y, NAV_W, DOTS_H, [&](aa::Buf& b) {
+    aa::fill(b, BG);
+    aa::text(b, aaSmall, s, NAV_X, DOTS_Y + 12, selecting ? AMBER : MUTED, aa::LEFT, 1);
+  });
+  render(NAME_X, DOTS_Y, NAV_W, DOTS_H, [&](aa::Buf& b) {
+    aa::fill(b, BG);
+    aa::text(b, aaSmall, PAGE_NAMES[target - 1], NAME_X + NAV_W, DOTS_Y + 12, selecting ? AMBER : MUTED, aa::RIGHT, 1);
+  });
   render(DOTS_X, DOTS_Y, DOTS_W, DOTS_H, [&](aa::Buf& b) {
     aa::fill(b, BG);
     const float cy = DOTS_Y + DOTS_H / 2.0f;
-    aa::circle(b, 154, cy, 3, page == 1 ? ACCENT : DIM);
-    aa::circle(b, 166, cy, 3, page == 2 ? ACCENT : DIM);
+    for (uint8_t p = 1; p <= PAGE_COUNT; ++p) {
+      const float cx = DOTS_X + DOTS_W / 2.0f + (p - (PAGE_COUNT + 1) / 2.0f) * 12;
+      if (selecting && p == sel) {
+        aa::circle(b, cx, cy, 5, blinkOn ? AMBER : aa::mix(BG, AMBER, 80));
+        if (p == page) aa::circle(b, cx, cy, 2, ACCENT);
+      } else aa::circle(b, cx, cy, 3, p == page ? ACCENT : DIM);
+    }
   });
 }
 
-// REF1 / BAT, the ABS / TCS lights (TCS blinks at 2 Hz; the self-test lights
-// both) and the page dots. Without live data both lights stay off.
-void topRow(const AbsData& d, uint8_t page, bool live, bool selfTest) {
+void navFooter(uint8_t page, uint8_t sel) {
+  const bool blinkOn = (millis() / 250) % 2;
+  char key[16];
+  snprintf(key, sizeof(key), "%u %u %d", page, sel, sel && blinkOn);
+  if (changed(S_DOTS, key)) drawNav(page, sel, blinkOn);
+}
+
+// REF1 / BAT and the ABS / TCS lights (TCS blinks at 2 Hz; the self-test
+// lights both). Without live data both lights stay off.
+void topRow(const AbsData& d, bool live, bool selfTest) {
   char key[16];
   for (uint8_t i = 0; i < 2; ++i) {
     const float v = i ? d.batteryV : d.ref1V;
@@ -284,8 +323,6 @@ void topRow(const AbsData& d, uint8_t page, bool live, bool selfTest) {
   const bool lit[2] = {live && (selfTest || d.absLamp), live && (selfTest || (tcsBlinking(d) && blinkOn))};
   snprintf(key, sizeof(key), "%d%d", lit[0], lit[1]);
   if (changed(S_LAMPS, key)) drawLamps(lit);
-  snprintf(key, sizeof(key), "%u", page);
-  if (changed(S_DOTS, key)) drawDots(page);
 }
 
 // ---- Page 1: REAR and FRONT speedometers ----
@@ -438,7 +475,7 @@ void lockedText(const AbsData& d) {
     aa::text(b, aaValue, line, W / 2, 144, color, aa::CENTER, 1);
     aa::text(b, aaLabel, live ? "Flash the new Mega firmware" : "Check the Mega link", W / 2, 166, MUTED,
              aa::CENTER);
-    aa::text(b, aaSmall, "Swipe left: page 2 (GPIO32 input)", W / 2, 186, DIM, aa::CENTER, 1);
+    aa::text(b, aaSmall, "Page pot A5: turn to change page", W / 2, 186, DIM, aa::CENTER, 1);
     aa::text(b, aaSmall, "Wi-Fi ABS-Tester  |  192.168.4.1", W / 2, 201, DIM, aa::CENTER, 1);
   });
 }
@@ -560,18 +597,30 @@ inline float ease(float& shownV, float target, float snap) {
   return shownV;
 }
 
-// Call every loop. page: 1 or 2.
-void update(const AbsData& d, uint8_t page) {
+// Page 3: a placeholder until its content is designed.
+void drawPage3() {
+  render(P3X, P3Y, P3W, P3H, [](aa::Buf& b) {
+    aa::fill(b, BG);
+    panel(b, P3X, P3Y, P3W, P3H, 10);
+    aa::text(b, aaValue, "PAGE 3", W / 2, P3Y + 80, TEXT, aa::CENTER, 1);
+    aa::text(b, aaLabel, "Free page for new readings", W / 2, P3Y + 104, MUTED, aa::CENTER);
+    aa::text(b, aaSmall, "Turn the page pot (A5) to change page", W / 2, P3Y + 150, DIM, aa::CENTER, 1);
+  });
+}
+
+// Call every loop. page: 1-3; sel: the page the knob is pointing at while
+// selecting, 0 when not selecting.
+void update(const AbsData& d, uint8_t page, uint8_t sel = 0) {
   const uint32_t now = millis();
   const bool running = d.link == AbsData::LIVE && d.keyOn;
-  const Mode want = page == 2 ? PAGE2 : running ? PAGE1 : LOCKED;
+  const Mode want = page == 3 ? PAGE3 : page == 2 ? PAGE2 : running ? PAGE1 : LOCKED;
   if (want != mode) {
     // The switch-on self-test runs when page 1 comes up with live data after
     // the waiting / no link screen (not when coming back from page 2).
     if (want == PAGE1 && (mode == LOCKED || mode == NONE)) { selfTestActive = true; selfTestStartMs = now; }
     if (want != PAGE1) selfTestActive = false;
     clearScreen();
-    if (want != LOCKED) cacheDial(want == PAGE1 ? 1 : 2);
+    if (want == PAGE1 || want == PAGE2) cacheDial(want == PAGE1 ? 1 : 2);
     mode = want;
     lastGaugeMs = lastTextMs = 0;
   }
@@ -579,7 +628,7 @@ void update(const AbsData& d, uint8_t page) {
   if (selfTestActive && (!running || testMs >= SELF_TEST_MS)) selfTestActive = false;
   const bool selfTest = selfTestActive;
 
-  if (mode != LOCKED && now - lastGaugeMs >= GAUGE_REFRESH_MS) {
+  if ((mode == PAGE1 || mode == PAGE2) && now - lastGaugeMs >= GAUGE_REFRESH_MS) {
     lastGaugeMs = now;
     if (mode == PAGE1) {
       const float sweep = sinf(PI * testMs / SELF_TEST_MS) * ABS_SPEED_MAX;  // Self-test: 0 -> 250 -> 0.
@@ -605,9 +654,12 @@ void update(const AbsData& d, uint8_t page) {
 
   if (now - lastTextMs < TEXT_REFRESH_MS) return;
   lastTextMs = now;
+  navFooter(page, sel);
   if (mode == LOCKED) { lockedText(d); return; }
-  topRow(d, page, running, selfTest);
-  if (mode == PAGE1) {
+  topRow(d, running, selfTest);
+  if (mode == PAGE3) {
+    if (changed(S_PAGE3, "3")) drawPage3();
+  } else if (mode == PAGE1) {
     AbsData bars = d;
     if (selfTest) { bars.speedKmh = bars.frontKmh = sinf(PI * testMs / SELF_TEST_MS) * ABS_SPEED_MAX; bars.front = true; }
     page1Text(bars);

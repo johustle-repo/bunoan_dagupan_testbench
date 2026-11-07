@@ -48,3 +48,7 @@ Serial link, no divider: Nano D5 (SoftwareSerial TX) → ESP32 RX2 (GPIO16), com
 
 ## Board settings
 ESP32 Dev Module, Flash Frequency 40MHz, Flash Mode DIO, Upload Speed 115200, ESP32 core 2.0.17. If upload reports "Wrong boot mode", hold BOOT, tap EN, release BOOT and retry.
+
+## Page navigation (page pot on the Mega's A5)
+
+Three pages: 1 SPEED (front / rear speedometers), 2 INPUT (GPIO32 gauge and DECLOG), 3 (placeholder for now). The Mega reads a 10 kΩ pot on A5 and splits 0–1023 into the pages: **0–341 → page 1, 342–682 → page 2, 683–1023 → page 3**. The screen jumps to the pot's page whenever that changes (and when the Mega link starts). Swipes still work (left = next page, right = previous) and hold until the pot is turned into another page. The footer shows `PAGE n/3` at the left and the page name at the right. Page changes are logged on the USB serial monitor (`# PAGE POT A5 … -> page n`). The pot reading and page arrive as two extra fields at the end of the `A1` frame; older sender firmware without them still works (swipe only).

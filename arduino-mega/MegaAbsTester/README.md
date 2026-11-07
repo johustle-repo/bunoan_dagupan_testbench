@@ -23,6 +23,7 @@ What changed from the Nano: the ESP32 link uses the Mega's **hardware Serial1 (T
 | D3 | Generator 2 output, 0–1500 Hz square wave (set by A0) | Jumper to D8 to test speed 2 |
 | A2 | Declog pot (PTV09 10 kΩ), wired like A1 | Sets D11 |
 | D11 | Generator 3 output, 0–100 Hz square wave (set by A2) | Jumper to D2 to test Declog |
+| A5 | Page pot (10 kΩ): ends to 5V / GND, wiper to A5 | Page navigator for the ESP32 screen |
 | 5V, GND | Testbench 5 V and GND (and the ESP32 GND) | |
 
 **Generators** (`PotGenerator.h`): each pot turned fully down stops its output LOW; the Serial Monitor shows the three output frequencies. Each output has its own 16-bit timer (D44 Timer5, D3 Timer3, D11 Timer1), so the waves are made entirely in hardware and stay exact while the frames are sent. Pot reading: every 100 ms each pot takes 20 `analogRead`s 50 µs apart, averages them and maps 0–1023 to 0–1500 Hz (A1, A0) or 0–100 Hz (A2) in whole Hz with `map()`.
@@ -59,3 +60,7 @@ Battery (A4): 13.80 V (pin 2.38 V)
 | GND | GND |
 
 115200 baud 8N1, one-way, 10 frames a second. The Mega's TX is 5 V and ESP32 pins are rated 3.3 V; the 1 kΩ series resistor limits the current (for full protection use a divider instead: TX1 → 1 kΩ → GPIO16 → 2 kΩ → GND). The `A1` frame carries key (1), brake (0), D7 Hz, speed 1, REF1, REF2 (0), current (0), battery, D8 Hz, speed 2, RPM, TCS (1 steady / 0 blinking), ABS (1 active), Declog Hz and the rear (A1) / front (A0) / Declog (A2) pot generator outputs (D44 / D3 / D11, Hz ×100; same slots as before, so the ESP32 still labels them by the old pins. Shown as A2 / A3 / A4 in the ESP32's JSON, dashboard footer and USB serial line), with an XOR checksum. The ESP32's 2.8" screen still says WAITING FOR NANO until the first frame arrives; that's only the label.
+
+## Page pot on A5 (page navigator)
+
+Wiring: pot ends → 5V and GND, wiper → A5 (`PagePot.h`). Every 50 ms the Mega averages 8 `analogRead`s and picks the page: **0–341 → page 1, 342–682 → page 2, 683–1023 → page 3**. Near a boundary the page only changes once the reading is 8 counts past it, so a pot left on the line doesn't flick between pages (`HYSTERESIS` in `PagePot.h`). The reading (0–1023) and the page (1–3) go at the end of the `A1` frame; the ESP32 switches to that page whenever the pot's page changes. The Serial Monitor report shows `Page pot (A5): … -> page n`.
