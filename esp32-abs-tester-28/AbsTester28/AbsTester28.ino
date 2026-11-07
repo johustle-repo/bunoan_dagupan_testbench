@@ -11,12 +11,12 @@
 //   key, brake, D7 rear frequency x100, rear speed x100, REF1 / REF2 mV,
 //   current mA, battery mV, D8 front frequency x100, front speed x100, RPM,
 //   TCS (1 steady, 0 blinking), ABS (1 active), D2 Declog Hz x100 and the
-//   A2 / A3 / A4 pot generator settings in Hz x100. Older
+//   rear / front / Declog pot generator settings in Hz x100. Older
 //   firmware stops after the battery, the front speed, ABS or Declog. REF2 and
 //   current are not wired (sent as 0) and are ignored.
 // Speed 1 (rear), speed 2 (front), RPM, TCS and ABS are shown exactly as the
 // Nano works them out (speed = Hz / 6 km/h, RPM = D7 Hz x 15000 / 1560).
-// Nano D5 (SoftwareSerial TX) -> ESP32 RX2 (GPIO16), common GND,
+// Mega TX1 (D18) or Nano D5 (SoftwareSerial TX) -> ESP32 RX2 (GPIO16), common GND,
 // 115200 baud 8N1 on hardware UART2. Only lines starting with "A1," are used.
 // Wi-Fi hotspot with the dashboard at http://192.168.4.1/ and the readings
 // as JSON at /api/live.
@@ -109,7 +109,8 @@ String liveJson() {
   json += F(",\"input_hz\":"); json += String(freqInput::hz, 1);
   json += F(",\"page\":"); json += page;
   // Pot generator settings (null with older Nano firmware).
-  const char* const GEN_KEYS[3] = {",\"gen_a2_hz\":", ",\"gen_a3_hz\":", ",\"gen_a4_hz\":"};
+  // Mega: rear pot A1 -> D44, front pot A0 -> D3, Declog pot A2 -> D11.
+  const char* const GEN_KEYS[3] = {",\"gen_rear_hz\":", ",\"gen_front_hz\":", ",\"gen_declog_hz\":"};
   for (uint8_t i = 0; i < 3; ++i) { json += GEN_KEYS[i]; json += latest.gens ? String(latest.genHz[i], 1) : String("null"); }
   // Warning lights, the same as the LCD: ABS "on" / "off", TCS "flash" / "off",
   // SENSOR (web only) "ok" / "on" / "off".
@@ -140,7 +141,7 @@ void setup() {
     server.send(200, "application/json", liveJson());
   });
   server.begin();
-  Serial.println(F("ABS tester (2.8\") ready. Nano link on GPIO16 (RX2), 115200 baud."));
+  Serial.println(F("ABS tester (2.8\") ready. Mega link (TX1, D18) on GPIO16 (RX2), 115200 baud."));
   Serial.print(F("Wi-Fi: ")); Serial.print(AP_SSID); Serial.print(F(" / ")); Serial.print(AP_PASSWORD);
   Serial.print(F(" | dashboard: http://")); Serial.print(WiFi.softAPIP()); Serial.println('/');
 }
@@ -177,22 +178,22 @@ void loop() {
       if (latest.front) {
         Serial.print(latest.frontHz, 1); Serial.print(F(" Hz = "));
         Serial.print(latest.frontKmh, 1); Serial.print(F(" km/h"));
-      } else Serial.print(F("n/a (old Nano firmware)"));
+      } else Serial.print(F("n/a (old sender firmware)"));
       Serial.print(F(" | DECLOG D2 ")); Serial.print(latest.declogHz, 1);
       Serial.print(F(" Hz | REF1 ")); Serial.print(latest.ref1V, 2);
       Serial.print(F(" V | BATTERY ")); Serial.print(latest.batteryV, 2);
       if (latest.gens) {
-        Serial.print(F(" V | POT A2 ")); Serial.print(latest.genHz[0], 0);
-        Serial.print(F(" Hz, A3 ")); Serial.print(latest.genHz[1], 0);
-        Serial.print(F(" Hz, A4 ")); Serial.print(latest.genHz[2], 1); Serial.print(F(" Hz"));
+        Serial.print(F(" V | POT REAR ")); Serial.print(latest.genHz[0], 0);
+        Serial.print(F(" Hz, FRONT ")); Serial.print(latest.genHz[1], 0);
+        Serial.print(F(" Hz, DECLOG ")); Serial.print(latest.genHz[2], 0); Serial.print(F(" Hz"));
       } else Serial.print(F(" V"));
       Serial.print(F(" | INPUT GPIO32 ")); Serial.print(freqInput::hz, 1);
       Serial.print(F(" Hz | bad frames ")); Serial.println(badFrames);
     } else {
-      Serial.print(F("# NO DATA from the Nano: ")); Serial.print(bytesReceived);
+      Serial.print(F("# NO DATA from the Mega: ")); Serial.print(bytesReceived);
       Serial.print(F(" bytes received on GPIO16, bad frames ")); Serial.print(badFrames);
       if (lastBadFrame[0]) { Serial.print(F(" | last line: ")); Serial.print(lastBadFrame); }
-      Serial.print(bytesReceived ? F("") : F(" | check Nano D5 -> GPIO16 and GND"));
+      Serial.print(bytesReceived ? F("") : F(" | check Mega TX1 (D18) -> GPIO16 and GND"));
       Serial.print(F(" | INPUT GPIO32 ")); Serial.print(freqInput::hz, 1); Serial.println(F(" Hz"));
     }
   }

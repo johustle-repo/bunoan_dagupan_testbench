@@ -3,12 +3,12 @@
 #include <util/atomic.h>
 #include <math.h>
 
-// Three frequency generators (as on the Nano, same A2 / A3 / A4 pots): a
+// Three frequency generators (rear pot A1, front pot A0, Declog pot A2): a
 // Bourns PTV09 10k pot sets a 50 % duty, 0-5 V square wave on a timer output.
-//   GEN A2: pot on A2 -> D44 (Timer5, OC5C), 0-1600 Hz (1500 Hz = 250 km/h, 1560 Hz = 15000 rpm)
-//   GEN A3: pot on A3 -> D3  (Timer3, OC3C), 0-1600 Hz
-//   GEN A4: pot on A4 -> D11 (Timer1, OC1A), 0-100 Hz
-//   Each pot: pin 1 -> GND, pin 2 (wiper) -> A2 / A3 / A4, pin 3 -> 5V
+//   Rear:   pot on A1 -> D44 (Timer5, OC5C), 0-1500 Hz (1500 Hz = 250 km/h)
+//   Front:  pot on A0 -> D3  (Timer3, OC3C), 0-1500 Hz
+//   Declog: pot on A2 -> D11 (Timer1, OC1A), 0-100 Hz
+//   Each pot: pin 1 -> GND, pin 2 (wiper) -> A1 / A0 / A2, pin 3 -> 5V
 //   (100 nF wiper-GND optional). Turned fully down the output stops LOW.
 // Each generator has its own 16-bit timer, so the three frequencies are
 // independent and made entirely in hardware: no interrupts, unaffected by the
@@ -49,35 +49,21 @@ class PotGenerator {
     stop();
   }
 
-  // Call every loop: reads the pot every 20 ms and smooths it.
-  // Each reading takes 16 samples, sorts them and averages the middle 8, so
-  // the odd bad sample from a scratchy wiper or a loose lead is thrown away.
-  // The output only retunes once the pot has moved by more than DEADBAND
-  // counts from where it was last applied, and the frequency is rounded to
-  // whole Hz (0.1 Hz on the 0-100 Hz range). Left alone, it stays on one value.
+  // Call every loop. Every 100 ms it reads the pot the simple way: 20
+  // analogReads 50 us apart, averaged, then map() 0-1023 -> 0-maxHz in whole
+  // Hz (A1 / A0: 0-1500 Hz, A2: 0-100 Hz). About 3 ms per pot.
   void update(uint32_t nowMs) {
     if (uint32_t(nowMs - lastReadMs) < READ_INTERVAL_MS) return;
     lastReadMs = nowMs;
-    analogRead(potPin);  // Let the ADC settle on this channel.
-    uint16_t s[16];
-    for (uint8_t n = 0; n < 16; ++n) {  // Insertion sort while reading.
-      const uint16_t v = analogRead(potPin);
-      int8_t k = n - 1;
-      while (k >= 0 && s[k] > v) { s[k + 1] = s[k]; --k; }
-      s[k + 1] = v;
+    long sum = 0;
+    for (uint8_t i = 0; i < NUM_SAMPLES; ++i) {
+      sum += analogRead(potPin);
+      delayMicroseconds(50);  // Small pause between readings for ADC stability.
     }
-    uint16_t sum = 0;
-    for (uint8_t n = 4; n < 12; ++n) sum += s[n];
-    const float counts = sum / 8.0f;
-    if (counts < noiseLo) noiseLo = counts;
-    if (counts > noiseHi) noiseHi = counts;
-    filtered = filtered < 0 ? counts : filtered + (counts - filtered) * 0.2f;
-    const bool atEnd = filtered < 4 || filtered > 1019;  // Ends snap to 0 / the maximum.
-    if (appliedCounts >= 0 && fabsf(filtered - appliedCounts) < DEADBAND && !(atEnd && !appliedAtEnd)) return;
-    appliedCounts = filtered;
-    appliedAtEnd = atEnd;
-    const float step = maxHz >= 1000 ? 1.0f : 0.1f;
-    const float hz = roundf(constrain((filtered - 4) / (1019 - 4), 0.0f, 1.0f) * maxHz / step) * step;
+    const int stableVal = sum / NUM_SAMPLES;
+    if (stableVal < noiseLo) noiseLo = stableVal;
+    if (stableVal > noiseHi) noiseHi = stableVal;
+    const long hz = map(stableVal, 0, 1023, 0, long(maxHz));
     if (hz == setHz) return;
     setHz = hz;
     apply(hz);
@@ -85,16 +71,13 @@ class PotGenerator {
 
  private:
   static constexpr float MIN_HZ = 0.5f;
-  static constexpr uint16_t READ_INTERVAL_MS = 20;
-  static constexpr float DEADBAND = 2.5f;  // ADC counts.
+  static constexpr uint8_t NUM_SAMPLES = 20;        // Higher = smoother, slightly slower.
+  static constexpr uint16_t READ_INTERVAL_MS = 100;
   volatile uint8_t &tccrA, &tccrB;
   volatile uint16_t &tcnt, &ocrTop, &ocrOut;
   const uint8_t comBits;     // Output mode bits: COMnC1 (PWM) or COMnA0 (toggle).
   const bool toggle;         // Channel A: toggles at TOP, so one period = 2 timer cycles.
-  float filtered = -1;       // Smoothed ADC counts.
-  float appliedCounts = -1;  // Filtered counts when the output was last retuned.
-  bool appliedAtEnd = false;
-  float setHz = 0;           // Frequency the pot asks for.
+  long setHz = -1;           // Frequency the pot asks for.
   uint32_t lastReadMs = 0;
 
   // Timer off and the pin back to PORT (LOW).
@@ -107,7 +90,7 @@ class PotGenerator {
     outHz = 0;
   }
 
-  // The smallest prescaler that fits gives the finest steps (at 1600 Hz
+  // The smallest prescaler that fits gives the finest steps (at 1500 Hz
   // about 0.2 Hz, at 100 Hz about 0.01 Hz).
   void apply(float hz) {
     if (hz < MIN_HZ) { if (tccrB) stop(); return; }
@@ -132,7 +115,7 @@ class PotGenerator {
   }
 };
 
-PotGenerator genA2(A2, 44, 1600, TCCR5A, TCCR5B, TCNT5, OCR5A, OCR5C, _BV(COM5C1), false);  // D44, 0-1600 Hz.
-PotGenerator genA3(A3, 3, 1600, TCCR3A, TCCR3B, TCNT3, OCR3A, OCR3C, _BV(COM3C1), false);   // D3,  0-1600 Hz.
-PotGenerator genA4(A4, 11, 100, TCCR1A, TCCR1B, TCNT1, OCR1A, OCR1A, _BV(COM1A0), true);    // D11, 0-100 Hz.
-PotGenerator* const generators[3] = {&genA2, &genA3, &genA4};
+PotGenerator genRear(A1, 44, 1500, TCCR5A, TCCR5B, TCNT5, OCR5A, OCR5C, _BV(COM5C1), false);  // D44, 0-1500 Hz.
+PotGenerator genFront(A0, 3, 1500, TCCR3A, TCCR3B, TCNT3, OCR3A, OCR3C, _BV(COM3C1), false);   // D3,  0-1500 Hz.
+PotGenerator genDeclog(A2, 11, 100, TCCR1A, TCCR1B, TCNT1, OCR1A, OCR1A, _BV(COM1A0), true);    // D11, 0-100 Hz.
+PotGenerator* const generators[3] = {&genRear, &genFront, &genDeclog};

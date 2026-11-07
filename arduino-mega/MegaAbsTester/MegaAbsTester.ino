@@ -18,11 +18,11 @@
 //   D2 Declog frequency, 0-100 Hz square wave, 0-5 V
 //   D13 TCS LED (built-in): steady when both speeds match (whole km/h), blinking otherwise
 //   D12 ABS LED: on when D7 is at least 10 % and 5 km/h slower than D8
-//   A0 Reference 1, A1 battery: 0-5 V at the pin mapped to 0-30 V through the
+//   A3 Reference 1, A4 battery: 0-5 V at the pin mapped to 0-30 V through the
 //   PCB calibration table (same as the ECU testbench), filtered.
 //   TX1 (D18) -> 1 kOhm -> ESP32 RX2 (GPIO16), common GND, 115200 8N1, one-way
 //   (hardware Serial1; the USB Serial Monitor stays on Serial).
-//   A2 / A3 / A4 PTV09 10k pots -> D44 0-1600 Hz, D3 0-1600 Hz, D11 0-100 Hz
+//   PTV09 10k pots: A1 rear -> D44 0-1500 Hz, A0 front -> D3 0-1500 Hz, A2 Declog -> D11 0-100 Hz
 //   square waves (PotGenerator.h, Timers 5 / 3 / 1); jumper them into
 //   D7 / D8 / D2 to test.
 // Timer2 (compare A) samples D2, D7 and D8 at 20 kHz (up to about 10 kHz per
@@ -69,7 +69,7 @@ bool absActive = false;
 
 float frequencyHz1 = 0, frequencyHz2 = 0, declogHz = 0;
 float ref1V = 0, batteryV = 0;
-float pinV[2] = {0, 0};  // Filtered A0 / A1 pin volts, 0-5 V.
+float pinV[2] = {0, 0};  // Filtered A3 / A4 pin volts, 0-5 V.
 float speed1 = 0, speed2 = 0;
 float rpm = 0;
 
@@ -97,7 +97,7 @@ float getTrueVoltage(float x) {
 constexpr uint8_t SAMPLES = 20;
 constexpr float FILTER = 0.2f;
 bool filterStarted[2] = {false, false};
-const uint8_t inputPins[2] = {A0, A1};  // REF1 A0, battery A1.
+const uint8_t inputPins[2] = {A3, A4};  // REF1 A3, battery A4.
 
 char linkBuffer[128];
 
@@ -120,7 +120,7 @@ ISR(TIMER2_COMPA_vect) {
   previousHigh3 = high3;
 }
 
-// Reads A0 / A1 (analogRead 0-1023 = 0-5 V), filters it and returns 0-30 V
+// Reads A3 / A4 (analogRead 0-1023 = 0-5 V), filters it and returns 0-30 V
 // through the calibration table.
 float readInput(uint8_t i) {
   analogRead(inputPins[i]);  // First reading after switching pins is discarded.
@@ -149,7 +149,7 @@ void readVolts() {
 // A1 frame (same as the Nano): key (always 1), brake (none, 0), D7 Hz x100,
 // speed 1 x100, REF1 mV, REF2 (unused, 0), current (unused, 0), battery mV,
 // D8 Hz x100, speed 2 x100, RPM, TCS (1 steady, 0 blinking), ABS (1 active),
-// D2 Declog Hz x100, the A2 / A3 / A4 pot generator outputs (D44 / D3 / D11)
+// D2 Declog Hz x100, the rear (A1) / front (A0) / Declog (A2) pot generator outputs (D44 / D3 / D11; same slots as before)
 // in Hz x100, then an XOR checksum of everything before '*'. The ESP32 shows
 // these values as they are.
 void sendFrame() {
@@ -158,8 +158,8 @@ void sendFrame() {
     (unsigned long)(frequencyHz1 * 100 + 0.5), unsigned(speed1 * 100 + 0.5), mv[0], mv[1],
     (unsigned long)(frequencyHz2 * 100 + 0.5), unsigned(speed2 * 100 + 0.5),
     unsigned(rpm + 0.5), unsigned(speedsEqual), unsigned(absActive),
-    (unsigned long)(declogHz * 100 + 0.5), (unsigned long)(genA2.outHz * 100 + 0.5),
-    (unsigned long)(genA3.outHz * 100 + 0.5), (unsigned long)(genA4.outHz * 100 + 0.5));
+    (unsigned long)(declogHz * 100 + 0.5), (unsigned long)(genRear.outHz * 100 + 0.5),
+    (unsigned long)(genFront.outHz * 100 + 0.5), (unsigned long)(genDeclog.outHz * 100 + 0.5));
   if (count < 0 || count > int(sizeof(linkBuffer) - 5)) return;
   uint8_t checksum = 0;
   for (int i = 0; i < count; i++) checksum ^= uint8_t(linkBuffer[i]);
@@ -192,7 +192,7 @@ float measureHz(uint8_t i, unsigned long pulses, unsigned long edgeUs, unsigned 
 }
 
 // One aligned line per pot, e.g.
-// "Pot A2 -> D44 :  1500.0 Hz  (max 1600)  noise 1 counts". The noise is how
+// "Rear   A1 -> D44 :  1500.0 Hz  (max 1500)  noise 1 counts". The noise is how
 // far the pot's reading moved in the last second; a pot left alone should
 // show about 0-2, and "CHECK POT" flags more than 6.
 void printGenerator(const char* label, PotGenerator& gen) {
@@ -211,9 +211,9 @@ void printGenerator(const char* label, PotGenerator& gen) {
 
 void printGenerators() {
   Serial.println(F("---- Pot generators ----"));
-  printGenerator("Pot A2 -> D44 :", genA2);
-  printGenerator("Pot A3 -> D3  :", genA3);
-  printGenerator("Pot A4 -> D11 :", genA4);
+  printGenerator("Rear   A1 -> D44 :", genRear);
+  printGenerator("Front  A0 -> D3  :", genFront);
+  printGenerator("Declog A2 -> D11 :", genDeclog);
   Serial.println(F("------------------------"));
 }
 
@@ -313,9 +313,9 @@ void loop() {
     Serial.print(F("TCS: ")); Serial.println(speedsEqual ? F("ON") : F("BLINKING"));
     Serial.print(F("ABS: ")); Serial.println(absActive ? F("ACTIVE") : F("OFF"));
     Serial.print(F("Declog (D2): ")); Serial.print(declogHz, 1); Serial.println(F(" Hz"));
-    Serial.print(F("REF1 (A0): ")); Serial.print(ref1V, 2);
+    Serial.print(F("REF1 (A3): ")); Serial.print(ref1V, 2);
     Serial.print(F(" V (pin ")); Serial.print(pinV[0], 2); Serial.println(F(" V)"));
-    Serial.print(F("Battery (A1): ")); Serial.print(batteryV, 2);
+    Serial.print(F("Battery (A4): ")); Serial.print(batteryV, 2);
     Serial.print(F(" V (pin ")); Serial.print(pinV[1], 2); Serial.println(F(" V)"));
     Serial.println();
   }

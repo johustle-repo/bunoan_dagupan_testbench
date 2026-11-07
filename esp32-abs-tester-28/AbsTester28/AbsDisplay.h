@@ -8,13 +8,13 @@
 // drawn anti-aliased (AaGraphics.h) with the Barlow Semi Condensed fonts in
 // AaFonts.h, into off-screen strips that are pushed in one SPI burst each, so
 // nothing flickers. Two pages: swipe left for page 2, swipe right for page 1.
-//   Top row (both pages): REF1 | small ABS and TCS lights | BAT.
-//   Page 1: REAR (D7) and FRONT (D8) speedometers side by side, 0-250 km/h,
+//   Header (both pages): REF1 | BAT.
+//   Page 1: FRONT (D8, left) and REAR (D7, right) speedometers, 0-250 km/h,
 //           each with its speed bar below.
 //   Page 2: one 0-2000 Hz gauge for the ESP32's own frequency input (GPIO32)
 //           and the DECLOG bar (the Nano's D2, 0-100 Hz shown as 0-100 %).
-//   Two dots at the bottom show the page.
-// Page 1 needs the Nano (WAITING FOR NANO / NO LINK until data arrives, then
+//   Footer (both pages): ABS light | page dots | TCS light.
+// Page 1 needs the Nano (WAITING FOR MEGA / NO LINK until data arrives, then
 // the switch-on self-test); page 2 works without it (DECLOG then shows --).
 // Touch: the XPT2046 shares the display's SPI bus (T_CLK 18, T_DIN 23,
 // T_DO 19) with its own chip select, T_CS on GPIO33. Only the direction of a
@@ -51,7 +51,7 @@ struct AbsData {
   bool tcsSteady, absActive;     // The Nano's TCS (D13) and ABS (D12) LED states.
   float declogHz;                // D2, 0 with older firmware.
   bool gens;                     // Frame carries the Nano's pot generator settings.
-  float genHz[3];                // A2 -> D9, A3 -> D10 (0-1600 Hz), A4 -> D3 (0-100 Hz).
+  float genHz[3];                // Mega pots: rear A1 -> D44, front A0 -> D3 (0-1500 Hz), Declog A2 -> D11 (0-100 Hz).
   float inputHz;                 // ESP32 GPIO32 frequency input (page 2), measured here.
   bool absLamp;                  // ABS light, from AbsLamp.
 };
@@ -109,13 +109,12 @@ constexpr uint16_t NEEDLE_CORE = rgb(0xff, 0xb4, 0xb4);
 Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_RST);
 
 // ---- Layout ----
-// Top row (both pages): REF1 | ABS, TCS lights | BAT.
+// Header (both pages): REF1 | BAT.
 constexpr int TOP_Y = 3, TOP_H = 30;
-constexpr int TOP_X[2] = {4, 200}, TOP_W = 116;
-constexpr int LAMP_X[2] = {124, 162}, LAMP_W = 34, LAMP_H = 22, LAMP_Y = TOP_Y + 4;
+constexpr int TOP_X[2] = {4, 162}, TOP_W = 154;
 // Page 1: two speedometers and their speed bars.
 constexpr int GY = 37, GH = 140, GW = 154;
-constexpr int GXS[2] = {4, 162};                 // REAR, FRONT.
+constexpr int GXS[2] = {162, 4};                 // REAR (right), FRONT (left).
 constexpr float DCY1 = GY + 90, DR1 = 66;         // Dial centre height and radius.
 constexpr int SBY = 181, SBH = 28;               // Speed bars.
 // Page 2: the 0-2000 Hz gauge and the DECLOG bar.
@@ -123,8 +122,9 @@ constexpr int P2X = 4, P2Y = 37, P2W = 312, P2H = 142;
 constexpr float DCX2 = 160, DCY2 = P2Y + 124, DR2 = 106;
 constexpr int PLATE_W = 88, PLATE_H = 44, PLATE_Y = DCY2 - 46;
 constexpr int DY = 183, DH = 36;                 // DECLOG panel.
-// Page dots (both pages).
+// Footer (both pages): ABS light | page dots | TCS light.
 constexpr int DOTS_X = 140, DOTS_Y = 222, DOTS_W = 40, DOTS_H = 16;
+constexpr int LAMP_X[2] = {88, 188}, LAMP_W = 44, LAMP_H = 16, LAMP_Y = 222;
 
 const char* const TOP_LABELS[2] = {"REF1", "BAT"};
 const uint16_t TOP_ACCENTS[2] = {ACCENT, AMBER};
@@ -241,22 +241,25 @@ void drawTop(uint8_t i, float volts) {
   });
 }
 
-// Small warning lights: lit amber with dark text, or a dim outline.
+// Warning lights: a round light and its label ("(o) ABS"). Lit: an amber
+// light with a soft glow and bright text; off: a dark ringed light, dim text.
 void drawLamps(const bool lit[2]) {
-  render(LAMP_X[0], TOP_Y, LAMP_X[1] + LAMP_W - LAMP_X[0], TOP_H, [&](aa::Buf& b) {
-    aa::fill(b, BG);
-    for (uint8_t i = 0; i < 2; ++i) {
-      const int x = LAMP_X[i];
+  for (uint8_t i = 0; i < 2; ++i) {
+    const int x = LAMP_X[i];
+    const float cx = x + 8, cy = LAMP_Y + LAMP_H / 2.0f;
+    render(x - 1, LAMP_Y - 1, LAMP_W + 2, LAMP_H + 2, [&](aa::Buf& b) {
+      aa::fill(b, BG);
       if (lit[i]) {
-        aa::roundRect(b, x - 1, LAMP_Y - 1, LAMP_W + 2, LAMP_H + 2, 7, aa::mix(BG, AMBER, 90));  // Glow.
-        aa::roundRect(b, x, LAMP_Y, LAMP_W, LAMP_H, 6, AMBER);
-        aa::textMid(b, aaLabel, LAMP_LABELS[i], x + LAMP_W / 2, LAMP_Y + LAMP_H / 2, BG, 1);
+        aa::circle(b, cx, cy, 8.5f, aa::mix(BG, AMBER, 70));  // Glow.
+        aa::circle(b, cx, cy, 6, AMBER);
+        aa::circle(b, cx - 1.8f, cy - 1.8f, 1.8f, aa::mix(AMBER, TEXT, 170));  // Highlight.
       } else {
-        aa::roundRect(b, x, LAMP_Y, LAMP_W, LAMP_H, 6, OFF_FILL, OFF_EDGE, 1);
-        aa::textMid(b, aaLabel, LAMP_LABELS[i], x + LAMP_W / 2, LAMP_Y + LAMP_H / 2, OFF_TEXT, 1);
+        aa::circle(b, cx, cy, 6, OFF_EDGE);
+        aa::circle(b, cx, cy, 5, OFF_FILL);
       }
-    }
-  });
+      aa::text(b, aaLabel, LAMP_LABELS[i], x + 19, LAMP_Y + 13, lit[i] ? TEXT : OFF_TEXT, aa::LEFT, 1);
+    });
+  }
 }
 
 void drawDots(uint8_t page) {
@@ -384,7 +387,7 @@ void drawDeclog(float hz, bool have) {
     aa::text(b, aaLabel, "DECLOG", P2X + 10, DY + 16, TEXT, aa::LEFT, 1);
     char s[16];
     if (have) snprintf(s, sizeof(s), "D2  %.1f Hz", hz);
-    else strlcpy(s, "NO NANO", sizeof(s));
+    else strlcpy(s, "NO MEGA", sizeof(s));
     aa::text(b, aaSmall, s, P2X + 10, DY + 29, MUTED, aa::LEFT);
     constexpr int X0 = P2X + 92, LEN = 150;
     const int cy = DY + DH / 2;
@@ -425,7 +428,7 @@ void clearScreen() {
 
 void lockedText(const AbsData& d) {
   const bool live = d.link == AbsData::LIVE;
-  const char* line = d.link == AbsData::WAITING ? "WAITING FOR NANO" : d.link == AbsData::STALE ? "NO LINK" : "UPDATE NANO";
+  const char* line = d.link == AbsData::WAITING ? "WAITING FOR MEGA" : d.link == AbsData::STALE ? "NO LINK" : "UPDATE MEGA";
   const uint16_t color = live ? AMBER : RED;
   if (!changed(S_LOCK, line)) return;
   render(30, 30, 260, 180, [&](aa::Buf& b) {
@@ -433,7 +436,7 @@ void lockedText(const AbsData& d) {
     aa::roundRect(b, 30, 30, 260, 180, 14, PANEL, PANEL_EDGE, 1);
     absSymbol(b, W / 2, 84, 22, color, aaPill);
     aa::text(b, aaValue, line, W / 2, 144, color, aa::CENTER, 1);
-    aa::text(b, aaLabel, live ? "Flash the new Nano firmware" : "Check the Nano link", W / 2, 166, MUTED,
+    aa::text(b, aaLabel, live ? "Flash the new Mega firmware" : "Check the Mega link", W / 2, 166, MUTED,
              aa::CENTER);
     aa::text(b, aaSmall, "Swipe left: page 2 (GPIO32 input)", W / 2, 186, DIM, aa::CENTER, 1);
     aa::text(b, aaSmall, "Wi-Fi ABS-Tester  |  192.168.4.1", W / 2, 201, DIM, aa::CENTER, 1);
