@@ -5,6 +5,7 @@
 #include "SerialLink.h"
 #include "Buttons.h"
 #include "PotGenerator.h"
+#include "SupplyVoltage.h"
 
 #if !defined(__AVR_ATmega2560__)
 #error "Select Arduino Mega or Mega 2560 (ATmega2560)."
@@ -66,7 +67,10 @@ const uint8_t referencePins[] = {A5, A6};
 constexpr uint8_t BATTERY_PIN = A7;
 float referenceVoltage[2] = {};
 float batteryVoltage = 0;
-constexpr float V_REF = 5.0f;  // Mega 5 V rail.
+// Pin volts use the measured 5 V rail (SupplyVoltage.h, supply::volts), not
+// an assumed 5.00 V. The IAT / ECT / O2 / MAP / TPS sensors stay on the plain
+// 5 V scale: they are fed from the same rail, so they are ratiometric and a
+// sagging rail moves the sensor and the ADC together.
 
 // Calibration table measured on the PCB: pin volts (x) -> true input volts (y).
 constexpr uint8_t CAL_POINTS = 8;
@@ -105,13 +109,14 @@ bool inputOpen(uint8_t pin) {
 // volts, then maps through the calibration table to 0-30 V. NAN = no input
 // attached (printed and shown as ERR).
 float readDividerInput(uint8_t pin) {
+  analogRead(pin);  // Discard: the ADC is switching channels (or back from the bandgap).
   uint32_t sum = 0;
   for (uint8_t n = 0; n < SENSOR_SAMPLES; n++) {
     sum += analogRead(pin);
     delay(1);
   }
   if (inputOpen(pin)) return NAN;
-  return getTrueVoltage(float(sum) / SENSOR_SAMPLES * (V_REF / 1023.0f));
+  return getTrueVoltage(float(sum) / SENSOR_SAMPLES * (supply::volts / 1023.0f));
 }
 
 // SoftwareSerial TX disables interrupts, so Timer1 can't sample D7/D8 while a
@@ -218,6 +223,7 @@ void loop() {
   if (!changed && uint32_t(nowMs - lastPublishMs) < PUBLISH_INTERVAL_MS) return;
   if (uint32_t(nowMs - lastPublishMs) < 200) return;
   lastPublishMs = nowMs;
+  supply::read();  // Measured 5 V rail for REF1 / REF2 / battery (about 4 ms).
   batteryVoltage = readDividerInput(BATTERY_PIN);
   const float iatV = readSensor(0), ectV = readSensor(1), o2V = readSensor(2);
   const float mapV = readSensor(3), tpsV = readSensor(4);
@@ -243,6 +249,7 @@ void loop() {
   Serial.print(F(" | REF1: ")); printVolts(referenceVoltage[0]);
   Serial.print(F(" | REF2: ")); printVolts(referenceVoltage[1]);
   Serial.print(F(" | BATV: ")); printVolts(batteryVoltage);
+  Serial.print(F(" | 5V: ")); Serial.print(supply::volts, 3); Serial.print(F(" V"));
   Serial.print(F(" | A8: ")); Serial.print(analogRead(A8));  // Plain analogRead, 0-1023.
   Serial.print(F(" | GEN D44: ")); Serial.print(gen1.outHz, 1);
   Serial.print(F(" Hz | A9: ")); Serial.print(analogRead(A9));

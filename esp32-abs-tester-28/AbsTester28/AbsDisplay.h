@@ -3,27 +3,31 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
 #include "AaGraphics.h"
+#include "FreqInput.h"  // freqInput::guard() around the touch panel's T_CS.
 
 // ABS tester on the 2.8" ILI9341 TFT (landscape 320 x 240). Everything is
 // drawn anti-aliased (AaGraphics.h) with the Barlow Semi Condensed fonts in
 // AaFonts.h, into off-screen strips that are pushed in one SPI burst each, so
 // nothing flickers. Two pages: swipe left for page 2, swipe right for page 1.
 //   Header (both pages): REF1 | BAT.
-//   Page 1: FRONT (D8, left) and REAR (D7, right) speedometers, 0-250 km/h,
+//   Page 1: REAR (D7, left) and FRONT (D8, right) speedometers, 0-250 km/h,
 //           each with its speed bar below.
-//   Page 2: one 0-2000 Hz gauge for the ESP32's own frequency input (GPIO32)
-//           and the DECLOG bar (the Nano's D2, 0-100 Hz shown as 0-100 %).
-//   Page 3: placeholder.
+//   Page 2: SPEED SENSOR gauge for the ESP32's own frequency input (GPIO34),
+//           0-2000 Hz shown as 0-200 km/h, with the SPEED bar below (km/h);
+//           NO SIGNAL when no pulses arrive.
+//   Page 3: one 0-100 Hz DECLOG gauge (the sender's D2) and the DECLOG bar
+//           below (0-100 Hz shown as 0-100 %).
 //   Footer (all pages): PAGE n/3 | ABS light | page dots | TCS light | page name.
 // Page change: the Mega's A5 page pot (0-341 page 1, 342-682 page 2,
 // 683-1023 page 3), or a swipe left / right on the touchscreen.
-// Page 1 needs the Nano (WAITING FOR MEGA / NO LINK until data arrives, then
-// the switch-on self-test); page 2 works without it (DECLOG then shows --).
+// Page 1 needs the sender (WAITING FOR DATA / NO LINK until data arrives, then
+// the switch-on self-test); pages 2 and 3 work without it (DECLOG then
+// shows 0 and NO LINK).
 // Touch: the XPT2046 shares the display's SPI bus (T_CLK 18, T_DIN 23,
 // T_DO 19) with its own chip select, T_CS on GPIO33. Only the direction of a
 // swipe is used, so no calibration. T_IRQ is not used (unconnected or on
 // GPIO35, which is then not used for anything else); it must not be wired
-// to GPIO32 (that is the frequency input).
+// to GPIO34 (that is the frequency input).
 constexpr uint8_t TFT_SCK = 18, TFT_MISO = 19, TFT_MOSI = 23;
 constexpr uint8_t TFT_CS = 27, TFT_DC = 25, TFT_RST = 26, TOUCH_CS = 33;
 constexpr uint32_t GAUGE_REFRESH_MS = 40, TEXT_REFRESH_MS = 100;
@@ -38,7 +42,9 @@ constexpr bool SWIPE_FLIP = false;
 // formula as the Nano. DECLOG: the D2 frequency, 0-100 Hz = 0-100 %.
 constexpr float ABS_SPEED_MAX = 250, SPEED_RED = 210, HZ_PER_KMH = 6;
 constexpr float DECLOG_MAX_HZ = 100;
-constexpr float INPUT_MAX_HZ = 2000;  // Page 2 gauge.
+// Page 2 speed sensor on GPIO34: 0-2000 Hz = 0-200 km/h (10 Hz per km/h).
+constexpr float INPUT_MAX_HZ = 2000, INPUT_HZ_PER_KMH = 10;
+constexpr float INPUT_MAX_KMH = INPUT_MAX_HZ / INPUT_HZ_PER_KMH, INPUT_RED_KMH = 180;
 constexpr float ABS_CHECK_KMH = 10;   // ABS lamp: off above, on below (see AbsLamp).
 
 // What the screen shows, filled by the sketch each loop.
@@ -53,14 +59,23 @@ struct AbsData {
   uint16_t rpm;                  // D7 Hz x 15000 / 1560, from the Nano.
   bool tcsSteady, absActive;     // The Nano's TCS (D13) and ABS (D12) LED states.
   float declogHz;                // D2, 0 with older firmware.
-  bool gens;                     // Frame carries the Nano's pot generator settings.
-  float genHz[3];                // Mega pots: rear A1 -> D44, front A0 -> D3 (0-1500 Hz), Declog A2 -> D11 (0-100 Hz).
-  float inputHz;                 // ESP32 GPIO32 frequency input (page 2), measured here.
+  // Sender board, from the frame length: the Mega adds the A5 page pot
+  // (19 fields), the Nano doesn't. Kept after the link drops.
+  enum Sender : uint8_t { UNKNOWN, NANO, MEGA } sender;
+  bool gens;                     // Frame carries the pot generator settings.
+  // Pots, rear / front (0-1500 Hz) / Declog (0-100 Hz):
+  //   Nano: A0 -> D9, A1 -> D10, A2 -> D3.  Mega: A1 -> D44, A0 -> D3, A2 -> D11.
+  float genHz[3];
+  float inputHz;                 // ESP32 GPIO34 frequency input (page 2), measured here.
   bool pagePot;                  // Frame carries the Mega's A5 page pot.
   uint16_t potRaw;               // A5 reading, 0-1023.
   uint8_t potPage;               // Page picked by the pot, 1-3.
   bool absLamp;                  // ABS light, from AbsLamp.
 };
+
+inline const char* senderName(AbsData::Sender s) {
+  return s == AbsData::MEGA ? "MEGA" : s == AbsData::NANO ? "NANO" : "SENDER";
+}
 
 // ABS light, like a real bike's start-up check, worked out from the REAR speed:
 //   switched on (live data arrives): ON;
@@ -120,7 +135,7 @@ constexpr int TOP_Y = 3, TOP_H = 30;
 constexpr int TOP_X[2] = {4, 162}, TOP_W = 154;
 // Page 1: two speedometers and their speed bars.
 constexpr int GY = 37, GH = 140, GW = 154;
-constexpr int GXS[2] = {162, 4};                 // REAR (right), FRONT (left).
+constexpr int GXS[2] = {4, 162};                 // REAR (left), FRONT (right); speed bars follow.
 constexpr float DCY1 = GY + 90, DR1 = 66;         // Dial centre height and radius.
 constexpr int SBY = 181, SBH = 28;               // Speed bars.
 // Page 2: the 0-2000 Hz gauge and the DECLOG bar.
@@ -133,7 +148,7 @@ constexpr int DOTS_X = 140, DOTS_Y = 222, DOTS_W = 40, DOTS_H = 16;
 constexpr int LAMP_X[2] = {88, 188}, LAMP_W = 44, LAMP_H = 16, LAMP_Y = 222;
 constexpr int NAV_X = 6, NAME_X = 234, NAV_W = 80;   // Footer: "PAGE 1/3" left, page name right.
 constexpr uint8_t PAGE_COUNT = 3;
-const char* const PAGE_NAMES[PAGE_COUNT] = {"SPEED", "INPUT", "PAGE 3"};
+const char* const PAGE_NAMES[PAGE_COUNT] = {"SPEED", "SENSOR", "DECLOG"};
 // Page 3 (placeholder for now).
 constexpr int P3X = 4, P3Y = 37, P3W = 312, P3H = 182;
 
@@ -153,12 +168,12 @@ uint16_t* dialBg = nullptr;
 
 enum Mode : uint8_t { NONE, LOCKED, PAGE1, PAGE2, PAGE3 } mode = NONE;
 uint8_t dialFor = 0;  // Page whose dial is in dialBg (0 = none).
-enum Slot : uint8_t { S_TOP0, S_TOP1, S_LAMPS, S_DOTS, S_BAR0, S_BAR1, S_DECLOG, S_LOCK, S_PAGE3, SLOT_COUNT };
+enum Slot : uint8_t { S_TOP0, S_TOP1, S_LAMPS, S_DOTS, S_BAR0, S_BAR1, S_DECLOG, S_LOCK, S_INPUT, SLOT_COUNT };
 char shown[SLOT_COUNT][40];
 uint32_t lastGaugeMs = 0, lastTextMs = 0, selfTestStartMs = 0;
 bool selfTestActive = false;
 int32_t shownGaugeKey[2] = {-1, -1};
-float easeRear = 0, easeFront = 0, easeInput = 0;  // Needle positions, eased toward the readings.
+float easeRear = 0, easeFront = 0, easeInput = 0, easeDeclog = 0;  // Needle positions, eased toward the readings.
 
 // True (and remembered) when a slot's content key differs from what is shown.
 bool changed(uint8_t slot, const char* key) {
@@ -277,14 +292,15 @@ void drawLamps(const bool lit[2]) {
 // the right and one dot per page (the shown page in cyan). While the knob is
 // selecting (sel 1-3), the left reads "SELECT 2/3" in amber, the right names
 // the page that a press will lock, and that page's dot blinks amber.
-void drawNav(uint8_t page, uint8_t sel, bool blinkOn) {
+// Locked by the encoder: the left reads "LOCKED 2/3" in cyan.
+void drawNav(uint8_t page, uint8_t sel, bool blinkOn, bool locked) {
   const bool selecting = sel != 0;
   const uint8_t target = selecting ? sel : page;
   char s[16];
-  snprintf(s, sizeof(s), "%s %u/%u", selecting ? "SELECT" : "PAGE", target, PAGE_COUNT);
+  snprintf(s, sizeof(s), "%s %u/%u", selecting ? "SELECT" : locked ? "LOCKED" : "PAGE", target, PAGE_COUNT);
   render(NAV_X, DOTS_Y, NAV_W, DOTS_H, [&](aa::Buf& b) {
     aa::fill(b, BG);
-    aa::text(b, aaSmall, s, NAV_X, DOTS_Y + 12, selecting ? AMBER : MUTED, aa::LEFT, 1);
+    aa::text(b, aaSmall, s, NAV_X, DOTS_Y + 12, selecting ? AMBER : locked ? ACCENT : MUTED, aa::LEFT, 1);
   });
   render(NAME_X, DOTS_Y, NAV_W, DOTS_H, [&](aa::Buf& b) {
     aa::fill(b, BG);
@@ -303,11 +319,11 @@ void drawNav(uint8_t page, uint8_t sel, bool blinkOn) {
   });
 }
 
-void navFooter(uint8_t page, uint8_t sel) {
+void navFooter(uint8_t page, uint8_t sel, bool locked) {
   const bool blinkOn = (millis() / 250) % 2;
   char key[16];
-  snprintf(key, sizeof(key), "%u %u %d", page, sel, sel && blinkOn);
-  if (changed(S_DOTS, key)) drawNav(page, sel, blinkOn);
+  snprintf(key, sizeof(key), "%u %u %d %d", page, sel, sel && blinkOn, locked);
+  if (changed(S_DOTS, key)) drawNav(page, sel, blinkOn, locked);
 }
 
 // REF1 / BAT and the ABS / TCS lights (TCS blinks at 2 Hz; the self-test
@@ -387,54 +403,92 @@ void page1Text(const AbsData& d) {
   }
 }
 
-// ---- Page 2: 0-2000 Hz input gauge and the DECLOG bar ----
+// ---- Pages 2 and 3: one big gauge with a bar panel below ----
+// Page 2: SPEED SENSOR, the ESP32's own GPIO34 input, 0-2000 Hz shown as
+//         0-200 km/h (10 Hz per km/h, red from 180), SPEED bar in km/h below.
+//         No pulses for 2.5 s (FreqInput.h) = NO SIGNAL: the plate shows
+//         NO SIGNAL / --, the bar "NO SIGNAL ON GPIO34" in red.
+// Page 3: the 0-100 Hz DECLOG gauge (the sender's D2), DECLOG bar (0-100 %) below.
+struct BigGauge {
+  const char* title; const char* pin; const char* unit;
+  float maxV; int minor, major; float redFrom;
+  const char* barName; bool barPercent;  // Bar value: % of the range, or the gauge unit.
+};
+const BigGauge BIG_GAUGES[2] = {
+    {"SPEED SENSOR", "GPIO34", "km/h", INPUT_MAX_KMH, 10, 50, INPUT_RED_KMH, "SPEED", false},
+    {"DECLOG", "D2", "Hz", DECLOG_MAX_HZ, 5, 25, DECLOG_MAX_HZ + 1, "DECLOG", true}};
 
-void drawDial2(aa::Buf& b) {
+// which: 0 = page 2 (speed sensor), 1 = page 3 (Declog).
+void drawDial2(aa::Buf& b, uint8_t which) {
+  const BigGauge& g = BIG_GAUGES[which];
   aa::fill(b, BG);
   panel(b, P2X, P2Y, P2W, P2H, 10);
-  dialFace(b, DCX2, DCY2, DR2, INPUT_MAX_HZ, 100, 500, INPUT_MAX_HZ + 1, aaDial, 30, 1.0f);
+  dialFace(b, DCX2, DCY2, DR2, g.maxV, g.minor, g.major, g.redFrom, aaDial, 30, 1.0f);
   aa::circle(b, 16, P2Y + 13, 3, ACCENT);
-  aa::text(b, aaLabel, "FREQUENCY", 24, P2Y + 18, TEXT, aa::LEFT, 1);
-  aa::text(b, aaSmall, "GPIO32", P2X + P2W - 10, P2Y + 17, MUTED, aa::RIGHT, 1);
+  aa::text(b, aaLabel, g.title, 24, P2Y + 18, TEXT, aa::LEFT, 1);
+  aa::text(b, aaSmall, g.pin, P2X + P2W - 10, P2Y + 17, MUTED, aa::RIGHT, 1);
 }
 
-void renderGauge2(float hz) {
+// v: the reading in the gauge's unit; signal false = NO SIGNAL on the plate.
+void renderGauge2(float v, uint8_t which, bool signal) {
+  const BigGauge& g = BIG_GAUGES[which];
+  const uint8_t dialPage = which + 2;  // dialBg holds this page's face.
   char digits[6];
-  snprintf(digits, sizeof(digits), "%d", int(lroundf(constrain(hz, 0.0f, 9999.0f))));
+  if (signal) snprintf(digits, sizeof(digits), "%d", int(lroundf(constrain(v, 0.0f, 9999.0f))));
+  else strlcpy(digits, "--", sizeof(digits));
   const int px = DCX2 - PLATE_W / 2;
   render(P2X, P2Y, P2W, P2H, [&](aa::Buf& b) {
-    if (dialBg && dialFor == 2) memcpy(b.px, dialBg + (b.oy - P2Y) * P2W, b.w * b.h * 2);
-    else drawDial2(b);
-    const float a = angleOf(hz, INPUT_MAX_HZ);
-    aa::arc(b, DCX2, DCY2, DR2 - 7, DR2, PI, a, [](float) { return ACCENT; });
+    if (dialBg && dialFor == dialPage) memcpy(b.px, dialBg + (b.oy - P2Y) * P2W, b.w * b.h * 2);
+    else drawDial2(b, which);
+    const float a = angleOf(signal ? v : 0, g.maxV);
+    const float redA = angleOf(g.redFrom, g.maxV);
+    aa::arc(b, DCX2, DCY2, DR2 - 7, DR2, PI, a, [redA](float ang) { return ang >= redA ? RED : ACCENT; });
     needle(b, DCX2, DCY2, a, 26, DR2 - 3, 5.5f, 1.8f, RED, true);
     aa::roundRect(b, px - 3, PLATE_Y - 3, PLATE_W + 6, PLATE_H + 6, 11, FACE);  // Gap around the plate.
-    aa::roundRect(b, px, PLATE_Y, PLATE_W, PLATE_H, 8, PLATE, PLATE_EDGE, 1);
-    aa::text(b, aaSmall, "Hz", DCX2, PLATE_Y + 12, MUTED, aa::CENTER, 1);
-    aa::text(b, aaBig, digits, DCX2, PLATE_Y + 41, TEXT, aa::CENTER, 1);
+    aa::roundRect(b, px, PLATE_Y, PLATE_W, PLATE_H, 8, PLATE, signal ? PLATE_EDGE : RED, 1);
+    aa::text(b, aaSmall, signal ? g.unit : "NO SIGNAL", DCX2, PLATE_Y + 12, signal ? MUTED : RED, aa::CENTER, 1);
+    aa::text(b, aaBig, digits, DCX2, PLATE_Y + 41, signal ? TEXT : DIM, aa::CENTER, 1);
   });
 }
 
-// DECLOG: the Nano's D2 frequency, 0-100 Hz shown as 0-100 %.
-void drawDeclog(float hz, bool have) {
-  const float pct = constrain(hz / DECLOG_MAX_HZ * 100, 0.0f, 100.0f);
+// Bar panel under the big gauge: name and pin / Hz at the left, the bar, and
+// the value at the right.
+//   Page 2: SPEED, GPIO34 Hz, bar and value in km/h (0-200);
+//           no pulses: "NO SIGNAL ON GPIO34" in red, empty bar, "--".
+//   Page 3: DECLOG, D2 Hz, bar and value as 0-100 % (NO LINK without data).
+void drawBigBar(uint8_t which, float hz, float v, bool have) {
+  const BigGauge& g = BIG_GAUGES[which];
+  const float frac = constrain(v / g.maxV, 0.0f, 1.0f);
+  const char* unit = g.barPercent ? "%" : g.unit;
+  if (!have && !which) {
+    // Speed sensor with no pulses: the whole panel is the error message.
+    render(P2X, DY, P2W, DH, [&](aa::Buf& b) {
+      aa::fill(b, BG);
+      panel(b, P2X, DY, P2W, DH);
+      aa::roundRect(b, P2X + 1, DY + 1, 4, DH - 2, 2, RED);
+      aa::text(b, aaLabel, "NO SPEED SENSOR READING", W / 2, DY + 16, RED, aa::CENTER, 1);
+      aa::text(b, aaSmall, "Check the sensor and its wire to GPIO34", W / 2, DY + 29, MUTED, aa::CENTER);
+    });
+    return;
+  }
   render(P2X, DY, P2W, DH, [&](aa::Buf& b) {
     aa::fill(b, BG);
     panel(b, P2X, DY, P2W, DH);
-    aa::text(b, aaLabel, "DECLOG", P2X + 10, DY + 16, TEXT, aa::LEFT, 1);
-    char s[16];
-    if (have) snprintf(s, sizeof(s), "D2  %.1f Hz", hz);
-    else strlcpy(s, "NO MEGA", sizeof(s));
-    aa::text(b, aaSmall, s, P2X + 10, DY + 29, MUTED, aa::LEFT);
-    constexpr int X0 = P2X + 92, LEN = 150;
+    aa::text(b, aaLabel, g.barName, P2X + 10, DY + 16, TEXT, aa::LEFT, 1);
+    char s[24];
+    if (have) snprintf(s, sizeof(s), which ? "%s  %.1f Hz" : "%s  %.0f Hz", g.pin, hz);
+    else if (which) strlcpy(s, "NO LINK", sizeof(s));
+    else snprintf(s, sizeof(s), "NO SIGNAL ON %s", g.pin);
+    aa::text(b, aaSmall, s, P2X + 10, DY + 29, have ? MUTED : RED, aa::LEFT);
+    constexpr int X0 = P2X + 104, LEN = 128;
     const int cy = DY + DH / 2;
     aa::roundRect(b, X0, cy - 5, LEN, 10, 5, TRACK);
-    if (have && pct > 0.5f) aa::roundRect(b, X0, cy - 5, max(10.0f, pct / 100 * LEN), 10, 5, ACCENT);
-    if (have) snprintf(s, sizeof(s), "%.0f", pct);
+    if (have && frac > 0.005f) aa::roundRect(b, X0, cy - 5, max(10.0f, frac * LEN), 10, 5, ACCENT);
+    if (have) snprintf(s, sizeof(s), "%.0f", g.barPercent ? frac * 100 : v);
     else strlcpy(s, "--", sizeof(s));
-    const int unitX = P2X + P2W - 10 - aa::textWidth(aaLabel, "%");
-    aa::text(b, aaLabel, "%", unitX, cy + 7, MUTED);
-    aa::text(b, aaValue, s, unitX - 2, cy + 9, TEXT, aa::RIGHT);
+    const int unitX = P2X + P2W - 10 - aa::textWidth(aaLabel, unit);
+    aa::text(b, aaLabel, unit, unitX, cy + 7, MUTED);
+    aa::text(b, aaValue, s, unitX - 2, cy + 9, have ? TEXT : DIM, aa::RIGHT);
   });
 }
 
@@ -453,7 +507,7 @@ void cacheDial(uint8_t page) {
     drawDial1(b, GXS[0]);
   } else {
     aa::Buf b{dialBg, P2W, P2H, P2X, P2Y};
-    drawDial2(b);
+    drawDial2(b, page == 3);
   }
   dialFor = page;
 }
@@ -465,17 +519,31 @@ void clearScreen() {
 
 void lockedText(const AbsData& d) {
   const bool live = d.link == AbsData::LIVE;
-  const char* line = d.link == AbsData::WAITING ? "WAITING FOR MEGA" : d.link == AbsData::STALE ? "NO LINK" : "UPDATE MEGA";
+  // Before any frame the board is unknown: WAITING FOR DATA, and the hint
+  // names both links. After that the screen names the board that was seen.
+  const char* name = senderName(d.sender);
+  char line[24], hint[40];
+  if (d.link == AbsData::WAITING) strlcpy(line, "WAITING FOR DATA", sizeof(line));
+  else if (d.link == AbsData::STALE) strlcpy(line, "NO LINK", sizeof(line));
+  else snprintf(line, sizeof(line), "UPDATE %s", name);
+  if (live) snprintf(hint, sizeof(hint), "Flash the new %s firmware",
+                     d.sender == AbsData::MEGA ? "Mega" : "Nano");
+  else if (d.sender == AbsData::MEGA) strlcpy(hint, "Check Mega D18 -> GPIO16, GND", sizeof(hint));
+  else if (d.sender == AbsData::NANO) strlcpy(hint, "Check Nano D5 -> GPIO16, GND", sizeof(hint));
+  else strlcpy(hint, "Nano D5 / Mega D18 -> GPIO16", sizeof(hint));
   const uint16_t color = live ? AMBER : RED;
-  if (!changed(S_LOCK, line)) return;
+  char key[32];  // Fits shown[] (39 chars); the hint follows from the line + sender.
+  snprintf(key, sizeof(key), "%s|%u", line, unsigned(d.sender));
+  if (!changed(S_LOCK, key)) return;
   render(30, 30, 260, 180, [&](aa::Buf& b) {
     aa::fill(b, BG);
     aa::roundRect(b, 30, 30, 260, 180, 14, PANEL, PANEL_EDGE, 1);
     absSymbol(b, W / 2, 84, 22, color, aaPill);
     aa::text(b, aaValue, line, W / 2, 144, color, aa::CENTER, 1);
-    aa::text(b, aaLabel, live ? "Flash the new Mega firmware" : "Check the Mega link", W / 2, 166, MUTED,
-             aa::CENTER);
-    aa::text(b, aaSmall, "Page pot A5: turn to change page", W / 2, 186, DIM, aa::CENTER, 1);
+    aa::text(b, aaLabel, hint, W / 2, 166, MUTED, aa::CENTER);
+    aa::text(b, aaSmall, d.sender == AbsData::MEGA ? "Encoder, swipe or page pot A5: change page"
+                                                   : "Encoder or swipe: change page",
+             W / 2, 186, DIM, aa::CENTER, 1);
     aa::text(b, aaSmall, "Wi-Fi ABS-Tester  |  192.168.4.1", W / 2, 201, DIM, aa::CENTER, 1);
   });
 }
@@ -529,6 +597,7 @@ inline int median3(int a, int b, int c) { return max(min(a, b), min(max(a, b), c
 // library at rotation 1).
 TouchRead readTouch() {
   SPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
+  freqInput::guardBegin();  // T_CS (GPIO33) couples into GPIO34: mask the read.
   digitalWrite(TOUCH_CS, LOW);
   SPI.transfer(0xB1);                        // Start Z1.
   const int z1 = SPI.transfer16(0xC1) >> 3;  // Read Z1, start Z2.
@@ -545,6 +614,7 @@ TouchRead readTouch() {
   d[4] = SPI.transfer16(0xD0) >> 3;          // X, then Y with power down.
   d[5] = SPI.transfer16(0) >> 3;
   digitalWrite(TOUCH_CS, HIGH);
+  freqInput::guardEnd();
   SPI.endTransaction();
   if (t.down) {
     t.x = median3(d[0], d[2], d[4]);
@@ -597,20 +667,9 @@ inline float ease(float& shownV, float target, float snap) {
   return shownV;
 }
 
-// Page 3: a placeholder until its content is designed.
-void drawPage3() {
-  render(P3X, P3Y, P3W, P3H, [](aa::Buf& b) {
-    aa::fill(b, BG);
-    panel(b, P3X, P3Y, P3W, P3H, 10);
-    aa::text(b, aaValue, "PAGE 3", W / 2, P3Y + 80, TEXT, aa::CENTER, 1);
-    aa::text(b, aaLabel, "Free page for new readings", W / 2, P3Y + 104, MUTED, aa::CENTER);
-    aa::text(b, aaSmall, "Turn the page pot (A5) to change page", W / 2, P3Y + 150, DIM, aa::CENTER, 1);
-  });
-}
-
 // Call every loop. page: 1-3; sel: the page the knob is pointing at while
-// selecting, 0 when not selecting.
-void update(const AbsData& d, uint8_t page, uint8_t sel = 0) {
+// selecting, 0 when not selecting; locked: the encoder holds the page.
+void update(const AbsData& d, uint8_t page, uint8_t sel = 0, bool locked = false) {
   const uint32_t now = millis();
   const bool running = d.link == AbsData::LIVE && d.keyOn;
   const Mode want = page == 3 ? PAGE3 : page == 2 ? PAGE2 : running ? PAGE1 : LOCKED;
@@ -620,7 +679,7 @@ void update(const AbsData& d, uint8_t page, uint8_t sel = 0) {
     if (want == PAGE1 && (mode == LOCKED || mode == NONE)) { selfTestActive = true; selfTestStartMs = now; }
     if (want != PAGE1) selfTestActive = false;
     clearScreen();
-    if (want == PAGE1 || want == PAGE2) cacheDial(want == PAGE1 ? 1 : 2);
+    if (want != LOCKED) cacheDial(want == PAGE1 ? 1 : want == PAGE2 ? 2 : 3);
     mode = want;
     lastGaugeMs = lastTextMs = 0;
   }
@@ -628,7 +687,7 @@ void update(const AbsData& d, uint8_t page, uint8_t sel = 0) {
   if (selfTestActive && (!running || testMs >= SELF_TEST_MS)) selfTestActive = false;
   const bool selfTest = selfTestActive;
 
-  if ((mode == PAGE1 || mode == PAGE2) && now - lastGaugeMs >= GAUGE_REFRESH_MS) {
+  if ((mode == PAGE1 || mode == PAGE2 || mode == PAGE3) && now - lastGaugeMs >= GAUGE_REFRESH_MS) {
     lastGaugeMs = now;
     if (mode == PAGE1) {
       const float sweep = sinf(PI * testMs / SELF_TEST_MS) * ABS_SPEED_MAX;  // Self-test: 0 -> 250 -> 0.
@@ -642,31 +701,45 @@ void update(const AbsData& d, uint8_t page, uint8_t sel = 0) {
         shownGaugeKey[i] = key;
         renderGauge1(i, v[i], have[i]);
       }
-    } else {
-      const float hz = ease(easeInput, max(0.0f, d.inputHz), 0.5f);
-      const int32_t key = lroundf(hz * 2);
+    } else if (mode == PAGE2) {
+      // Speed sensor: GPIO34 Hz / 10 = km/h; no pulses = NO SIGNAL.
+      const bool signal = d.inputHz > 0;
+      const float kmh = ease(easeInput, constrain(d.inputHz / INPUT_HZ_PER_KMH, 0.0f, INPUT_MAX_KMH), 0.2f);
+      const int32_t key = lroundf(kmh * 4) | int32_t(signal) << 16;
       if (key != shownGaugeKey[0]) {
         shownGaugeKey[0] = key;
-        renderGauge2(hz);
+        renderGauge2(kmh, 0, signal);
+      }
+    } else {
+      // Page 3: Declog from the sender; drops to 0 without live data.
+      const float hz = ease(easeDeclog, running ? constrain(d.declogHz, 0.0f, DECLOG_MAX_HZ) : 0.0f, 0.05f);
+      const int32_t key = lroundf(hz * 20);
+      if (key != shownGaugeKey[0]) {
+        shownGaugeKey[0] = key;
+        renderGauge2(hz, 1, true);
       }
     }
   }
 
   if (now - lastTextMs < TEXT_REFRESH_MS) return;
   lastTextMs = now;
-  navFooter(page, sel);
+  navFooter(page, sel, locked);
   if (mode == LOCKED) { lockedText(d); return; }
   topRow(d, running, selfTest);
-  if (mode == PAGE3) {
-    if (changed(S_PAGE3, "3")) drawPage3();
-  } else if (mode == PAGE1) {
+  if (mode == PAGE1) {
     AbsData bars = d;
     if (selfTest) { bars.speedKmh = bars.frontKmh = sinf(PI * testMs / SELF_TEST_MS) * ABS_SPEED_MAX; bars.front = true; }
     page1Text(bars);
+  } else if (mode == PAGE2) {
+    const bool signal = d.inputHz > 0;
+    const float kmh = constrain(d.inputHz / INPUT_HZ_PER_KMH, 0.0f, INPUT_MAX_KMH);
+    char key[16];
+    snprintf(key, sizeof(key), "%d %.0f", signal, d.inputHz);
+    if (changed(S_INPUT, key)) drawBigBar(0, d.inputHz, kmh, signal);
   } else {
     char key[16];
     snprintf(key, sizeof(key), "%d %.1f", running, d.declogHz);
-    if (changed(S_DECLOG, key)) drawDeclog(d.declogHz, running);
+    if (changed(S_DECLOG, key)) drawBigBar(1, d.declogHz, d.declogHz, running);
   }
 }
 

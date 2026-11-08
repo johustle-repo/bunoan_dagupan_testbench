@@ -3,6 +3,7 @@
 #include <util/atomic.h>
 #include <math.h>
 #include "PotGenerator.h"
+#include "SupplyVoltage.h"
 #include "PagePot.h"
 
 #if !defined(__AVR_ATmega2560__)
@@ -78,7 +79,7 @@ float rpm = 0;
 
 // REF1 / battery: the pin reads 0-5 V, mapped to 0-30 V through the PCB
 // calibration table (same as the ECU testbench): pin volts (x) -> true volts (y).
-constexpr float PIN_FULL_SCALE_V = 5.0f;
+// Pin volts use the measured supply (SupplyVoltage.h), not an assumed 5.00 V.
 constexpr uint8_t CAL_POINTS = 8;
 const float calPinV[CAL_POINTS] = {0.00f, 0.15f, 0.85f, 1.72f, 2.59f, 3.48f, 4.35f, 5.00f};
 const float calTrueV[CAL_POINTS] = {0.00f, 1.00f, 5.00f, 10.0f, 15.0f, 20.0f, 25.0f, 30.0f};
@@ -123,7 +124,7 @@ ISR(TIMER2_COMPA_vect) {
   previousHigh3 = high3;
 }
 
-// Reads A3 / A4 (analogRead 0-1023 = 0-5 V), filters it and returns 0-30 V
+// Reads A3 / A4 (analogRead 0-1023 = 0 V to the measured supply), filters it and returns 0-30 V
 // through the calibration table.
 float readInput(uint8_t i) {
   analogRead(inputPins[i]);  // First reading after switching pins is discarded.
@@ -137,13 +138,14 @@ float readInput(uint8_t i) {
     if (raw > highest) highest = raw;
     delayMicroseconds(500);
   }
-  const float volts = float(sum - lowest - highest) / (SAMPLES - 2) * PIN_FULL_SCALE_V / 1023.0f;
+  const float volts = float(sum - lowest - highest) / (SAMPLES - 2) * supply::volts / 1023.0f;
   if (!filterStarted[i]) { pinV[i] = volts; filterStarted[i] = true; }
   else pinV[i] += FILTER * (volts - pinV[i]);
   return getTrueVoltage(pinV[i]);
 }
 
 void readVolts() {
+  supply::read();  // Measured 5 V rail for the pin volts (about 4 ms).
   for (uint8_t i = 0; i < 2; i++) voltsMv[i] = unsigned(readInput(i) * 1000 + 0.5);
   ref1V = voltsMv[0] / 1000.0;
   batteryV = voltsMv[1] / 1000.0;
@@ -324,6 +326,7 @@ void loop() {
     Serial.print(F(" V (pin ")); Serial.print(pinV[0], 2); Serial.println(F(" V)"));
     Serial.print(F("Battery (A4): ")); Serial.print(batteryV, 2);
     Serial.print(F(" V (pin ")); Serial.print(pinV[1], 2); Serial.println(F(" V)"));
+    Serial.print(F("Supply (5V pin, measured): ")); Serial.print(supply::volts, 3); Serial.println(F(" V"));
     Serial.print(F("Page pot (A5): ")); Serial.print(pagePot::raw);
     Serial.print(F(" -> page ")); Serial.println(pagePot::page);
     Serial.println();

@@ -3,6 +3,8 @@
 #include <util/atomic.h>
 #include <math.h>
 #include <SoftwareSerial.h>
+#include "PotGenerator.h"
+#include "SupplyVoltage.h"
 
 #if !defined(__AVR_ATmega328P__)
 #error "Select Arduino Uno or Arduino Nano (ATmega328P)."
@@ -16,10 +18,12 @@
 //   D2 Declog frequency, 0-100 Hz square wave, 0-5 V (e.g. Mega D2)
 //   D13 TCS LED: steady when both speeds match (whole km/h), blinking otherwise
 //   D12 ABS LED: on when D7 is at least 10 % and 5 km/h slower than D8
-//   A0 Reference 1, A1 battery: 0-5 V at the pin mapped to 0-30 V
-//   (volts = pin volts / 5 x 30, the ECU testbench x6 formula), filtered.
-//   No pot frequency generators in this version (the Mega 2560 Pro ABS tester,
-//   arduino-mega/MegaAbsTester, has them); A2-A4, D3, D9 and D10 are free.
+//   A3 Reference 1, A4 battery: 0-5 V at the pin mapped to 0-30 V
+//   through the PCB calibration table, filtered.
+//   Pot frequency generators (PotGenerator.h), 50 % duty 0-5 V square waves:
+//   rear pot A0 -> D9 0-1500 Hz, front pot A1 -> D10 0-1500 Hz,
+//   Declog pot A2 -> D3 0-100 Hz. Jumper D9 -> D7, D10 -> D8, D3 -> D2 to self-test.
+//   Divided outputs: D4 = D9 / 10, D11 = D10 / 10 (0-150 Hz), 50 % duty.
 //   D5 (TX) -> ESP32 RX2 (GPIO16), common GND, 115200 8N1, one-way
 //   (SoftwareSerial; the USB Serial Monitor stays on the normal Serial port).
 // SoftwareSerial owns the pin-change interrupts, so Timer2 (compare A) samples
@@ -62,13 +66,13 @@ bool absActive = false;
 
 float frequencyHz1 = 0, frequencyHz2 = 0, declogHz = 0;
 float ref1V = 0, batteryV = 0;
-float pinV[2] = {0, 0};  // Filtered A0 / A1 pin volts, 0-5 V.
+float pinV[2] = {0, 0};  // Filtered A3 / A4 pin volts, 0-5 V.
 float speed1 = 0, speed2 = 0;
 float rpm = 0;
 
 // REF1 / battery: the pin reads 0-5 V, mapped to 0-30 V through the PCB
 // calibration table (same as the ECU testbench): pin volts (x) -> true volts (y).
-constexpr float PIN_FULL_SCALE_V = 5.0f;
+// Pin volts use the measured supply (SupplyVoltage.h), not an assumed 5.00 V.
 constexpr uint8_t CAL_POINTS = 8;
 const float calPinV[CAL_POINTS] = {0.00f, 0.15f, 0.85f, 1.72f, 2.59f, 3.48f, 4.35f, 5.00f};
 const float calTrueV[CAL_POINTS] = {0.00f, 1.00f, 5.00f, 10.0f, 15.0f, 20.0f, 25.0f, 30.0f};
@@ -90,7 +94,7 @@ float getTrueVoltage(float x) {
 constexpr uint8_t SAMPLES = 20;
 constexpr float FILTER = 0.2f;
 bool filterStarted[2] = {false, false};
-const uint8_t inputPins[2] = {A0, A1};          // REF1 A0, battery A1.
+const uint8_t inputPins[2] = {A3, A4};          // REF1 A3, battery A4.
 
 SoftwareSerial esp(6, 5);  // RX D6 (unused), TX D5 -> ESP32 GPIO16.
 char linkBuffer[128];
@@ -99,9 +103,11 @@ char linkBuffer[128];
 // Timer2 runs free at 500 kHz, so each sample
 // moves compare A on by 25 ticks (50 us).
 ISR(TIMER2_COMPA_vect) {
+  const uint8_t t2 = TCNT2;
   uint8_t next = OCR2A + 25;
-  if (uint8_t(next - TCNT2 - 1) > 24) next = TCNT2 + 2;  // Held off (SoftwareSerial byte): resume now.
+  if (uint8_t(next - t2 - 1) > 24) next = t2 + 2;  // Held off (SoftwareSerial byte): resume now.
   OCR2A = next;
+  potgen::declogTick(t2);  // D3 Declog generator.
   const bool high1 = D7_HIGH(), high2 = D8_HIGH(), high3 = D2_HIGH();
   const bool rise1 = high1 && !previousHigh1, rise2 = high2 && !previousHigh2, rise3 = high3 && !previousHigh3;
   if (rise1 || rise2 || rise3) {
@@ -115,7 +121,7 @@ ISR(TIMER2_COMPA_vect) {
   previousHigh3 = high3;
 }
 
-// Reads A0 / A1 (analogRead 0-1023 = 0-5 V), filters it and returns 0-30 V
+// Reads A3 / A4 (analogRead 0-1023 = 0 V to the measured supply), filters it and returns 0-30 V
 // through the calibration table.
 float readInput(uint8_t i) {
   analogRead(inputPins[i]);  // First reading after switching pins is discarded.
@@ -129,7 +135,7 @@ float readInput(uint8_t i) {
     if (raw > highest) highest = raw;
     delayMicroseconds(500);
   }
-  const float volts = float(sum - lowest - highest) / (SAMPLES - 2) * PIN_FULL_SCALE_V / 1023.0f;
+  const float volts = float(sum - lowest - highest) / (SAMPLES - 2) * supply::volts / 1023.0f;
   if (!filterStarted[i]) { pinV[i] = volts; filterStarted[i] = true; }
   else pinV[i] += FILTER * (volts - pinV[i]);
   return getTrueVoltage(pinV[i]);
@@ -138,9 +144,12 @@ float readInput(uint8_t i) {
 // A1 frame: key (always 1), brake (none, 0), D7 Hz x100, speed 1 x100,
 // REF1 mV, REF2 (unused, 0), current (unused, 0), battery mV, D8 Hz x100,
 // speed 2 x100, RPM, TCS (1 steady, 0 blinking), ABS (1 active), D2 Declog
-// Hz x100, then an XOR checksum of everything before '*'. The ESP32 shows
+// Hz x100, the rear (A0 -> D9) / front (A1 -> D10) / Declog (A2 -> D3) pot
+// generator outputs in Hz x100 (17 fields, the ESP32's GEN_FIELDS frame),
+// then an XOR checksum of everything before '*'. The ESP32 shows
 // these values as they are.
 void readVolts() {
+  supply::read();  // Measured 5 V rail for the pin volts (about 4 ms).
   for (uint8_t i = 0; i < 2; i++) voltsMv[i] = unsigned(readInput(i) * 1000 + 0.5);
   ref1V = voltsMv[0] / 1000.0;
   batteryV = voltsMv[1] / 1000.0;
@@ -148,11 +157,12 @@ void readVolts() {
 
 void sendFrame() {
   const unsigned int* mv = voltsMv;
-  const int count = snprintf(linkBuffer, sizeof(linkBuffer), "A1,1,0,%lu,%u,%u,0,0,%u,%lu,%u,%u,%u,%u,%lu",
+  const int count = snprintf(linkBuffer, sizeof(linkBuffer), "A1,1,0,%lu,%u,%u,0,0,%u,%lu,%u,%u,%u,%u,%lu,%lu,%lu,%lu",
     (unsigned long)(frequencyHz1 * 100 + 0.5), unsigned(speed1 * 100 + 0.5), mv[0], mv[1],
     (unsigned long)(frequencyHz2 * 100 + 0.5), unsigned(speed2 * 100 + 0.5),
     unsigned(rpm + 0.5), unsigned(speedsEqual), unsigned(absActive),
-    (unsigned long)(declogHz * 100 + 0.5));
+    (unsigned long)(declogHz * 100 + 0.5), (unsigned long)(potgen::outHz(0) * 100 + 0.5),
+    (unsigned long)(potgen::outHz(1) * 100 + 0.5), (unsigned long)(potgen::outHz(2) * 100 + 0.5));
   if (count < 0 || count > int(sizeof(linkBuffer) - 5)) return;
   uint8_t checksum = 0;
   for (int i = 0; i < count; i++) checksum ^= uint8_t(linkBuffer[i]);
@@ -206,7 +216,7 @@ void setup() {
     previousHigh3 = D2_HIGH();
     // Timer2 free-running in normal mode at 500 kHz (/32) for the sampler.
     // analogWrite() on D3 / D11 and tone() can't be used; Timer1 (D9 / D10)
-    // is left as Arduino set it up.
+    // belongs to the pot generators (no Servo).
     TIMSK2 = 0;
     TCCR2A = 0;
     TCCR2B = _BV(CS21) | _BV(CS20);
@@ -216,12 +226,14 @@ void setup() {
     TIMSK2 |= _BV(OCIE2A);
     windowStartUs = micros();
   }
+  potgen::begin();  // Pots A0 / A1 / A2, outputs D9 / D10 / D3.
 
   lastTcsBlink = millis();
 }
 
 void loop() {
   unsigned long now = millis();
+  potgen::update(now);  // Pots, every 100 ms.
 
   if (micros() - windowStartUs >= MEASURE_US) {
     unsigned long pulses1, pulses2, pulses3, elapsedUs, nowUs, edge[3];
@@ -308,17 +320,35 @@ void loop() {
     Serial.print(declogHz, 1);
     Serial.println(" Hz");
 
-    Serial.print("REF1 (A0): ");
+    Serial.print("Pot rear A0 -> D9: ");
+    Serial.print(potgen::outHz(0), 0);
+    Serial.print(" Hz, front A1 -> D10: ");
+    Serial.print(potgen::outHz(1), 0);
+    Serial.print(" Hz, Declog A2 -> D3: ");
+    Serial.print(potgen::outHz(2), 0);
+    Serial.println(" Hz");
+
+    Serial.print("Divided /10: D4 (D9) ");
+    Serial.print(potgen::outHz(0) / potgen::DIVIDE, 1);
+    Serial.print(" Hz, D11 (D10) ");
+    Serial.print(potgen::outHz(1) / potgen::DIVIDE, 1);
+    Serial.println(" Hz");
+
+    Serial.print("REF1 (A3): ");
     Serial.print(ref1V, 2);
     Serial.print(" V (pin ");
     Serial.print(pinV[0], 2);
     Serial.println(" V)");
 
-    Serial.print("Battery (A1): ");
+    Serial.print("Battery (A4): ");
     Serial.print(batteryV, 2);
     Serial.print(" V (pin ");
     Serial.print(pinV[1], 2);
     Serial.println(" V)");
+
+    Serial.print("Supply (5V pin, measured): ");
+    Serial.print(supply::volts, 3);
+    Serial.println(" V");
 
     Serial.println();
   }

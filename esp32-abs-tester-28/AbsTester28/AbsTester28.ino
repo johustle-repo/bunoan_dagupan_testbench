@@ -4,6 +4,7 @@
 #include "AbsDisplay.h"
 #include "DashboardPage.h"
 #include "FreqInput.h"
+#include "Encoder.h"
 
 // ABS tester: ESP32 + 2.8" ILI9341 (Adafruit libraries), fed by the Arduino
 // Nano running arduino-nano/NanoAbsTester (or the Mega 2560 Pro running
@@ -11,7 +12,8 @@
 //   key, brake, D7 rear frequency x100, rear speed x100, REF1 / REF2 mV,
 //   current mA, battery mV, D8 front frequency x100, front speed x100, RPM,
 //   TCS (1 steady, 0 blinking), ABS (1 active), D2 Declog Hz x100 and the
-//   rear / front / Declog pot generator settings in Hz x100. Older
+//   rear / front / Declog pot generator settings in Hz x100 (17 fields: Nano),
+//   plus the A5 page pot reading and page (19 fields: Mega). Older
 //   firmware stops after the battery, the front speed, ABS or Declog. REF2 and
 //   current are not wired (sent as 0) and are ignored.
 // Speed 1 (rear), speed 2 (front), RPM, TCS and ABS are shown exactly as the
@@ -21,7 +23,7 @@
 // Wi-Fi hotspot with the dashboard at http://192.168.4.1/ and the readings
 // as JSON at /api/live.
 // LCD pages: swipe left on the touchscreen for page 2, right for page 1 (REAR / FRONT speed);
-// page 2 (the 0-2000 Hz GPIO32 input gauge and the DECLOG bar, FreqInput.h).
+// page 2 (the 0-2000 Hz GPIO34 speed sensor gauge and SPEED bar, FreqInput.h; page 3 the DECLOG gauge and bar).
 const char* const AP_SSID = "ABS-Tester";
 const char* const AP_PASSWORD = "ABSdemo2026";  // At least 8 characters.
 constexpr uint8_t LINK_RX = 16, LINK_TX = 17;  // RX2, TX2 (TX unused).
@@ -34,6 +36,10 @@ bool havePacket = false;
 uint32_t lastPacketMs = 0, badFrames = 0, lastSerialReportMs = 0, bytesReceived = 0;
 AbsData latest{};
 uint8_t page = 1;  // LCD page, 1-3: the Mega's A5 page pot, or swipe left (next) / right (previous).
+// Encoder page navigation state (see encoderNav()).
+enum class Nav : uint8_t { FREE, SELECTING, LOCKED };
+Nav nav = Nav::FREE;
+uint8_t selPage = 1;  // Page the encoder points at while selecting.
 uint32_t frameCount = 0;  // Good frames so far (the page pot is read once per frame).
 AbsLamp absLamp;   // ABS light (switch-on check from the rear speed), LCD and JSON.
 
@@ -80,6 +86,7 @@ bool parseFrame(char* text) {
   latest.tcsSteady = latest.nanoLamps && values[11] == 1;
   latest.absActive = latest.nanoLamps && values[12] == 1;
   latest.declogHz = parsed >= DECLOG_FIELDS ? values[13] / 100.0f : 0;
+  latest.sender = parsed == MAX_FIELDS ? AbsData::MEGA : AbsData::NANO;
   latest.gens = parsed >= GEN_FIELDS;
   for (uint8_t i = 0; i < 3; ++i) latest.genHz[i] = latest.gens ? values[14 + i] / 100.0f : 0;
   latest.pagePot = parsed == MAX_FIELDS && values[18] >= 1;
@@ -112,8 +119,17 @@ String liveJson() {
   json += F(",\"ref1_v\":"); json += String(latest.ref1V, 3);
   json += F(",\"battery_v\":"); json += String(latest.batteryV, 3);
   json += F(",\"input_hz\":"); json += String(freqInput::hz, 1);
+  // Page 2 speed sensor: GPIO34 Hz / 10 = km/h (0-200); null = NO SIGNAL.
+  json += F(",\"input_kmh\":");
+  json += freqInput::hz > 0 ? String(min(freqInput::hz / INPUT_HZ_PER_KMH, INPUT_MAX_KMH), 1) : String("null");
   json += F(",\"page\":"); json += page;
-  // Pot generator settings (null with older Nano firmware).
+  json += F(",\"page_mode\":\"");
+  json += nav == Nav::LOCKED ? F("locked") : nav == Nav::SELECTING ? F("select") : F("free");
+  json += '"';
+  json += F(",\"sender\":");
+  json += latest.sender == AbsData::MEGA ? F("\"mega\"") : latest.sender == AbsData::NANO ? F("\"nano\"") : F("null");
+  // Pot generator settings (null with older sender firmware).
+  // Nano: rear pot A0 -> D9, front pot A1 -> D10, Declog pot A2 -> D3.
   // Mega: rear pot A1 -> D44, front pot A0 -> D3, Declog pot A2 -> D11.
   const char* const GEN_KEYS[3] = {",\"gen_rear_hz\":", ",\"gen_front_hz\":", ",\"gen_declog_hz\":"};
   for (uint8_t i = 0; i < 3; ++i) { json += GEN_KEYS[i]; json += latest.gens ? String(latest.genHz[i], 1) : String("null"); }
@@ -144,21 +160,52 @@ struct PagePotFollow {
   uint8_t lastPotPage = 0;  // 0 = not seen yet (or link lost).
   uint32_t seenFrame = 0;
 
-  void update(bool fresh) {
+  // apply false (encoder selecting or locked): keep track of the pot but
+  // leave the page alone.
+  void update(bool fresh, bool apply) {
     if (!fresh || !latest.pagePot) { lastPotPage = 0; return; }
     if (frameCount == seenFrame) return;
     seenFrame = frameCount;
     if (latest.potPage == lastPotPage) return;
     lastPotPage = latest.potPage;
+    if (!apply) return;
     page = latest.potPage;
     Serial.print(F("# PAGE POT A5 ")); Serial.print(latest.potRaw); Serial.print(F(" -> page ")); Serial.println(page);
   }
 } pagePotFollow;
 
+// KY-040 encoder page selection (Encoder.h): press to start selecting, turn
+// to pick a page (the footer's blinking dot), press again to go to it and
+// lock it there. FREE is the start-up state (swipes and the page pot work as
+// before); after the first press the screen alternates SELECTING / LOCKED.
+void encoderNav() {
+  encoder::poll();
+  const int8_t steps = encoder::takeSteps();
+  if (encoder::pressed()) {
+    if (nav != Nav::SELECTING) {
+      nav = Nav::SELECTING;
+      selPage = page;
+      encoder::clearSteps();
+      Serial.print(F("# ENCODER press -> SELECT (page ")); Serial.print(page); Serial.println(')');
+    } else {
+      nav = Nav::LOCKED;
+      page = selPage;
+      Serial.print(F("# ENCODER press -> LOCKED on page ")); Serial.println(page);
+    }
+    return;
+  }
+  if (steps && nav == Nav::SELECTING) {
+    selPage = wrapPage(selPage + steps);
+    Serial.print(F("# ENCODER turn ")); Serial.print(steps); Serial.print(F(" -> select page "));
+    Serial.println(selPage);
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   absDisplay::begin();
   freqInput::begin();
+  encoder::begin();
   nano.setRxBufferSize(512);
   nano.begin(115200, SERIAL_8N1, LINK_RX, LINK_TX);
   WiFi.mode(WIFI_AP);
@@ -172,7 +219,7 @@ void setup() {
     server.send(200, "application/json", liveJson());
   });
   server.begin();
-  Serial.println(F("ABS tester (2.8\") ready. Mega link (TX1, D18) on GPIO16 (RX2), 115200 baud."));
+  Serial.println(F("ABS tester (2.8\") ready. Nano D5 or Mega TX1 (D18) link on GPIO16 (RX2), 115200 baud."));
   Serial.print(F("Wi-Fi: ")); Serial.print(AP_SSID); Serial.print(F(" / ")); Serial.print(AP_PASSWORD);
   Serial.print(F(" | dashboard: http://")); Serial.print(WiFi.softAPIP()); Serial.println('/');
 }
@@ -214,18 +261,30 @@ void loop() {
       Serial.print(F(" Hz | REF1 ")); Serial.print(latest.ref1V, 2);
       Serial.print(F(" V | BATTERY ")); Serial.print(latest.batteryV, 2);
       if (latest.gens) {
-        Serial.print(F(" V | POT REAR ")); Serial.print(latest.genHz[0], 0);
-        Serial.print(F(" Hz, FRONT ")); Serial.print(latest.genHz[1], 0);
-        Serial.print(F(" Hz, DECLOG ")); Serial.print(latest.genHz[2], 0); Serial.print(F(" Hz"));
+        const bool mega = latest.sender == AbsData::MEGA;
+        Serial.print(mega ? F(" V | POT REAR A1->D44 ") : F(" V | POT REAR A0->D9 "));
+        Serial.print(latest.genHz[0], 0);
+        Serial.print(mega ? F(" Hz, FRONT A0->D3 ") : F(" Hz, FRONT A1->D10 "));
+        Serial.print(latest.genHz[1], 0);
+        Serial.print(mega ? F(" Hz, DECLOG A2->D11 ") : F(" Hz, DECLOG A2->D3 "));
+        Serial.print(latest.genHz[2], 0); Serial.print(F(" Hz"));
       } else Serial.print(F(" V"));
-      Serial.print(F(" | INPUT GPIO32 ")); Serial.print(freqInput::hz, 1);
-      Serial.print(F(" Hz | bad frames ")); Serial.println(badFrames);
+      Serial.print(F(" | ")); Serial.print(senderName(latest.sender));
+      Serial.print(F(" | SENSOR GPIO34 "));
+      if (freqInput::hz > 0) {
+        Serial.print(freqInput::hz, 1); Serial.print(F(" Hz = "));
+        Serial.print(min(freqInput::hz / INPUT_HZ_PER_KMH, INPUT_MAX_KMH), 1); Serial.print(F(" km/h"));
+      } else Serial.print(F("NO SIGNAL"));
+      Serial.print(F(" | bad frames ")); Serial.print(badFrames);
+      Serial.print(F(" | ")); encoder::printStatus(Serial); Serial.println();
     } else {
-      Serial.print(F("# NO DATA from the Mega: ")); Serial.print(bytesReceived);
+      Serial.print(F("# NO DATA from the ")); Serial.print(senderName(latest.sender));
+      Serial.print(F(": ")); Serial.print(bytesReceived);
       Serial.print(F(" bytes received on GPIO16, bad frames ")); Serial.print(badFrames);
       if (lastBadFrame[0]) { Serial.print(F(" | last line: ")); Serial.print(lastBadFrame); }
-      Serial.print(bytesReceived ? F("") : F(" | check Mega TX1 (D18) -> GPIO16 and GND"));
-      Serial.print(F(" | INPUT GPIO32 ")); Serial.print(freqInput::hz, 1); Serial.println(F(" Hz"));
+      Serial.print(bytesReceived ? F("") : F(" | check Nano D5 / Mega TX1 (D18) -> GPIO16 and GND"));
+      Serial.print(F(" | SENSOR GPIO34 ")); Serial.print(freqInput::hz, 1); Serial.print(F(" Hz | "));
+      encoder::printStatus(Serial); Serial.println();
     }
   }
   AbsData d = latest;
@@ -236,16 +295,25 @@ void loop() {
   // (the next start begins with it on).
   if (fresh) absLamp.update(latest.speedKmh); else absLamp.reset();
   d.absLamp = absLamp.on;
-  pagePotFollow.update(fresh);
-  // Swipe left: next page, swipe right: previous page.
+  encoderNav();
+  pagePotFollow.update(fresh, nav == Nav::FREE);
+  // Swipe left: next page, swipe right: previous page. While selecting a
+  // swipe moves the selection instead; while locked swipes are ignored.
   const int8_t s = absDisplay::swipe();
   if (s) {
-    page = wrapPage(page - s);
     Serial.print(F("# SWIPE ")); Serial.print(s < 0 ? F("left") : F("right"));
     Serial.print(F(" (raw dx ")); Serial.print(absDisplay::lastSwipeDx); Serial.print(F(", dy "));
-    Serial.print(absDisplay::lastSwipeDy); Serial.print(F(") -> page ")); Serial.println(page);
+    Serial.print(absDisplay::lastSwipeDy);
+    if (nav == Nav::LOCKED) Serial.println(F(") ignored, page locked"));
+    else if (nav == Nav::SELECTING) {
+      selPage = wrapPage(selPage - s);
+      Serial.print(F(") -> select page ")); Serial.println(selPage);
+    } else {
+      page = wrapPage(page - s);
+      Serial.print(F(") -> page ")); Serial.println(page);
+    }
   }
-  absDisplay::update(d, page);
+  absDisplay::update(d, page, nav == Nav::SELECTING ? selPage : 0, nav == Nav::LOCKED);
   server.handleClient();
   yield();
 }

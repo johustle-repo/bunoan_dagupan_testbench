@@ -64,3 +64,9 @@ Battery (A4): 13.80 V (pin 2.38 V)
 ## Page pot on A5 (page navigator)
 
 Wiring: pot ends → 5V and GND, wiper → A5 (`PagePot.h`). Every 50 ms the Mega averages 8 `analogRead`s and picks the page: **0–341 → page 1, 342–682 → page 2, 683–1023 → page 3**. Near a boundary the page only changes once the reading is 8 counts past it, so a pot left on the line doesn't flick between pages (`HYSTERESIS` in `PagePot.h`). The reading (0–1023) and the page (1–3) go at the end of the `A1` frame; the ESP32 switches to that page whenever the pot's page changes. The Serial Monitor report shows `Page pot (A5): … -> page n`.
+
+## Measured supply for REF / battery (`SupplyVoltage.h`)
+
+The 0–30 V inputs no longer assume the board runs on exactly 5.00 V. Before each REF / battery read the chip's internal 1.1 V bandgap is read against the 5 V rail (AVcc = 1.1 V × 1023 / counts, filtered), and the pin volts are `counts × measured supply / 1023` before they go through the PCB calibration table. On USB the rail is often 4.7–5.1 V; at 4.85 V the old fixed 5.00 V read a 12.00 V input as about 11.6 V. The measured rail is printed on the USB Serial Monitor (`Supply (5V pin, measured)` / `5V:`).
+
+**Calibrate once per board:** the bandgap is 1.0–1.2 V from chip to chip. Measure the board's 5V pin with a multimeter, compare it with the printed supply, and set `BANDGAP_V = 1.100 × meter volts / printed volts` in `SupplyVoltage.h`. Readings outside 4.0–5.5 V are ignored (the last good value is kept).
