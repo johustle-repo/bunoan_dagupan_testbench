@@ -34,6 +34,7 @@ constexpr float SPEED_MAX = 250, RPM_MAX = 15000;
 struct DisplayData {
   enum Link : uint8_t { WAITING, LIVE, STALE } link;
   bool keyOn, brake, checkEngine, coolantWarning;  // brake: the D9 ABS input on U6.
+  bool absLamp;            // ABS lamp from the speed (AbsLamp in ReceiverV2.ino).
   bool declog;             // Mega 2560 Pro (U6) Declog lamp.
   bool declogHzAvailable;  // Newer U6 frames: Declog frequency from the Mega's A9 pot.
   float declogHz;          // 0-100 Hz.
@@ -222,8 +223,8 @@ inline uint32_t to888(uint16_t c) {
 
 // ---- Lamps -----------------------------------------------------------------
 // Smart key, winker, check engine, ABS, TCS (no Declog or Temp lamp). Winker
-// and TCS have no input on this bench. ABS turns orange with the brake
-// (Uno/Nano/Mega D9) or ABS (Mega 2560 Pro D9) input.
+// and TCS have no input on this bench. ABS follows the speed (AbsLamp in
+// ReceiverV2.ino), not the D9 input.
 constexpr uint8_t LAMP_COUNT = 5;
 enum Lamp : uint8_t { L_KEY, L_WINKER, L_CHECK, L_ABS, L_TCS };
 const char* const LAMP_NAMES[LAMP_COUNT] = {"KEY", "WINKER", "CHECK ENGINE", "ABS", "TCS"};
@@ -250,7 +251,9 @@ void lampColors(const DisplayData& d, bool selfTest, float speed, uint32_t now, 
   if (selfTest) return;
   if (fresh && d.keyOn) out[L_KEY] = race ? GREEN : ACCENT;
   if (running && milLit(d, speed, now)) out[L_CHECK] = ORANGE;
-  if (running) out[L_ABS] = d.brake ? ORANGE : GREEN;
+  // ABS: lit from power-on until the speed passes 10 km/h, then lit at
+  // 10 km/h or less and off at 0 (AbsLamp); shown with or without a link.
+  if (d.absLamp) out[L_ABS] = ORANGE;
 }
 
 void drawClassicLamp(uint8_t i, uint16_t color) {

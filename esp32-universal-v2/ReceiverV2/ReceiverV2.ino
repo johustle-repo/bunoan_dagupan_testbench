@@ -53,7 +53,23 @@ uint32_t sampleSequence = 0;
 uint32_t lastSerialReportMs = 0;
 uint8_t injectedFault = 0;
 float faultLimitedSpeed = 0;
-uint32_t lastSpeedMs = 0;
+
+// ABS lamp on the TFT, from the speed (the D9 ABS input no longer drives it):
+//   board powered: ON;
+//   speed above 10 km/h: OFF;
+//   after that: 10 km/h or less ON again, 0 km/h OFF.
+// Key off or the sender link lost counts as switching off, so the next start
+// begins with the lamp ON again.
+struct AbsLamp {
+  bool checked = false;  // Has been above 10 km/h since switch-on.
+  bool on = true;
+  void reset() { checked = false; on = true; }
+  void update(float kmh) {
+    if (kmh > 10) { checked = true; on = false; }
+    else if (!checked) on = true;
+    else on = kmh >= 0.5f;  // Shows as 0 km/h: OFF.
+  }
+} absLamp;
 
 // RPM from the D7 frequency and speed from the D8 frequency (U6) or D7 (the
 // other boards): speed = Hz / 6 km/h, max 250; RPM = Hz x 15000 / 1549, so
@@ -207,6 +223,7 @@ void updateLocalDisplay() {
   d.link = !havePacket ? DisplayData::WAITING : stale ? DisplayData::STALE : DisplayData::LIVE;
   d.keyOn = smartKeyOn;
   d.brake = brakePressed;
+  d.absLamp = absLamp.on;
   d.declog = declogOn;
   d.declogHzAvailable = haveDeclogHz && !stale;
   d.declogHz = declogHz;
@@ -270,6 +287,7 @@ String telemetryJson() {
   json += F(",\"acquisition_enabled\":"); json += smartKeyOn ? F("true") : F("false");
   json += F(",\"frame\":\""); json += frameId; json += '"';
   json += F(",\"brake_pressed\":"); json += brakePressed ? F("true") : F("false");
+  json += F(",\"abs_lamp\":"); json += absLamp.on ? F("true") : F("false");  // TFT ABS lamp (from the speed).
   json += F(",\"declog\":"); json += !haveDeclog ? F("null") : declogOn ? F("true") : F("false");
   json += F(",\"declog_hz\":"); json += haveDeclogHz ? String(declogHz, 2) : String(F("null"));
   const uint8_t activeInjected = !stale && smartKeyOn ? injectedFault : 0;
@@ -481,16 +499,14 @@ void loop() {
   const bool fresh = havePacket && uint32_t(now-lastPacketMs) <= 3000;
   // No frames for 3 s: the sender is off or unplugged, so the smart key is off.
   if (!fresh && smartKeyOn) { smartKeyOn = false; updateDiagnostics(); }
-  if (!fresh || !smartKeyOn) { faultLimitedSpeed = 0; engineRpm = 0; injectedFault = 0; }
+  if (!fresh || !smartKeyOn) { faultLimitedSpeed = 0; engineRpm = 0; injectedFault = 0; absLamp.reset(); }
   else {
-    // Brake (ABS on U6) and injected faults pull the speed to zero; RPM follows D7 Hz only.
-    const float target = injectedFault || brakePressed ? 0 : min(speedFrequencyHz / HZ_PER_KMH, SPEED_MAX_KMH);
+    // Speed follows the frequency directly (no ramp, the ABS input no longer
+    // touches it); injected faults still pull it to zero. RPM follows D7 Hz.
+    faultLimitedSpeed = injectedFault ? 0 : min(speedFrequencyHz / HZ_PER_KMH, SPEED_MAX_KMH);
     engineRpm = min(frequencyHz * RPM_PER_HZ, ENGINE_RPM_MAX);
-    const float step = 100.0f * uint32_t(now-lastSpeedMs)/1000.0f;
-    if (faultLimitedSpeed < target) faultLimitedSpeed = min(target, faultLimitedSpeed+step);
-    else faultLimitedSpeed = max(target, faultLimitedSpeed-step);
+    absLamp.update(faultLimitedSpeed);
   }
-  lastSpeedMs = now;
   updateLocalDisplay();
   server.handleClient();
   yield();
