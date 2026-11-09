@@ -10,14 +10,15 @@
 // AaFonts.h, into off-screen strips that are pushed in one SPI burst each, so
 // nothing flickers. Two pages: swipe left for page 2, swipe right for page 1.
 //   Header (both pages): REF1 | BAT.
-//   Page 1: REAR (D7, left) and FRONT (D8, right) speedometers, 0-250 km/h,
-//           each with its speed bar below.
+//   Page 1: one FRONT (D8) speedometer, 0-250 km/h, with the REAR (D7)
+//           speed bar below.
 //   Page 2: SPEED SENSOR gauge for the ESP32's own frequency input (GPIO34),
 //           0-2000 Hz shown as 0-200 km/h, with the SPEED bar below (km/h);
 //           NO SIGNAL when no pulses arrive.
 //   Page 3: one 0-100 Hz DECLOG gauge (the sender's D2) and the DECLOG bar
 //           below (0-100 Hz shown as 0-100 %).
-//   Footer (all pages): PAGE n/3 | ABS light | page dots | TCS light | page name.
+//   Footer: PAGE n/3 | ABS light | page dots | TCS light | page name
+//   (the ABS / TCS lights on page 1 only).
 // Page change: the Mega's A5 page pot (0-341 page 1, 342-682 page 2,
 // 683-1023 page 3), or a swipe left / right on the touchscreen.
 // Page 1 needs the sender (WAITING FOR DATA / NO LINK until data arrives, then
@@ -133,12 +134,8 @@ Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_RST);
 // Header (both pages): REF1 | BAT.
 constexpr int TOP_Y = 3, TOP_H = 30;
 constexpr int TOP_X[2] = {4, 162}, TOP_W = 154;
-// Page 1: two speedometers and their speed bars.
-constexpr int GY = 37, GH = 140, GW = 154;
-constexpr int GXS[2] = {4, 162};                 // REAR (left), FRONT (right); speed bars follow.
-constexpr float DCY1 = GY + 90, DR1 = 66;         // Dial centre height and radius.
-constexpr int SBY = 181, SBH = 28;               // Speed bars.
-// Page 2: the 0-2000 Hz gauge and the DECLOG bar.
+// Pages 1-3: one big gauge and a bar panel below (page 1: FRONT gauge,
+// REAR bar; page 2: speed sensor gauge and bar; page 3: DECLOG).
 constexpr int P2X = 4, P2Y = 37, P2W = 312, P2H = 142;
 constexpr float DCX2 = 160, DCY2 = P2Y + 124, DR2 = 106;
 constexpr int PLATE_W = 88, PLATE_H = 44, PLATE_Y = DCY2 - 46;
@@ -154,15 +151,12 @@ constexpr int P3X = 4, P3Y = 37, P3W = 312, P3H = 182;
 
 const char* const TOP_LABELS[2] = {"REF1", "BAT"};
 const uint16_t TOP_ACCENTS[2] = {ACCENT, AMBER};
-const char* const GAUGE_LABELS[2] = {"REAR", "FRONT"};
-const uint16_t GAUGE_COLORS[2] = {RED, GREEN};
 const char* const LAMP_LABELS[2] = {"ABS", "TCS"};
 
 // Strips of the screen are drawn here, then pushed.
 constexpr int SCRATCH_PX = 320 * 28;
 uint16_t scratch[SCRATCH_PX];
-// Static dial of the current page, drawn once per page change (page 1: one
-// speedometer face, used for both). Null if the heap had no room; the dial is
+// Static dial of the current page, drawn once per page change. Null if the heap had no room; the dial is
 // then drawn again with every gauge frame.
 uint16_t* dialBg = nullptr;
 
@@ -173,7 +167,7 @@ char shown[SLOT_COUNT][40];
 uint32_t lastGaugeMs = 0, lastTextMs = 0, selfTestStartMs = 0;
 bool selfTestActive = false;
 int32_t shownGaugeKey[2] = {-1, -1};
-float easeRear = 0, easeFront = 0, easeInput = 0, easeDeclog = 0;  // Needle positions, eased toward the readings.
+float easeFront = 0, easeInput = 0, easeDeclog = 0;  // Needle positions, eased toward the readings.
 
 // True (and remembered) when a slot's content key differs from what is shown.
 bool changed(uint8_t slot, const char* key) {
@@ -327,112 +321,60 @@ void navFooter(uint8_t page, uint8_t sel, bool locked) {
 }
 
 // REF1 / BAT and the ABS / TCS lights (TCS blinks at 2 Hz; the self-test
-// lights both). Without live data both lights stay off.
-void topRow(const AbsData& d, bool live, bool selfTest) {
+// lights both). Without live data both lights stay off. lamps = false (pages
+// 2 and 3): the lights are not drawn at all.
+void topRow(const AbsData& d, bool live, bool selfTest, bool lamps) {
   char key[16];
   for (uint8_t i = 0; i < 2; ++i) {
     const float v = i ? d.batteryV : d.ref1V;
     snprintf(key, sizeof(key), "%.2f", v);
     if (changed(S_TOP0 + i, key)) drawTop(i, v);
   }
+  if (!lamps) return;
   const bool blinkOn = (millis() / 250) % 2;
   const bool lit[2] = {live && (selfTest || d.absLamp), live && (selfTest || (tcsBlinking(d) && blinkOn))};
   snprintf(key, sizeof(key), "%d%d", lit[0], lit[1]);
   if (changed(S_LAMPS, key)) drawLamps(lit);
 }
 
-// ---- Page 1: REAR and FRONT speedometers ----
-
-void drawDial1(aa::Buf& b, int gx) {
-  aa::fill(b, BG);
-  panel(b, gx, GY, GW, GH, 10);
-  dialFace(b, gx + GW / 2.0f, DCY1, DR1, ABS_SPEED_MAX, 10, 50, SPEED_RED, aaSmall, 26, 0.75f);
-}
-
-// Lit arc to the speed, the needle (red rear, green front), the label in the
-// corner and the digital speed under the centre. `have` false: no needle, "--".
-void renderGauge1(uint8_t i, float kmh, bool have) {
-  const int gx = GXS[i];
-  const float cx = gx + GW / 2.0f;
-  char digits[6];
-  if (have) snprintf(digits, sizeof(digits), "%d", int(lroundf(kmh)));
-  else strlcpy(digits, "--", sizeof(digits));
-  render(gx, GY, GW, GH, [&](aa::Buf& b) {
-    if (dialBg && dialFor == 1) memcpy(b.px, dialBg + (b.oy - GY) * GW, b.w * b.h * 2);
-    else drawDial1(b, gx);
-    aa::text(b, aaLabel, GAUGE_LABELS[i], gx + 10, GY + 17, GAUGE_COLORS[i], aa::LEFT, 1);
-    if (have) {
-      const float a = angleOf(kmh, ABS_SPEED_MAX);
-      aa::arc(b, cx, DCY1, DR1 - 5, DR1, PI, a,
-              [](float ang) { return speedColor((ang - PI) / PI * ABS_SPEED_MAX); });
-      needle(b, cx, DCY1, a, 7, DR1 - 3, 4.0f, 1.4f, GAUGE_COLORS[i], i == 0);
-    }
-    aa::circle(b, cx, DCY1, 5, have ? GAUGE_COLORS[i] : DIM);
-    aa::circle(b, cx, DCY1, 2, PLATE);
-    const int wd = aa::textWidth(aaBig, digits), wu = aa::textWidth(aaSmall, "km/h");
-    const int x = cx - (wd + 4 + wu) / 2;
-    const int end = aa::text(b, aaBig, digits, x, DCY1 + 44, have && kmh >= SPEED_RED ? RED : TEXT);
-    aa::text(b, aaSmall, "km/h", end + 4, DCY1 + 44, MUTED);
-  });
-}
-
-void drawSpeedBar(uint8_t i, float kmh, bool have) {
-  const int gx = GXS[i];
-  render(gx, SBY, GW, SBH, [&](aa::Buf& b) {
-    aa::fill(b, BG);
-    panel(b, gx, SBY, GW, SBH, 7);
-    constexpr int LEN = 82;
-    const int x0 = gx + 10, cy = SBY + SBH / 2;
-    aa::roundRect(b, x0, cy - 4, LEN, 8, 4, TRACK);
-    const float f = have ? constrain(kmh / ABS_SPEED_MAX, 0.0f, 1.0f) : 0;
-    if (f > 0.01f) aa::roundRect(b, x0, cy - 4, max(8.0f, f * LEN), 8, 4, speedColor(kmh));
-    char s[12];
-    if (have) snprintf(s, sizeof(s), "%.0f km/h", kmh);
-    else strlcpy(s, "-- km/h", sizeof(s));
-    aa::text(b, aaLabel, s, gx + GW - 10, cy + 5, TEXT, aa::RIGHT);
-  });
-}
-
-void page1Text(const AbsData& d) {
-  char key[16];
-  const float speeds[2] = {d.speedKmh, d.frontKmh};
-  const bool have[2] = {true, d.front};
-  for (uint8_t i = 0; i < 2; ++i) {
-    snprintf(key, sizeof(key), "%d %.0f", have[i], speeds[i]);
-    if (changed(S_BAR0 + i, key)) drawSpeedBar(i, speeds[i], have[i]);
-  }
-}
-
-// ---- Pages 2 and 3: one big gauge with a bar panel below ----
+// ---- Pages 1-3: one big gauge with a bar panel below ----
+// Page 1: FRONT speedometer (D8, green needle, 0-250 km/h, lit arc cyan ->
+//         amber -> red, red from 210; "--" when the frame has no front
+//         sensor), REAR speed bar below (bar and value in km/h).
 // Page 2: SPEED SENSOR, the ESP32's own GPIO34 input, 0-2000 Hz shown as
 //         0-200 km/h (10 Hz per km/h, red from 180), SPEED bar in km/h below.
 //         No pulses for 2.5 s (FreqInput.h) = NO SIGNAL: the plate shows
-//         NO SIGNAL / --, the bar "NO SIGNAL ON GPIO34" in red.
+//         NO SIGNAL / --, the bar NO SPEED SENSOR READING in red.
 // Page 3: the 0-100 Hz DECLOG gauge (the sender's D2), DECLOG bar (0-100 %) below.
+// The LCD shows no pin names or raw input Hz (the serial log and web
+// dashboard still do).
 struct BigGauge {
-  const char* title; const char* pin; const char* unit;
+  const char* title; const char* unit;
   float maxV; int minor, major; float redFrom;
   const char* barName; bool barPercent;  // Bar value: % of the range, or the gauge unit.
+  uint16_t needleColor, dotColor;
 };
-const BigGauge BIG_GAUGES[2] = {
-    {"SPEED SENSOR", "GPIO34", "km/h", INPUT_MAX_KMH, 10, 50, INPUT_RED_KMH, "SPEED", false},
-    {"DECLOG", "D2", "Hz", DECLOG_MAX_HZ, 5, 25, DECLOG_MAX_HZ + 1, "DECLOG", true}};
+enum : uint8_t { G_INPUT, G_DECLOG, G_FRONT };  // Page 2, page 3, page 1.
+const BigGauge BIG_GAUGES[3] = {
+    {"SPEED SENSOR", "km/h", INPUT_MAX_KMH, 10, 50, INPUT_RED_KMH, "SPEED", false, RED, ACCENT},
+    {"DECLOG", "Hz", DECLOG_MAX_HZ, 5, 25, DECLOG_MAX_HZ + 1, "DECLOG", true, RED, ACCENT},
+    {"FRONT", "km/h", ABS_SPEED_MAX, 10, 50, SPEED_RED, "REAR", false, GREEN, GREEN}};
+inline uint8_t pageOf(uint8_t which) { return which == G_FRONT ? 1 : which + 2; }
 
-// which: 0 = page 2 (speed sensor), 1 = page 3 (Declog).
+// which: G_FRONT (page 1), G_INPUT (page 2, speed sensor), G_DECLOG (page 3).
 void drawDial2(aa::Buf& b, uint8_t which) {
   const BigGauge& g = BIG_GAUGES[which];
   aa::fill(b, BG);
   panel(b, P2X, P2Y, P2W, P2H, 10);
   dialFace(b, DCX2, DCY2, DR2, g.maxV, g.minor, g.major, g.redFrom, aaDial, 30, 1.0f);
-  aa::circle(b, 16, P2Y + 13, 3, ACCENT);
+  aa::circle(b, 16, P2Y + 13, 3, g.dotColor);
   aa::text(b, aaLabel, g.title, 24, P2Y + 18, TEXT, aa::LEFT, 1);
-  aa::text(b, aaSmall, g.pin, P2X + P2W - 10, P2Y + 17, MUTED, aa::RIGHT, 1);
 }
 
 // v: the reading in the gauge's unit; signal false = NO SIGNAL on the plate.
 void renderGauge2(float v, uint8_t which, bool signal) {
   const BigGauge& g = BIG_GAUGES[which];
-  const uint8_t dialPage = which + 2;  // dialBg holds this page's face.
+  const uint8_t dialPage = pageOf(which);  // dialBg holds this page's face.
   char digits[6];
   if (signal) snprintf(digits, sizeof(digits), "%d", int(lroundf(constrain(v, 0.0f, 9999.0f))));
   else strlcpy(digits, "--", sizeof(digits));
@@ -442,48 +384,52 @@ void renderGauge2(float v, uint8_t which, bool signal) {
     else drawDial2(b, which);
     const float a = angleOf(signal ? v : 0, g.maxV);
     const float redA = angleOf(g.redFrom, g.maxV);
-    aa::arc(b, DCX2, DCY2, DR2 - 7, DR2, PI, a, [redA](float ang) { return ang >= redA ? RED : ACCENT; });
-    needle(b, DCX2, DCY2, a, 26, DR2 - 3, 5.5f, 1.8f, RED, true);
+    if (which == G_FRONT) {
+      if (signal) aa::arc(b, DCX2, DCY2, DR2 - 7, DR2, PI, a,
+                          [](float ang) { return speedColor((ang - PI) / PI * ABS_SPEED_MAX); });
+    } else aa::arc(b, DCX2, DCY2, DR2 - 7, DR2, PI, a, [redA](float ang) { return ang >= redA ? RED : ACCENT; });
+    if (signal || which != G_FRONT) needle(b, DCX2, DCY2, a, 26, DR2 - 3, 5.5f, 1.8f, g.needleColor, true);
     aa::roundRect(b, px - 3, PLATE_Y - 3, PLATE_W + 6, PLATE_H + 6, 11, FACE);  // Gap around the plate.
     aa::roundRect(b, px, PLATE_Y, PLATE_W, PLATE_H, 8, PLATE, signal ? PLATE_EDGE : RED, 1);
     aa::text(b, aaSmall, signal ? g.unit : "NO SIGNAL", DCX2, PLATE_Y + 12, signal ? MUTED : RED, aa::CENTER, 1);
-    aa::text(b, aaBig, digits, DCX2, PLATE_Y + 41, signal ? TEXT : DIM, aa::CENTER, 1);
+    const bool hot = which == G_FRONT && signal && v >= SPEED_RED;
+    aa::text(b, aaBig, digits, DCX2, PLATE_Y + 41, hot ? RED : signal ? TEXT : DIM, aa::CENTER, 1);
   });
 }
 
-// Bar panel under the big gauge: name and pin / Hz at the left, the bar, and
-// the value at the right.
-//   Page 2: SPEED, GPIO34 Hz, bar and value in km/h (0-200);
-//           no pulses: "NO SIGNAL ON GPIO34" in red, empty bar, "--".
-//   Page 3: DECLOG, D2 Hz, bar and value as 0-100 % (NO LINK without data).
-void drawBigBar(uint8_t which, float hz, float v, bool have) {
+// Bar panel under the big gauge: the name at the left, the bar, and the
+// value at the right.
+//   Page 2: SPEED, bar and value in km/h (0-200);
+//           no pulses: NO SPEED SENSOR READING in red across the panel.
+//   Page 3: DECLOG, bar and value as 0-100 % (NO LINK under the name without data).
+//   Page 1: REAR, bar (cyan -> amber -> red) and value in km/h.
+void drawBigBar(uint8_t which, float v, bool have) {
   const BigGauge& g = BIG_GAUGES[which];
   const float frac = constrain(v / g.maxV, 0.0f, 1.0f);
   const char* unit = g.barPercent ? "%" : g.unit;
-  if (!have && !which) {
+  if (!have && which == G_INPUT) {
     // Speed sensor with no pulses: the whole panel is the error message.
     render(P2X, DY, P2W, DH, [&](aa::Buf& b) {
       aa::fill(b, BG);
       panel(b, P2X, DY, P2W, DH);
       aa::roundRect(b, P2X + 1, DY + 1, 4, DH - 2, 2, RED);
       aa::text(b, aaLabel, "NO SPEED SENSOR READING", W / 2, DY + 16, RED, aa::CENTER, 1);
-      aa::text(b, aaSmall, "Check the sensor and its wire to GPIO34", W / 2, DY + 29, MUTED, aa::CENTER);
+      aa::text(b, aaSmall, "Check the sensor and its wire", W / 2, DY + 29, MUTED, aa::CENTER);
     });
     return;
   }
   render(P2X, DY, P2W, DH, [&](aa::Buf& b) {
     aa::fill(b, BG);
     panel(b, P2X, DY, P2W, DH);
-    aa::text(b, aaLabel, g.barName, P2X + 10, DY + 16, TEXT, aa::LEFT, 1);
-    char s[24];
-    if (have) snprintf(s, sizeof(s), which ? "%s  %.1f Hz" : "%s  %.0f Hz", g.pin, hz);
-    else if (which) strlcpy(s, "NO LINK", sizeof(s));
-    else snprintf(s, sizeof(s), "NO SIGNAL ON %s", g.pin);
-    aa::text(b, aaSmall, s, P2X + 10, DY + 29, have ? MUTED : RED, aa::LEFT);
+    // Name centred in the panel; without data it moves up for NO LINK below.
+    aa::text(b, aaLabel, g.barName, P2X + 10, have ? DY + 23 : DY + 16, TEXT, aa::LEFT, 1);
+    if (!have) aa::text(b, aaSmall, "NO LINK", P2X + 10, DY + 29, RED, aa::LEFT);
+    char s[12];
     constexpr int X0 = P2X + 104, LEN = 128;
     const int cy = DY + DH / 2;
     aa::roundRect(b, X0, cy - 5, LEN, 10, 5, TRACK);
-    if (have && frac > 0.005f) aa::roundRect(b, X0, cy - 5, max(10.0f, frac * LEN), 10, 5, ACCENT);
+    const uint16_t fill = which == G_FRONT ? speedColor(v) : ACCENT;
+    if (have && frac > 0.005f) aa::roundRect(b, X0, cy - 5, max(10.0f, frac * LEN), 10, 5, fill);
     if (have) snprintf(s, sizeof(s), "%.0f", g.barPercent ? frac * 100 : v);
     else strlcpy(s, "--", sizeof(s));
     const int unitX = P2X + P2W - 10 - aa::textWidth(aaLabel, unit);
@@ -502,13 +448,8 @@ void forget() {
 // Draws the page's static dial into dialBg.
 void cacheDial(uint8_t page) {
   if (!dialBg || dialFor == page) return;
-  if (page == 1) {
-    aa::Buf b{dialBg, GW, GH, GXS[0], GY};
-    drawDial1(b, GXS[0]);
-  } else {
-    aa::Buf b{dialBg, P2W, P2H, P2X, P2Y};
-    drawDial2(b, page == 3);
-  }
+  aa::Buf b{dialBg, P2W, P2H, P2X, P2Y};
+  drawDial2(b, page == 1 ? G_FRONT : page == 3 ? G_DECLOG : G_INPUT);
   dialFor = page;
 }
 
@@ -691,15 +632,13 @@ void update(const AbsData& d, uint8_t page, uint8_t sel = 0, bool locked = false
     lastGaugeMs = now;
     if (mode == PAGE1) {
       const float sweep = sinf(PI * testMs / SELF_TEST_MS) * ABS_SPEED_MAX;  // Self-test: 0 -> 250 -> 0.
-      const float rear = selfTest ? sweep : ease(easeRear, constrain(d.speedKmh, 0.0f, ABS_SPEED_MAX), 0.2f);
+      // FRONT speedometer only; the rear speed is in the bar below.
       const float front = selfTest ? sweep : ease(easeFront, constrain(d.frontKmh, 0.0f, ABS_SPEED_MAX), 0.2f);
-      const float v[2] = {rear, front};
-      const bool have[2] = {true, selfTest || d.front};
-      for (uint8_t i = 0; i < 2; ++i) {
-        const int32_t key = lroundf(v[i] * 2) | int32_t(have[i]) << 12;
-        if (key == shownGaugeKey[i]) continue;
-        shownGaugeKey[i] = key;
-        renderGauge1(i, v[i], have[i]);
+      const bool have = selfTest || d.front;
+      const int32_t key = lroundf(front * 4) | int32_t(have) << 16;
+      if (key != shownGaugeKey[0]) {
+        shownGaugeKey[0] = key;
+        renderGauge2(front, G_FRONT, have);
       }
     } else if (mode == PAGE2) {
       // Speed sensor: GPIO34 Hz / 10 = km/h; no pulses = NO SIGNAL.
@@ -708,7 +647,7 @@ void update(const AbsData& d, uint8_t page, uint8_t sel = 0, bool locked = false
       const int32_t key = lroundf(kmh * 4) | int32_t(signal) << 16;
       if (key != shownGaugeKey[0]) {
         shownGaugeKey[0] = key;
-        renderGauge2(kmh, 0, signal);
+        renderGauge2(kmh, G_INPUT, signal);
       }
     } else {
       // Page 3: Declog from the sender; drops to 0 without live data.
@@ -716,7 +655,7 @@ void update(const AbsData& d, uint8_t page, uint8_t sel = 0, bool locked = false
       const int32_t key = lroundf(hz * 20);
       if (key != shownGaugeKey[0]) {
         shownGaugeKey[0] = key;
-        renderGauge2(hz, 1, true);
+        renderGauge2(hz, G_DECLOG, true);
       }
     }
   }
@@ -725,21 +664,24 @@ void update(const AbsData& d, uint8_t page, uint8_t sel = 0, bool locked = false
   lastTextMs = now;
   navFooter(page, sel, locked);
   if (mode == LOCKED) { lockedText(d); return; }
-  topRow(d, running, selfTest);
+  topRow(d, running, selfTest, mode == PAGE1);  // ABS / TCS lights on page 1 only.
   if (mode == PAGE1) {
-    AbsData bars = d;
-    if (selfTest) { bars.speedKmh = bars.frontKmh = sinf(PI * testMs / SELF_TEST_MS) * ABS_SPEED_MAX; bars.front = true; }
-    page1Text(bars);
+    // REAR speed bar (the self-test sweeps it with the needle).
+    const float rear = selfTest ? sinf(PI * testMs / SELF_TEST_MS) * ABS_SPEED_MAX
+                                : constrain(d.speedKmh, 0.0f, ABS_SPEED_MAX);
+    char key[16];
+    snprintf(key, sizeof(key), "%.0f", rear);
+    if (changed(S_BAR0, key)) drawBigBar(G_FRONT, rear, true);
   } else if (mode == PAGE2) {
     const bool signal = d.inputHz > 0;
     const float kmh = constrain(d.inputHz / INPUT_HZ_PER_KMH, 0.0f, INPUT_MAX_KMH);
     char key[16];
-    snprintf(key, sizeof(key), "%d %.0f", signal, d.inputHz);
-    if (changed(S_INPUT, key)) drawBigBar(0, d.inputHz, kmh, signal);
+    snprintf(key, sizeof(key), "%d %.0f", signal, kmh);
+    if (changed(S_INPUT, key)) drawBigBar(G_INPUT, kmh, signal);
   } else {
     char key[16];
-    snprintf(key, sizeof(key), "%d %.1f", running, d.declogHz);
-    if (changed(S_DECLOG, key)) drawBigBar(1, d.declogHz, d.declogHz, running);
+    snprintf(key, sizeof(key), "%d %.0f", running, d.declogHz);
+    if (changed(S_DECLOG, key)) drawBigBar(G_DECLOG, d.declogHz, running);
   }
 }
 

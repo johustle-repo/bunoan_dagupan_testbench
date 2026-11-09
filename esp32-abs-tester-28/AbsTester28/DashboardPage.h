@@ -4,9 +4,9 @@
 // Wi-Fi dashboard for the ABS tester, served from flash at http://192.168.4.1/.
 // Shows everything the three LCD pages show, on one screen:
 //   header: REF1 | ABS TESTER + link pill | BAT;
-//   row 1 (LCD page 1): REAR (left, red) and FRONT (right, green) 0-250 km/h
-//     speedometers with their speed bars;
-//   row 2: SPEED SENSOR (LCD page 2: GPIO34, 0-2000 Hz = 0-200 km/h, red from
+//   row 1 (LCD page 1): the FRONT 0-250 km/h speedometer (green) with the
+//     REAR speed bar below it;
+//   row 2: SPEED SENSOR (LCD page 2: 0-200 km/h, red from
 //     180, NO SPEED SENSOR READING with no pulses) and DECLOG (LCD page 3:
 //     0-100 Hz gauge with the 0-100 % bar);
 //   footer: round ABS / TCS lights, KEY ON, the LCD page chip (page, name and
@@ -54,16 +54,17 @@ background:var(--red);transition:background .3s}
 .gauge h2{margin:0;display:flex;justify-content:space-between;align-items:baseline;gap:8px;font-size:15px;font-weight:700;letter-spacing:1px;color:var(--c)}
 .gauge h2 small{font-size:12px;font-weight:600;letter-spacing:.5px;color:var(--muted)}
 .gauge svg{width:100%;display:block;overflow:visible}
+.wide{grid-column:1/-1}.wide svg{max-width:480px;margin:0 auto}
 .ndl{transform-box:view-box;transform-origin:130px 140px;transition:transform .25s linear,opacity .25s}
 .lit{transition:stroke-dasharray .25s linear,stroke .25s}
 .stale{opacity:.42;filter:saturate(.35)}
 .fault{border-color:rgba(255,75,75,.55)}
-.bar-row{display:grid;grid-template-columns:minmax(0,1fr) 96px;gap:12px;align-items:center;min-height:42px}
+.bar-row{display:grid;grid-template-columns:auto minmax(0,1fr) 96px;gap:12px;align-items:center;min-height:42px}
+.bar-row b{font-size:15px;font-weight:700;letter-spacing:1px;min-width:56px}
 .track{height:10px;border-radius:5px;background:var(--track);overflow:hidden}
 .fill{height:100%;width:0;border-radius:5px;background:var(--accent);transition:width .25s linear,background .25s}
 .bar-row strong{text-align:right;font-size:20px;font-weight:700}
 .bar-row strong small{font-size:12px;font-weight:600;color:var(--muted);margin-left:3px}
-.sub{grid-column:1/-1;margin-top:-6px;font-size:12px;color:var(--muted);letter-spacing:.3px}
 .err{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;min-height:42px;padding:5px 8px;border-radius:10px;
 background:rgba(255,75,75,.08);border:1px solid rgba(255,75,75,.35);color:var(--red);font-weight:800;font-size:15px;letter-spacing:1px;text-align:center}
 .err small{color:var(--muted);font-weight:500;font-size:12px;letter-spacing:.3px}
@@ -92,7 +93,7 @@ footer{display:flex;flex-wrap:wrap;align-items:center;gap:10px 20px;padding:10px
 @keyframes sweep{to{stroke-dasharray:200 0}}@keyframes fade{from{opacity:0}}@keyframes load{to{width:100%}}
 [hidden]{display:none!important}
 @media(max-width:640px){header{grid-template-columns:1fr 1fr}.brand{grid-column:1/-1;grid-row:1;flex-direction:row;justify-content:space-between}
-.tile strong{font-size:28px}.row{grid-template-columns:1fr}.bar-row{grid-template-columns:minmax(0,1fr) 88px}}
+.tile strong{font-size:28px}.row{grid-template-columns:1fr}.bar-row{grid-template-columns:auto minmax(0,1fr) 88px}}
 @media(prefers-reduced-motion:reduce){*{transition:none!important;animation-duration:.01s!important}}
 </style></head><body><main>
 <header>
@@ -108,8 +109,7 @@ footer{display:flex;flex-wrap:wrap;align-items:center;gap:10px 20px;padding:10px
  <div><b id="bannerTitle">WAITING FOR DATA</b><span id="bannerText">Connecting to the ABS tester…</span></div>
 </div>
 <div class="row">
- <section class="panel gauge" style="--c:var(--red)" id="rearCard"></section>
- <section class="panel gauge" style="--c:var(--green)" id="frontCard"></section>
+ <section class="panel gauge wide" style="--c:var(--green)" id="frontCard"></section>
 </div>
 <div class="row">
  <section class="panel gauge" style="--c:var(--accent)" id="sensorCard"></section>
@@ -132,12 +132,12 @@ footer{display:flex;flex-wrap:wrap;align-items:center;gap:10px 20px;padding:10px
 <script>
 const $=id=>document.getElementById(id),CX=130,CY=140;
 // Dials, as on the LCD: wheels 0-250 km/h (red from 210), speed sensor 0-200
-// km/h (red from 180), Declog 0-100 Hz.
+// km/h (red from 180), Declog 0-100 Hz. bar: the name on the bar row (the
+// FRONT card's bar shows the REAR speed, as on LCD page 1).
 const D={
- rear:{label:'REAR',sub:'D7',max:250,minor:10,major:50,red:210,unit:'km/h',needle:'var(--red)',speed:true},
- front:{label:'FRONT',sub:'D8',max:250,minor:10,major:50,red:210,unit:'km/h',needle:'var(--green)',speed:true},
- sensor:{label:'SPEED SENSOR',sub:'GPIO34 · 10 Hz = 1 km/h',max:200,minor:10,major:50,red:180,unit:'km/h',needle:'var(--red)'},
- declog:{label:'DECLOG',sub:'D2 · 0-100 Hz',max:100,minor:5,major:25,red:1e9,unit:'Hz',needle:'var(--red)',pct:true}};
+ front:{label:'FRONT',bar:'REAR',max:250,minor:10,major:50,red:210,unit:'km/h',needle:'var(--green)',speed:true},
+ sensor:{label:'SPEED SENSOR',bar:'SPEED',max:200,minor:10,major:50,red:180,unit:'km/h',needle:'var(--red)'},
+ declog:{label:'DECLOG',bar:'DECLOG',max:100,minor:5,major:25,red:1e9,unit:'Hz',needle:'var(--red)',pct:true}};
 const clamp=(v,m)=>Math.min(Math.max(+v||0,0),m);
 // Speed colour, as on the LCD: cyan to 140, to amber by 170, amber to red from 200 to 215.
 const mix=(a,b,f)=>a.map((x,i)=>Math.round(x+(b[i]-x)*f));
@@ -154,7 +154,7 @@ function card(p,o){
   if(major){const a=v==0?-.17:v==o.max?.17:0,[tx,ty]=pt(v-a*o.max/Math.PI,77);
    t+=`<text x="${tx}" y="${ty+4}" text-anchor="middle" fill="${c}" font-size="11" font-weight="600">${v}</text>`;}}
  const n=o.needle;
- $(p+'Card').innerHTML=`<h2>${o.label}<small>${o.sub}</small></h2><svg viewBox="0 0 260 150" aria-label="${o.label}">
+ $(p+'Card').innerHTML=`<h2>${o.label}</h2><svg viewBox="0 0 260 150" aria-label="${o.label}">
  <path d="M14 140A116 116 0 0 1 246 140Z" fill="var(--face)"/>
  <path d="M10 140A120 120 0 0 1 250 140" fill="none" stroke="var(--edge)" stroke-width="1.2"/>
  <path d="M22 140A108 108 0 0 1 238 140" fill="none" stroke="var(--track)" stroke-width="9"/>
@@ -166,19 +166,19 @@ function card(p,o){
  <rect x="94" y="101" width="72" height="42" rx="8" fill="var(--plate)" stroke="#22303f" id="${p}Plate"/>
  <text x="130" y="113" text-anchor="middle" font-size="8" fill="var(--muted)" letter-spacing=".5" id="${p}Unit">${o.unit}</text>
  <text x="130" y="138" text-anchor="middle" font-size="26" font-weight="800" fill="var(--text)" class="num" id="${p}Val">--</text>
-</svg><div class="bar-row" id="${p}Row"><div class="track"><div class="fill" id="${p}Bar"></div></div><strong class="num"><span id="${p}Text">--</span><small>${o.pct?'%':o.unit}</small></strong>
- <div class="sub" id="${p}Sub"></div></div>
- <div class="err" id="${p}Err" hidden>NO SPEED SENSOR READING<small>Check the sensor and its wire to GPIO34</small></div>`;}
+</svg><div class="bar-row" id="${p}Row"><b>${o.bar}</b><div class="track"><div class="fill" id="${p}Bar"></div></div><strong class="num"><span id="${p}Text">--</span><small>${o.pct?'%':o.unit}</small></strong></div>
+ <div class="err" id="${p}Err" hidden>NO SPEED SENSOR READING<small>Check the sensor and its wire</small></div>`;}
 for(const p in D)card(p,D[p]);
 // v: reading in the dial's unit; have false: needle parked, "--".
-function setDial(p,v,have,sub){
+// bv / bhave: the bar's own reading (defaults to the dial's).
+function setDial(p,v,have,bv=v,bhave=have){
  const o=D[p],f=have?clamp(v,o.max)/o.max:0;
  $(p+'Needle').style.transform=`rotate(${f*180}deg)`;$(p+'Needle').style.opacity=have?1:.25;
  $(p+'Lit').setAttribute('stroke-dasharray',`${f*200} 200`);$(p+'Lit').setAttribute('stroke',litColor(o,v));
  $(p+'Val').textContent=have?Math.round(v):'--';$(p+'Val').setAttribute('fill',have&&v>=o.red?'var(--red)':'var(--text)');
- $(p+'Text').textContent=have?Math.round(o.pct?f*100:v):'--';
- $(p+'Bar').style.width=f*100+'%';$(p+'Bar').style.background=litColor(o,v);
- $(p+'Sub').textContent=sub||'';}
+ const bf=bhave?clamp(bv,o.max)/o.max:0;
+ $(p+'Text').textContent=bhave?Math.round(o.pct?bf*100:bv):'--';
+ $(p+'Bar').style.width=bf*100+'%';$(p+'Bar').style.background=litColor(o,bv);}
 // Speed sensor fault: NO SIGNAL on the plate, red edge, error block instead of the bar.
 function sensorFault(on){
  $('sensorCard').classList.toggle('fault',on);$('sensorErr').hidden=!on;$('sensorRow').hidden=on;
@@ -204,14 +204,14 @@ function show(d){
   ?(d.sender?'Check '+(mega?'Mega D18':'Nano D5')+' → GPIO16 and GND':'Check the link to GPIO16'):'Connecting to the ABS tester…';
  $('banner').style.setProperty('--c',live?'var(--amber)':'var(--red)');
  $('banner').style.borderColor=live?'rgba(255,181,71,.45)':'rgba(255,75,75,.45)';
- for(const id of['rearCard','frontCard','declogCard','ref1Tile','batTile'])$(id).classList.toggle('stale',!on);
+ for(const id of['frontCard','declogCard','ref1Tile','batTile'])$(id).classList.toggle('stale',!on);
  $('keyDot').className='dot'+(on?' on':'');$('keyText').textContent=on?'KEY ON':'KEY OFF';
  // LCD page chip: page, name and the encoder mode.
  const pg=d.page>=1&&d.page<=3?d.page:1,mode=d.page_mode;
  $('pageChip').textContent=`LCD ${pg}/3 ${PAGES[pg-1]}`+(mode==='select'?' · SELECT':mode==='locked'?' · LOCKED':'');
  $('pageChip').className='chip'+(mode==='select'?' sel':mode==='locked'?' lock':'');
- // Pot generator settings: Nano rear A0, front A1, Declog A2; Mega rear A1, front A0, Declog A2.
- const g=[['REAR '+(mega?'A1':'A0'),d.gen_rear_hz],['FRONT '+(mega?'A0':'A1'),d.gen_front_hz],['DECLOG A2',d.gen_declog_hz]];
+ // Pot generator settings (no pin names, as on the LCD).
+ const g=[['REAR',d.gen_rear_hz],['FRONT',d.gen_front_hz],['DECLOG',d.gen_declog_hz]];
  $('gens').innerHTML=on&&g.every(x=>typeof x[1]==='number')?'POT '+g.map(([n,v])=>`<span>${n} <b>${Math.round(v)}</b> Hz</span>`).join(''):'';
  lampStates=on?{absLamp:d.abs_lamp,tcsLamp:d.tcs_lamp}:{};lamps();
  // Speed sensor on GPIO34, measured by the ESP32: always shown.
@@ -219,12 +219,11 @@ function show(d){
  const esp=d.uptime_ms!==undefined,sig=esp&&typeof d.input_kmh==='number';
  $('sensorCard').classList.toggle('stale',!esp);
  sensorFault(esp&&!sig);
- setDial('sensor',sig?d.input_kmh:0,sig,sig?Math.round(d.input_hz)+' Hz on GPIO34':'');
- // The sender's readings.
+ setDial('sensor',sig?d.input_kmh:0,sig);
+ // The sender's readings: FRONT on the dial, REAR on its bar.
  const hz=Math.max(+d.declog_hz||0,0);
- setDial('rear',on?d.speed_kmh:0,on,on?(+d.frequency_hz||0).toFixed(0)+' Hz on D7':'');
- setDial('front',on?d.front_speed_kmh:0,on&&!!d.front,on&&d.front?(+d.front_frequency_hz||0).toFixed(0)+' Hz on D8':'');
- setDial('declog',on?hz:0,on,on?hz.toFixed(1)+' Hz on D2':'');
+ setDial('front',on?d.front_speed_kmh:0,on&&!!d.front,on?d.speed_kmh:0,on);
+ setDial('declog',on?hz:0,on);
  volts('ref1',on?d.ref1_v:null);volts('battery',on?d.battery_v:null);
  if(d.uptime_ms!==undefined)$('stamp').textContent='Updated '+new Date().toLocaleTimeString();
 }

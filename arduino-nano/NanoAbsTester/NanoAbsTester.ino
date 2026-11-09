@@ -19,7 +19,7 @@
 //   D13 TCS LED: steady when both speeds match (whole km/h), blinking otherwise
 //   D12 ABS LED: on when D7 is at least 10 % and 5 km/h slower than D8
 //   A3 Reference 1, A4 battery: 0-5 V at the pin mapped to 0-30 V
-//   through the PCB calibration table, filtered.
+//   through the PCB calibration table (same formula as the ECU testbench).
 //   Pot frequency generators (PotGenerator.h), 50 % duty 0-5 V square waves:
 //   rear pot A0 -> D9 0-1500 Hz, front pot A1 -> D10 0-1500 Hz,
 //   Declog pot A2 -> D3 0-100 Hz. Jumper D9 -> D7, D10 -> D8, D3 -> D2 to self-test.
@@ -35,7 +35,7 @@ const byte ABS_LED = 12;
 const unsigned long TCS_BLINK_INTERVAL = 500;
 // Speeds and Declog are measured every 100 ms and sent to the ESP32 10 times
 // a second, so the gauges follow the pots without lag. REF1 / battery are
-// read 4 times a second (each read takes about 13 ms); the Serial Monitor
+// read 4 times a second (each read takes about 25 ms); the Serial Monitor
 // report stays once a second.
 const unsigned long MEASURE_US = 100000UL;
 const unsigned long PUBLISH_MS = 100;
@@ -66,7 +66,7 @@ bool absActive = false;
 
 float frequencyHz1 = 0, frequencyHz2 = 0, declogHz = 0;
 float ref1V = 0, batteryV = 0;
-float pinV[2] = {0, 0};  // Filtered A3 / A4 pin volts, 0-5 V.
+float pinV[2] = {0, 0};  // A3 / A4 pin volts (20-reading average), 0-5 V.
 float speed1 = 0, speed2 = 0;
 float rpm = 0;
 
@@ -89,11 +89,9 @@ float getTrueVoltage(float x) {
   }
   return 0.0f;
 }
-// Noise filter: 20 samples with the highest and lowest dropped, then a
-// running average (each new reading moves the value 20 %, about 1 s to settle).
+// Same formula as the ECU testbench (arduino-mega/MegaTelemetry,
+// readDividerInput): 20 readings 1 ms apart, plain average, no extra filter.
 constexpr uint8_t SAMPLES = 20;
-constexpr float FILTER = 0.2f;
-bool filterStarted[2] = {false, false};
 const uint8_t inputPins[2] = {A3, A4};          // REF1 A3, battery A4.
 
 SoftwareSerial esp(6, 5);  // RX D6 (unused), TX D5 -> ESP32 GPIO16.
@@ -121,23 +119,17 @@ ISR(TIMER2_COMPA_vect) {
   previousHigh3 = high3;
 }
 
-// Reads A3 / A4 (analogRead 0-1023 = 0 V to the measured supply), filters it and returns 0-30 V
-// through the calibration table.
+// Reads A3 / A4 exactly like the ECU testbench: averages 20 readings 1 ms
+// apart, converts to pin volts with the measured 5 V rail, then maps through
+// the calibration table to 0-30 V.
 float readInput(uint8_t i) {
-  analogRead(inputPins[i]);  // First reading after switching pins is discarded.
-  delayMicroseconds(200);
+  analogRead(inputPins[i]);  // Discard: the ADC is switching channels (or back from the bandgap).
   uint32_t sum = 0;
-  uint16_t lowest = 1023, highest = 0;
   for (uint8_t n = 0; n < SAMPLES; n++) {
-    const uint16_t raw = analogRead(inputPins[i]);
-    sum += raw;
-    if (raw < lowest) lowest = raw;
-    if (raw > highest) highest = raw;
-    delayMicroseconds(500);
+    sum += analogRead(inputPins[i]);
+    delay(1);
   }
-  const float volts = float(sum - lowest - highest) / (SAMPLES - 2) * supply::volts / 1023.0f;
-  if (!filterStarted[i]) { pinV[i] = volts; filterStarted[i] = true; }
-  else pinV[i] += FILTER * (volts - pinV[i]);
+  pinV[i] = float(sum) / SAMPLES * (supply::volts / 1023.0f);
   return getTrueVoltage(pinV[i]);
 }
 

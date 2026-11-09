@@ -5,6 +5,7 @@
 #include "DashboardPage.h"
 #include "FreqInput.h"
 #include "Encoder.h"
+#include "BrakeButton.h"
 
 // ABS tester: ESP32 + 2.8" ILI9341 (Adafruit libraries), fed by the Arduino
 // Nano running arduino-nano/NanoAbsTester (or the Mega 2560 Pro running
@@ -107,11 +108,12 @@ String liveJson() {
   json = F("{\"link\":\"");
   json += !havePacket ? F("waiting") : !fresh ? F("stale") : F("live");
   json += F("\",\"key\":"); json += latest.keyOn ? F("true") : F("false");
-  json += F(",\"brake\":"); json += latest.brake ? F("true") : F("false");
-  json += F(",\"speed_kmh\":"); json += String(latest.speedKmh, 1);
+  json += F(",\"brake\":"); json += latest.brake || brakeButton::held ? F("true") : F("false");
+  json += F(",\"brake_button\":"); json += brakeButton::held ? F("true") : F("false");
+  json += F(",\"speed_kmh\":"); json += String(brakeButton::rearKmh(latest.speedKmh), 1);
   json += F(",\"frequency_hz\":"); json += String(latest.frequencyHz, 1);
   json += F(",\"front\":"); json += latest.front ? F("true") : F("false");
-  json += F(",\"front_speed_kmh\":"); json += String(latest.frontKmh, 1);
+  json += F(",\"front_speed_kmh\":"); json += String(brakeButton::frontKmh(latest.frontKmh), 1);
   json += F(",\"front_frequency_hz\":"); json += String(latest.frontHz, 1);
   json += F(",\"rpm\":"); json += latest.rpm;
   json += F(",\"declog_hz\":"); json += String(latest.declogHz, 1);
@@ -206,6 +208,7 @@ void setup() {
   absDisplay::begin();
   freqInput::begin();
   encoder::begin();
+  brakeButton::begin();
   nano.setRxBufferSize(512);
   nano.begin(115200, SERIAL_8N1, LINK_RX, LINK_TX);
   WiFi.mode(WIFI_AP);
@@ -275,6 +278,7 @@ void loop() {
         Serial.print(freqInput::hz, 1); Serial.print(F(" Hz = "));
         Serial.print(min(freqInput::hz / INPUT_HZ_PER_KMH, INPUT_MAX_KMH), 1); Serial.print(F(" km/h"));
       } else Serial.print(F("NO SIGNAL"));
+      if (brakeButton::held) { Serial.print(F(" | BRAKE GPIO13 rear ")); Serial.print(brakeButton::rear, 0); Serial.print(F(" front ")); Serial.print(brakeButton::front, 0); Serial.print(F(" km/h")); }
       Serial.print(F(" | bad frames ")); Serial.print(badFrames);
       Serial.print(F(" | ")); encoder::printStatus(Serial); Serial.println();
     } else {
@@ -291,9 +295,14 @@ void loop() {
   const bool fresh = havePacket && uint32_t(millis() - lastPacketMs) <= 3000;
   d.link = !havePacket ? AbsData::WAITING : !fresh ? AbsData::STALE : AbsData::LIVE;
   d.inputHz = freqInput::update();
+  // Brake button (GPIO13): shown rear / front speeds drop 10 km/h per 100 ms to 0 while held.
+  brakeButton::update(latest.speedKmh, latest.frontKmh);
+  d.speedKmh = brakeButton::rearKmh(latest.speedKmh);
+  d.frontKmh = brakeButton::frontKmh(latest.frontKmh);
+  d.brake = latest.brake || brakeButton::held;
   // ABS light: follows the rear speed while live; losing the link resets it
   // (the next start begins with it on).
-  if (fresh) absLamp.update(latest.speedKmh); else absLamp.reset();
+  if (fresh) absLamp.update(d.speedKmh); else absLamp.reset();
   d.absLamp = absLamp.on;
   encoderNav();
   pagePotFollow.update(fresh, nav == Nav::FREE);
