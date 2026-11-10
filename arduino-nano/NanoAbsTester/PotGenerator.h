@@ -3,13 +3,14 @@
 #include <avr/interrupt.h>
 #include <util/atomic.h>
 
-// Three pot frequency generators for the Uno / Nano ABS tester, 50 % duty,
+// Three frequency generators for the Uno / Nano ABS tester, 50 % duty,
 // 0-5 V square waves:
-//   Rear:   pot on A0 -> D9  (Timer1 OC1A), 0-1500 Hz (1500 Hz = 250 km/h)
-//   Front:  pot on A1 -> D10 (Timer1 OC1B), 0-1500 Hz
-//   Declog: pot on A2 -> D3  (made in the 20 kHz Timer2 sampler), 0-100 Hz
-//   Each pot (10 kOhm): one end -> GND, wiper -> A0 / A1 / A2, other end -> 5V
-//   (100 nF wiper-GND optional). Turned fully down the output stops LOW.
+//   Rear:   speed encoder -> D9  (Timer1 OC1A), 0-1500 Hz (1500 Hz = 250 km/h)
+//   Front:  speed encoder -> D10 (Timer1 OC1B), 0-1500 Hz
+//   Declog: pot on A2     -> D3  (made in the 20 kHz Timer2 sampler), 0-100 Hz
+//   The KY-040 speed encoder (SpeedEncoder.h) sets rear / front with
+//   setWheel(). Declog pot (10 kOhm): one end -> GND, wiper -> A2, other end
+//   -> 5V (100 nF wiper-GND optional). At 0 Hz the output stops LOW.
 // Jumper D9 -> D7, D10 -> D8 and D3 -> D2 to test the tester itself.
 //
 // The ATmega328P has only one free 16-bit timer, so D9 and D10 share Timer1
@@ -29,14 +30,16 @@
 
 namespace potgen {
 
-constexpr uint8_t REAR_POT = A0, FRONT_POT = A1, DECLOG_POT = A2;
+constexpr uint8_t DECLOG_POT = A2;  // A0 / A1 are the speed encoder's CLK / DT now.
 constexpr uint8_t REAR_OUT = 9, FRONT_OUT = 10, DECLOG_OUT = 3;
-// Divided outputs: D4 = D9 / 10, D11 = D10 / 10 (1500 Hz -> 150 Hz), 50 % duty.
+// Divided outputs: D4 = D9 / 6, D11 = D10 / 6 (1500 Hz -> 250 Hz), 50 % duty,
+// the same /6 as the speed formula, so their Hz equals the wheel's km/h
+// (100 km/h: D9 600 Hz, D4 100 Hz).
 // Each D9 / D10 edge (rising and falling) is counted in the Timer1 interrupt
-// and every 10th toggles the divided pin, so they stay locked to the main
+// and every 6th toggles the divided pin, so they stay locked to the main
 // outputs (exact average frequency; each edge up to about 0.1 ms late, which
-// is under 2 % of a 150 Hz half period). They stop LOW with the main output.
-constexpr uint8_t REAR_DIV_OUT = 4, FRONT_DIV_OUT = 11, DIVIDE = 10;
+// is under 5 % of a 250 Hz half period). They stop LOW with the main output.
+constexpr uint8_t REAR_DIV_OUT = 4, FRONT_DIV_OUT = 11, DIVIDE = 6;
 uint8_t divCount[2] = {0, 0};
 
 // Writing 1 to a PINx bit toggles that output (ATmega328P), in one instruction.
@@ -155,17 +158,23 @@ void setDeclogHz(uint16_t hz) {
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { declogInc = inc; }
 }
 
-// ---- Pots ----
-const uint8_t potPins[3] = {REAR_POT, FRONT_POT, DECLOG_POT};
-const uint16_t potMaxHz[3] = {MAX_WHEEL_HZ, MAX_WHEEL_HZ, MAX_DECLOG_HZ};
+// ---- Settings ----
 uint16_t setHz[3] = {0xFFFF, 0xFFFF, 0xFFFF};  // Rear, front, Declog, whole Hz.
 uint32_t lastReadMs = 0;
 
 // Frequency each output is set to (Hz), for the frame and the Serial Monitor.
 float outHz(uint8_t i) { return setHz[i] == 0xFFFF ? 0 : setHz[i]; }
 
+// Rear (c = 0, D9) or front (c = 1, D10) wheel output, 0-1500 Hz (0 = stopped LOW).
+void setWheel(uint8_t c, uint16_t hz) {
+  if (hz > MAX_WHEEL_HZ) hz = MAX_WHEEL_HZ;
+  if (hz == setHz[c]) return;
+  setHz[c] = hz;
+  setWheelHz(c, hz);
+}
+
 void begin() {
-  for (uint8_t pin : potPins) pinMode(pin, INPUT);
+  pinMode(DECLOG_POT, INPUT);
   digitalWrite(REAR_OUT, LOW);
   digitalWrite(FRONT_OUT, LOW);
   digitalWrite(DECLOG_OUT, LOW);
@@ -174,8 +183,8 @@ void begin() {
   pinMode(REAR_OUT, OUTPUT);
   pinMode(FRONT_OUT, OUTPUT);
   pinMode(DECLOG_OUT, OUTPUT);
-  pinMode(REAR_DIV_OUT, OUTPUT);   // D4 = D9 / 10.
-  pinMode(FRONT_DIV_OUT, OUTPUT);  // D11 = D10 / 10 (plain output: Timer2 runs the sampler, no PWM).
+  pinMode(REAR_DIV_OUT, OUTPUT);   // D4 = D9 / 6.
+  pinMode(FRONT_DIV_OUT, OUTPUT);  // D11 = D10 / 6 (plain output: Timer2 runs the sampler, no PWM).
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
     TIMSK1 = 0;
     TCCR1A = 0;                // Normal mode, pins not connected yet.
@@ -185,24 +194,21 @@ void begin() {
   }
 }
 
-// Call every loop: every 100 ms each pot is read (20 analogReads 50 us apart,
-// averaged, about 3 ms per pot) and mapped 0-1023 -> 0-max Hz in whole Hz.
+// Call every loop: every 100 ms the Declog pot is read (20 analogReads 50 us
+// apart, averaged, about 3 ms) and mapped 0-1023 -> 0-100 Hz in whole Hz.
 void update(uint32_t nowMs) {
   if (uint32_t(nowMs - lastReadMs) < READ_INTERVAL_MS) return;
   lastReadMs = nowMs;
-  for (uint8_t i = 0; i < 3; ++i) {
-    analogRead(potPins[i]);  // First reading after switching pins is discarded.
-    uint32_t sum = 0;
-    for (uint8_t n = 0; n < NUM_SAMPLES; ++n) {
-      sum += analogRead(potPins[i]);
-      delayMicroseconds(50);
-    }
-    const uint16_t hz = map(long(sum / NUM_SAMPLES), 0, 1023, 0, potMaxHz[i]);
-    if (hz == setHz[i]) continue;
-    setHz[i] = hz;
-    if (i < 2) setWheelHz(i, hz);
-    else setDeclogHz(hz);
+  analogRead(DECLOG_POT);  // First reading after switching pins is discarded.
+  uint32_t sum = 0;
+  for (uint8_t n = 0; n < NUM_SAMPLES; ++n) {
+    sum += analogRead(DECLOG_POT);
+    delayMicroseconds(50);
   }
+  const uint16_t hz = map(long(sum / NUM_SAMPLES), 0, 1023, 0, MAX_DECLOG_HZ);
+  if (hz == setHz[2]) return;
+  setHz[2] = hz;
+  setDeclogHz(hz);
 }
 
 }  // namespace potgen

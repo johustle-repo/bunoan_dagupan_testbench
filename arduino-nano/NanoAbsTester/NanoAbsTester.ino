@@ -5,6 +5,7 @@
 #include <SoftwareSerial.h>
 #include "PotGenerator.h"
 #include "SupplyVoltage.h"
+#include "SpeedEncoder.h"
 
 #if !defined(__AVR_ATmega328P__)
 #error "Select Arduino Uno or Arduino Nano (ATmega328P)."
@@ -20,10 +21,12 @@
 //   D12 ABS LED: on when D7 is at least 10 % and 5 km/h slower than D8
 //   A3 Reference 1, A4 battery: 0-5 V at the pin mapped to 0-30 V
 //   through the PCB calibration table (same formula as the ECU testbench).
-//   Pot frequency generators (PotGenerator.h), 50 % duty 0-5 V square waves:
-//   rear pot A0 -> D9 0-1500 Hz, front pot A1 -> D10 0-1500 Hz,
-//   Declog pot A2 -> D3 0-100 Hz. Jumper D9 -> D7, D10 -> D8, D3 -> D2 to self-test.
-//   Divided outputs: D4 = D9 / 10, D11 = D10 / 10 (0-150 Hz), 50 % duty.
+//   Frequency generators (PotGenerator.h), 50 % duty 0-5 V square waves:
+//   rear -> D9 0-1500 Hz and front -> D10 0-1500 Hz set by the KY-040 speed
+//   encoder (SpeedEncoder.h: CLK A0, DT A1, SW A5; turn = speed of the
+//   selected wheel, press = REAR <-> FRONT, hold 1 s = both 0), Declog pot
+//   A2 -> D3 0-100 Hz. Jumper D9 -> D7, D10 -> D8, D3 -> D2 to self-test.
+//   Divided outputs: D4 = D9 / 6, D11 = D10 / 6 (0-250 Hz, Hz = km/h), 50 % duty.
 //   D5 (TX) -> ESP32 RX2 (GPIO16), common GND, 115200 8N1, one-way
 //   (SoftwareSerial; the USB Serial Monitor stays on the normal Serial port).
 // SoftwareSerial owns the pin-change interrupts, so Timer2 (compare A) samples
@@ -117,6 +120,7 @@ ISR(TIMER2_COMPA_vect) {
   previousHigh1 = high1;
   previousHigh2 = high2;
   previousHigh3 = high3;
+  speedEnc::sample();
 }
 
 // Reads A3 / A4 exactly like the ECU testbench: averages 20 readings 1 ms
@@ -136,9 +140,9 @@ float readInput(uint8_t i) {
 // A1 frame: key (always 1), brake (none, 0), D7 Hz x100, speed 1 x100,
 // REF1 mV, REF2 (unused, 0), current (unused, 0), battery mV, D8 Hz x100,
 // speed 2 x100, RPM, TCS (1 steady, 0 blinking), ABS (1 active), D2 Declog
-// Hz x100, the rear (A0 -> D9) / front (A1 -> D10) / Declog (A2 -> D3) pot
-// generator outputs in Hz x100 (17 fields, the ESP32's GEN_FIELDS frame),
-// then an XOR checksum of everything before '*'. The ESP32 shows
+// Hz x100, the rear (D9) / front (D10) encoder and Declog (A2 pot -> D3)
+// generator outputs in Hz x100, the wheel the speed encoder adjusts (1 rear,
+// 2 front; 18 fields, the ESP32's NANO_ENC_FIELDS frame), then an XOR checksum of everything before '*'. The ESP32 shows
 // these values as they are.
 void readVolts() {
   supply::read();  // Measured 5 V rail for the pin volts (about 4 ms).
@@ -149,12 +153,13 @@ void readVolts() {
 
 void sendFrame() {
   const unsigned int* mv = voltsMv;
-  const int count = snprintf(linkBuffer, sizeof(linkBuffer), "A1,1,0,%lu,%u,%u,0,0,%u,%lu,%u,%u,%u,%u,%lu,%lu,%lu,%lu",
+  const int count = snprintf(linkBuffer, sizeof(linkBuffer), "A1,1,0,%lu,%u,%u,0,0,%u,%lu,%u,%u,%u,%u,%lu,%lu,%lu,%lu,%u",
     (unsigned long)(frequencyHz1 * 100 + 0.5), unsigned(speed1 * 100 + 0.5), mv[0], mv[1],
     (unsigned long)(frequencyHz2 * 100 + 0.5), unsigned(speed2 * 100 + 0.5),
     unsigned(rpm + 0.5), unsigned(speedsEqual), unsigned(absActive),
     (unsigned long)(declogHz * 100 + 0.5), (unsigned long)(potgen::outHz(0) * 100 + 0.5),
-    (unsigned long)(potgen::outHz(1) * 100 + 0.5), (unsigned long)(potgen::outHz(2) * 100 + 0.5));
+    (unsigned long)(potgen::outHz(1) * 100 + 0.5), (unsigned long)(potgen::outHz(2) * 100 + 0.5),
+    unsigned(speedEnc::selected));
   if (count < 0 || count > int(sizeof(linkBuffer) - 5)) return;
   uint8_t checksum = 0;
   for (int i = 0; i < count; i++) checksum ^= uint8_t(linkBuffer[i]);
@@ -218,14 +223,16 @@ void setup() {
     TIMSK2 |= _BV(OCIE2A);
     windowStartUs = micros();
   }
-  potgen::begin();  // Pots A0 / A1 / A2, outputs D9 / D10 / D3.
+  potgen::begin();    // Declog pot A2, outputs D9 / D10 / D3.
+  speedEnc::begin();  // Speed encoder on A0 / A1 / A5, both wheels at 0 km/h.
 
   lastTcsBlink = millis();
 }
 
 void loop() {
   unsigned long now = millis();
-  potgen::update(now);  // Pots, every 100 ms.
+  potgen::update(now);    // Declog pot, every 100 ms.
+  speedEnc::update(now);  // Speed encoder turns and button.
 
   if (micros() - windowStartUs >= MEASURE_US) {
     unsigned long pulses1, pulses2, pulses3, elapsedUs, nowUs, edge[3];
@@ -312,15 +319,22 @@ void loop() {
     Serial.print(declogHz, 1);
     Serial.println(" Hz");
 
-    Serial.print("Pot rear A0 -> D9: ");
+    Serial.print("Encoder rear -> D9: ");
     Serial.print(potgen::outHz(0), 0);
-    Serial.print(" Hz, front A1 -> D10: ");
+    Serial.print(" Hz (");
+    Serial.print(speedEnc::kmh[0]);
+    Serial.print(" km/h), front -> D10: ");
     Serial.print(potgen::outHz(1), 0);
-    Serial.print(" Hz, Declog A2 -> D3: ");
+    Serial.print(" Hz (");
+    Serial.print(speedEnc::kmh[1]);
+    Serial.print(" km/h), adjusting ");
+    Serial.println(speedEnc::nameOf(speedEnc::selected));
+    speedEnc::printStatus(Serial);
+    Serial.print("Declog pot A2 -> D3: ");
     Serial.print(potgen::outHz(2), 0);
     Serial.println(" Hz");
 
-    Serial.print("Divided /10: D4 (D9) ");
+    Serial.print("Divided /"); Serial.print(potgen::DIVIDE); Serial.print(": D4 (D9) ");
     Serial.print(potgen::outHz(0) / potgen::DIVIDE, 1);
     Serial.print(" Hz, D11 (D10) ");
     Serial.print(potgen::outHz(1) / potgen::DIVIDE, 1);

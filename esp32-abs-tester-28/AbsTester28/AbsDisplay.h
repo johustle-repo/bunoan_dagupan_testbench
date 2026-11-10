@@ -71,6 +71,7 @@ struct AbsData {
   bool pagePot;                  // Frame carries the Mega's A5 page pot.
   uint16_t potRaw;               // A5 reading, 0-1023.
   uint8_t potPage;               // Page picked by the pot, 1-3.
+  uint8_t speedSel;              // Wheel the Mega's speed encoder adjusts: 1 rear, 2 front, 0 none / older firmware.
   bool absLamp;                  // ABS light, from AbsLamp.
 };
 
@@ -372,7 +373,9 @@ void drawDial2(aa::Buf& b, uint8_t which) {
 }
 
 // v: the reading in the gauge's unit; signal false = NO SIGNAL on the plate.
-void renderGauge2(float v, uint8_t which, bool signal) {
+// adjust (page 1): the Mega's speed encoder sets this wheel, shown by an
+// amber title dot and ADJUST after the title.
+void renderGauge2(float v, uint8_t which, bool signal, bool adjust = false) {
   const BigGauge& g = BIG_GAUGES[which];
   const uint8_t dialPage = pageOf(which);  // dialBg holds this page's face.
   char digits[6];
@@ -382,6 +385,10 @@ void renderGauge2(float v, uint8_t which, bool signal) {
   render(P2X, P2Y, P2W, P2H, [&](aa::Buf& b) {
     if (dialBg && dialFor == dialPage) memcpy(b.px, dialBg + (b.oy - P2Y) * P2W, b.w * b.h * 2);
     else drawDial2(b, which);
+    if (adjust) {
+      aa::circle(b, 16, P2Y + 13, 3.5f, AMBER);
+      aa::text(b, aaSmall, "ADJUST", 24 + aa::textWidth(aaLabel, g.title) + 6, P2Y + 18, AMBER, aa::LEFT, 1);
+    }
     const float a = angleOf(signal ? v : 0, g.maxV);
     const float redA = angleOf(g.redFrom, g.maxV);
     if (which == G_FRONT) {
@@ -403,7 +410,9 @@ void renderGauge2(float v, uint8_t which, bool signal) {
 //           no pulses: NO SPEED SENSOR READING in red across the panel.
 //   Page 3: DECLOG, bar and value as 0-100 % (NO LINK under the name without data).
 //   Page 1: REAR, bar (cyan -> amber -> red) and value in km/h.
-void drawBigBar(uint8_t which, float v, bool have) {
+// adjust (page 1 REAR): the speed encoder sets this wheel: amber name with
+// ADJUST under it.
+void drawBigBar(uint8_t which, float v, bool have, bool adjust = false) {
   const BigGauge& g = BIG_GAUGES[which];
   const float frac = constrain(v / g.maxV, 0.0f, 1.0f);
   const char* unit = g.barPercent ? "%" : g.unit;
@@ -422,8 +431,11 @@ void drawBigBar(uint8_t which, float v, bool have) {
     aa::fill(b, BG);
     panel(b, P2X, DY, P2W, DH);
     // Name centred in the panel; without data it moves up for NO LINK below.
-    aa::text(b, aaLabel, g.barName, P2X + 10, have ? DY + 23 : DY + 16, TEXT, aa::LEFT, 1);
+    const bool tag = !have || adjust;  // Second line under the name.
+    if (adjust) aa::roundRect(b, P2X + 1, DY + 1, 4, DH - 2, 2, AMBER);
+    aa::text(b, aaLabel, g.barName, P2X + 10, tag ? DY + 16 : DY + 23, adjust ? AMBER : TEXT, aa::LEFT, 1);
     if (!have) aa::text(b, aaSmall, "NO LINK", P2X + 10, DY + 29, RED, aa::LEFT);
+    else if (adjust) aa::text(b, aaSmall, "ADJUST", P2X + 10, DY + 29, AMBER, aa::LEFT);
     char s[12];
     constexpr int X0 = P2X + 104, LEN = 128;
     const int cy = DY + DH / 2;
@@ -482,8 +494,7 @@ void lockedText(const AbsData& d) {
     absSymbol(b, W / 2, 84, 22, color, aaPill);
     aa::text(b, aaValue, line, W / 2, 144, color, aa::CENTER, 1);
     aa::text(b, aaLabel, hint, W / 2, 166, MUTED, aa::CENTER);
-    aa::text(b, aaSmall, d.sender == AbsData::MEGA ? "Encoder, swipe or page pot A5: change page"
-                                                   : "Encoder or swipe: change page",
+    aa::text(b, aaSmall, d.pagePot ? "Encoder, swipe or page pot A5: change page" : "Encoder or swipe: change page",
              W / 2, 186, DIM, aa::CENTER, 1);
     aa::text(b, aaSmall, "Wi-Fi ABS-Tester  |  192.168.4.1", W / 2, 201, DIM, aa::CENTER, 1);
   });
@@ -635,10 +646,11 @@ void update(const AbsData& d, uint8_t page, uint8_t sel = 0, bool locked = false
       // FRONT speedometer only; the rear speed is in the bar below.
       const float front = selfTest ? sweep : ease(easeFront, constrain(d.frontKmh, 0.0f, ABS_SPEED_MAX), 0.2f);
       const bool have = selfTest || d.front;
-      const int32_t key = lroundf(front * 4) | int32_t(have) << 16;
+      const bool adjust = !selfTest && d.speedSel == 2;  // Speed encoder on FRONT.
+      const int32_t key = lroundf(front * 4) | int32_t(have) << 16 | int32_t(adjust) << 17;
       if (key != shownGaugeKey[0]) {
         shownGaugeKey[0] = key;
-        renderGauge2(front, G_FRONT, have);
+        renderGauge2(front, G_FRONT, have, adjust);
       }
     } else if (mode == PAGE2) {
       // Speed sensor: GPIO34 Hz / 10 = km/h; no pulses = NO SIGNAL.
@@ -669,9 +681,10 @@ void update(const AbsData& d, uint8_t page, uint8_t sel = 0, bool locked = false
     // REAR speed bar (the self-test sweeps it with the needle).
     const float rear = selfTest ? sinf(PI * testMs / SELF_TEST_MS) * ABS_SPEED_MAX
                                 : constrain(d.speedKmh, 0.0f, ABS_SPEED_MAX);
+    const bool adjust = !selfTest && d.speedSel == 1;  // Speed encoder on REAR.
     char key[16];
-    snprintf(key, sizeof(key), "%.0f", rear);
-    if (changed(S_BAR0, key)) drawBigBar(G_FRONT, rear, true);
+    snprintf(key, sizeof(key), "%.0f %d", rear, adjust);
+    if (changed(S_BAR0, key)) drawBigBar(G_FRONT, rear, true, adjust);
   } else if (mode == PAGE2) {
     const bool signal = d.inputHz > 0;
     const float kmh = constrain(d.inputHz / INPUT_HZ_PER_KMH, 0.0f, INPUT_MAX_KMH);

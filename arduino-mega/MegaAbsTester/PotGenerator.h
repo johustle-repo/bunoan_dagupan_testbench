@@ -3,13 +3,14 @@
 #include <util/atomic.h>
 #include <math.h>
 
-// Three frequency generators (rear pot A1, front pot A0, Declog pot A2): a
-// Bourns PTV09 10k pot sets a 50 % duty, 0-5 V square wave on a timer output.
-//   Rear:   pot on A1 -> D44 (Timer5, OC5C), 0-1500 Hz (1500 Hz = 250 km/h)
-//   Front:  pot on A0 -> D3  (Timer3, OC3C), 0-1500 Hz
-//   Declog: pot on A2 -> D11 (Timer1, OC1A), 0-100 Hz
-//   Each pot: pin 1 -> GND, pin 2 (wiper) -> A1 / A0 / A2, pin 3 -> 5V
-//   (100 nF wiper-GND optional). Turned fully down the output stops LOW.
+// Three frequency generators, each a 50 % duty, 0-5 V square wave on a timer output:
+//   Rear:   speed encoder -> D44 (Timer5, OC5C), 0-1500 Hz (1500 Hz = 250 km/h)
+//   Front:  speed encoder -> D3  (Timer3, OC3C), 0-1500 Hz
+//   Declog: pot on A2     -> D11 (Timer1, OC1A), 0-100 Hz
+// Rear and front have no pot (NO_POT): the KY-040 speed encoder
+// (SpeedEncoder.h) sets them with set(). The Declog pot (Bourns PTV09 10k):
+// pin 1 -> GND, pin 2 (wiper) -> A2, pin 3 -> 5V (100 nF wiper-GND optional).
+// At 0 Hz (pot fully down) the output stops LOW.
 // Each generator has its own 16-bit timer, so the three frequencies are
 // independent and made entirely in hardware: no interrupts, unaffected by the
 // serial frames or the 20 kHz input sampler (Timer2). The timers run in fast
@@ -27,6 +28,7 @@ class PotGenerator {
       : potPin(potPin), outPin(outPin), maxHz(maxHz), tccrA(tccrA), tccrB(tccrB), tcnt(tcnt), ocrTop(ocrTop),
         ocrOut(ocrOut), comBits(comBits), toggle(toggle) {}
 
+  static constexpr uint8_t NO_POT = 0xFF;  // Set by set() instead of a pot.
   const uint8_t potPin, outPin;
   const float maxHz;
   float outHz = 0;                     // Exact frequency on the pin (0 = stopped).
@@ -43,7 +45,7 @@ class PotGenerator {
   }
 
   void begin() {
-    pinMode(potPin, INPUT);
+    if (potPin != NO_POT) pinMode(potPin, INPUT);
     digitalWrite(outPin, LOW);
     pinMode(outPin, OUTPUT);
     stop();
@@ -53,6 +55,7 @@ class PotGenerator {
   // analogReads 50 us apart, averaged, then map() 0-1023 -> 0-maxHz in whole
   // Hz (A1 / A0: 0-1500 Hz, A2: 0-100 Hz). About 3 ms per pot.
   void update(uint32_t nowMs) {
+    if (potPin == NO_POT) return;
     if (uint32_t(nowMs - lastReadMs) < READ_INTERVAL_MS) return;
     lastReadMs = nowMs;
     long sum = 0;
@@ -64,6 +67,12 @@ class PotGenerator {
     if (stableVal < noiseLo) noiseLo = stableVal;
     if (stableVal > noiseHi) noiseHi = stableVal;
     const long hz = map(stableVal, 0, 1023, 0, long(maxHz));
+    set(hz);
+  }
+
+  // Sets the output to hz whole Hz (0 = stopped LOW), clamped to 0-maxHz.
+  void set(long hz) {
+    hz = constrain(hz, 0L, long(maxHz));
     if (hz == setHz) return;
     setHz = hz;
     apply(hz);
@@ -115,7 +124,7 @@ class PotGenerator {
   }
 };
 
-PotGenerator genRear(A1, 44, 1500, TCCR5A, TCCR5B, TCNT5, OCR5A, OCR5C, _BV(COM5C1), false);  // D44, 0-1500 Hz.
-PotGenerator genFront(A0, 3, 1500, TCCR3A, TCCR3B, TCNT3, OCR3A, OCR3C, _BV(COM3C1), false);   // D3,  0-1500 Hz.
+PotGenerator genRear(PotGenerator::NO_POT, 44, 1500, TCCR5A, TCCR5B, TCNT5, OCR5A, OCR5C, _BV(COM5C1), false);  // D44, encoder.
+PotGenerator genFront(PotGenerator::NO_POT, 3, 1500, TCCR3A, TCCR3B, TCNT3, OCR3A, OCR3C, _BV(COM3C1), false);   // D3,  encoder.
 PotGenerator genDeclog(A2, 11, 100, TCCR1A, TCCR1B, TCNT1, OCR1A, OCR1A, _BV(COM1A0), true);    // D11, 0-100 Hz.
 PotGenerator* const generators[3] = {&genRear, &genFront, &genDeclog};

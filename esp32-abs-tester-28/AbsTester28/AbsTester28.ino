@@ -55,11 +55,14 @@ bool parseFrame(char* text) {
   *star = '\0';
   if (strncmp(text, "A1,", 3) != 0) return false;
   // 8 fields (oldest Nano), 10 (+ front sensor), 13 (+ RPM, TCS, ABS), 14 (+ Declog Hz)
-  // 17 (+ the three pot generator settings) or 19 (+ the Mega's A5 page pot reading 0-1023 and page 1-3).
-  constexpr uint8_t MIN_FIELDS = 8, FRONT_FIELDS = 10, LAMP_FIELDS = 13, DECLOG_FIELDS = 14, GEN_FIELDS = 17, MAX_FIELDS = 19;
+  // 17 (+ the three generator settings), 18 (Nano with the speed encoder: + the wheel it adjusts,
+  // 1 rear / 2 front), 19 (+ the older Mega's A5 page pot reading 0-1023 and page 1-3)
+  // or 20 (Mega with the speed encoder: 0,0 for the page pot, then the wheel it adjusts).
+  constexpr uint8_t MIN_FIELDS = 8, FRONT_FIELDS = 10, LAMP_FIELDS = 13, DECLOG_FIELDS = 14, GEN_FIELDS = 17,
+                    NANO_ENC_FIELDS = 18, POT_FIELDS = 19, MAX_FIELDS = 20;
   // REF1 and battery: up to 30 V (0-30 V dividers, as on the ECU testbench).
   constexpr unsigned long maximum[MAX_FIELDS] = {1, 1, 100000000UL, 25000, 31000, 5500, 10500, 31000, 100000000UL, 25000,
-                                                 15000, 1, 1, 100000000UL, 250000, 250000, 25000, 1023, 3};
+                                                 15000, 1, 1, 100000000UL, 250000, 250000, 25000, 1023, 3, 2};
   unsigned long values[MAX_FIELDS];
   uint8_t parsed = 0;
   char* p = text + 3;
@@ -69,10 +72,12 @@ bool parseFrame(char* text) {
     if (values[i] > maximum[i]) return false;
     parsed = i + 1;
     if (!*end && (parsed == MIN_FIELDS || parsed == FRONT_FIELDS || parsed == LAMP_FIELDS ||
-                    parsed == DECLOG_FIELDS || parsed == GEN_FIELDS || parsed == MAX_FIELDS)) break;
+                    parsed == DECLOG_FIELDS || parsed == GEN_FIELDS || parsed == NANO_ENC_FIELDS ||
+                    parsed == POT_FIELDS || parsed == MAX_FIELDS)) break;
     if (*end != ',' || parsed == MAX_FIELDS) return false;
     p = end + 1;
   }
+  if (parsed == NANO_ENC_FIELDS && values[17] > 2) return false;  // Nano's encoder wheel: 1 or 2.
   latest.keyOn = values[0] == 1;
   latest.brake = values[1] == 1;
   latest.frequencyHz = values[2] / 100.0f;
@@ -87,10 +92,11 @@ bool parseFrame(char* text) {
   latest.tcsSteady = latest.nanoLamps && values[11] == 1;
   latest.absActive = latest.nanoLamps && values[12] == 1;
   latest.declogHz = parsed >= DECLOG_FIELDS ? values[13] / 100.0f : 0;
-  latest.sender = parsed == MAX_FIELDS ? AbsData::MEGA : AbsData::NANO;
+  latest.sender = parsed >= POT_FIELDS ? AbsData::MEGA : AbsData::NANO;
   latest.gens = parsed >= GEN_FIELDS;
   for (uint8_t i = 0; i < 3; ++i) latest.genHz[i] = latest.gens ? values[14 + i] / 100.0f : 0;
-  latest.pagePot = parsed == MAX_FIELDS && values[18] >= 1;
+  latest.pagePot = parsed >= POT_FIELDS && values[18] >= 1;  // The encoder Mega sends page 0: no pot.
+  latest.speedSel = parsed == MAX_FIELDS ? values[19] : parsed == NANO_ENC_FIELDS ? values[17] : 0;
   latest.potRaw = latest.pagePot ? values[17] : 0;
   latest.potPage = latest.pagePot ? values[18] : 0;
   ++frameCount;
@@ -135,6 +141,9 @@ String liveJson() {
   // Mega: rear pot A1 -> D44, front pot A0 -> D3, Declog pot A2 -> D11.
   const char* const GEN_KEYS[3] = {",\"gen_rear_hz\":", ",\"gen_front_hz\":", ",\"gen_declog_hz\":"};
   for (uint8_t i = 0; i < 3; ++i) { json += GEN_KEYS[i]; json += latest.gens ? String(latest.genHz[i], 1) : String("null"); }
+  // Wheel the Mega's speed encoder adjusts ("rear" / "front"; null without one).
+  json += F(",\"speed_encoder\":");
+  json += latest.speedSel == 1 ? F("\"rear\"") : latest.speedSel == 2 ? F("\"front\"") : F("null");
   // Warning lights, the same as the LCD: ABS "on" / "off", TCS "flash" / "off",
   // SENSOR (web only) "ok" / "on" / "off".
   json += F(",\"abs_lamp\":\""); json += fresh && absLamp.on ? "on" : "off";
@@ -265,12 +274,16 @@ void loop() {
       Serial.print(F(" V | BATTERY ")); Serial.print(latest.batteryV, 2);
       if (latest.gens) {
         const bool mega = latest.sender == AbsData::MEGA;
-        Serial.print(mega ? F(" V | POT REAR A1->D44 ") : F(" V | POT REAR A0->D9 "));
+        const bool enc = latest.speedSel != 0;  // Mega with the speed encoder.
+        Serial.print(enc ? (mega ? F(" V | ENC REAR ->D44 ") : F(" V | ENC REAR ->D9 "))
+                         : mega ? F(" V | POT REAR A1->D44 ") : F(" V | POT REAR A0->D9 "));
         Serial.print(latest.genHz[0], 0);
-        Serial.print(mega ? F(" Hz, FRONT A0->D3 ") : F(" Hz, FRONT A1->D10 "));
+        Serial.print(enc ? (mega ? F(" Hz, FRONT ->D3 ") : F(" Hz, FRONT ->D10 "))
+                         : mega ? F(" Hz, FRONT A0->D3 ") : F(" Hz, FRONT A1->D10 "));
         Serial.print(latest.genHz[1], 0);
         Serial.print(mega ? F(" Hz, DECLOG A2->D11 ") : F(" Hz, DECLOG A2->D3 "));
         Serial.print(latest.genHz[2], 0); Serial.print(F(" Hz"));
+        if (enc) Serial.print(latest.speedSel == 1 ? F(" (adjusting REAR)") : F(" (adjusting FRONT)"));
       } else Serial.print(F(" V"));
       Serial.print(F(" | ")); Serial.print(senderName(latest.sender));
       Serial.print(F(" | SENSOR GPIO34 "));

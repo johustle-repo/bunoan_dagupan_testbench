@@ -4,15 +4,16 @@
 #include <math.h>
 #include "PotGenerator.h"
 #include "SupplyVoltage.h"
-#include "PagePot.h"
+#include "SpeedEncoder.h"
 
 #if !defined(__AVR_ATmega2560__)
 #error "Select Arduino Mega or Mega 2560 (ATmega2560)."
 #endif
 
 // ABS tester for an Arduino Mega 2560 Pro (or full-size Mega 2560), in place
-// of the Nano (arduino-nano/NanoAbsTester): same pins, same "A1" frames, so
-// the ESP32 (esp32-abs-tester-28/AbsTester28) needs no change. Measures the
+// of the Nano (arduino-nano/NanoAbsTester): same pins, same "A1" frames plus
+// the speed encoder's wheel (20 fields; flash the matching
+// esp32-abs-tester-28/AbsTester28, older ESP32 firmware rejects them). Measures the
 // two wheel-speed sensors and the Declog frequency, drives the TCS / ABS LEDs
 // and sends the readings to the ESP32.
 //   D7 speed 1 (rear) and RPM, D8 speed 2 (front), 0-5 V square waves
@@ -24,14 +25,16 @@
 //   PCB calibration table (same as the ECU testbench), filtered.
 //   TX1 (D18) -> 1 kOhm -> ESP32 RX2 (GPIO16), common GND, 115200 8N1, one-way
 //   (hardware Serial1; the USB Serial Monitor stays on Serial).
-//   PTV09 10k pots: A1 rear -> D44 0-1500 Hz, A0 front -> D3 0-1500 Hz, A2 Declog -> D11 0-100 Hz
-//   square waves (PotGenerator.h, Timers 5 / 3 / 1); jumper them into
-//   D7 / D8 / D2 to test.
-//   A5 page pot (10k, PagePot.h): the ESP32 screen's page navigator,
-//   0-341 page 1, 342-682 page 2, 683-1023 page 3; reading and page go in the frame.
+//   Generators (PotGenerator.h, Timers 5 / 3 / 1): rear -> D44 0-1500 Hz and
+//   front -> D3 0-1500 Hz set by the KY-040 speed encoder (SpeedEncoder.h:
+//   CLK D22, DT D23, SW D24; turn = speed of the selected wheel, press =
+//   REAR <-> FRONT, hold 1 s = both 0), Declog PTV09 10k pot A2 -> D11
+//   0-100 Hz. Jumper them into D7 / D8 / D2 to test.
+//   Page selection is the ESP32's own KY-040 (GPIO21/22/4); the A5 page pot
+//   is gone (its two frame fields are sent as 0).
 // Timer2 (compare A) samples D2, D7 and D8 at 20 kHz (up to about 10 kHz per
-// input). With all four timers in use, analogWrite() on D2, D3, D5, D9-D13
-// and D44-D46, tone() and Servo can't be used.
+// input) and decodes the speed encoder. With all four timers in use,
+// analogWrite() on D2, D3, D5, D9-D13 and D44-D46, tone() and Servo can't be used.
 
 const byte TCS_LED = LED_BUILTIN;  // D13
 const byte ABS_LED = 12;
@@ -122,6 +125,7 @@ ISR(TIMER2_COMPA_vect) {
   previousHigh1 = high1;
   previousHigh2 = high2;
   previousHigh3 = high3;
+  speedEnc::sample();
 }
 
 // Reads A3 / A4 (analogRead 0-1023 = 0 V to the measured supply), filters it and returns 0-30 V
@@ -154,19 +158,20 @@ void readVolts() {
 // A1 frame (same as the Nano): key (always 1), brake (none, 0), D7 Hz x100,
 // speed 1 x100, REF1 mV, REF2 (unused, 0), current (unused, 0), battery mV,
 // D8 Hz x100, speed 2 x100, RPM, TCS (1 steady, 0 blinking), ABS (1 active),
-// D2 Declog Hz x100, the rear (A1) / front (A0) / Declog (A2) pot generator outputs (D44 / D3 / D11; same slots as before)
-// in Hz x100, the A5 page pot reading (0-1023) and its page (1-3),
+// D2 Declog Hz x100, the rear / front (encoder) and Declog (A2 pot) generator outputs (D44 / D3 / D11; same slots as before)
+// in Hz x100, 0,0 (where the A5 page pot reading and page used to be), the
+// wheel the speed encoder adjusts (1 rear, 2 front),
 // then an XOR checksum of everything before '*'. The ESP32 shows
 // these values as they are.
 void sendFrame() {
   const unsigned int* mv = voltsMv;
-  const int count = snprintf(linkBuffer, sizeof(linkBuffer), "A1,1,0,%lu,%u,%u,0,0,%u,%lu,%u,%u,%u,%u,%lu,%lu,%lu,%lu,%u,%u",
+  const int count = snprintf(linkBuffer, sizeof(linkBuffer), "A1,1,0,%lu,%u,%u,0,0,%u,%lu,%u,%u,%u,%u,%lu,%lu,%lu,%lu,0,0,%u",
     (unsigned long)(frequencyHz1 * 100 + 0.5), unsigned(speed1 * 100 + 0.5), mv[0], mv[1],
     (unsigned long)(frequencyHz2 * 100 + 0.5), unsigned(speed2 * 100 + 0.5),
     unsigned(rpm + 0.5), unsigned(speedsEqual), unsigned(absActive),
     (unsigned long)(declogHz * 100 + 0.5), (unsigned long)(genRear.outHz * 100 + 0.5),
     (unsigned long)(genFront.outHz * 100 + 0.5), (unsigned long)(genDeclog.outHz * 100 + 0.5),
-    unsigned(pagePot::raw), unsigned(pagePot::page));
+    unsigned(speedEnc::selected));
   if (count < 0 || count > int(sizeof(linkBuffer) - 5)) return;
   uint8_t checksum = 0;
   for (int i = 0; i < count; i++) checksum ^= uint8_t(linkBuffer[i]);
@@ -216,19 +221,31 @@ void printGenerator(const char* label, PotGenerator& gen) {
   Serial.println(noise > 6 ? F(" counts  CHECK POT") : F(" counts"));
 }
 
+// "Rear   enc -> D44 :   600.0 Hz  (100 km/h)  <- encoder"
+void printEncoderGenerator(const char* label, speedEnc::Wheel w) {
+  char hz[10];
+  dtostrf(speedEnc::genFor(w).outHz, 7, 1, hz);
+  Serial.print(label);
+  Serial.print(hz);
+  Serial.print(F(" Hz  ("));
+  Serial.print(speedEnc::kmh[w - 1]);
+  Serial.print(F(" km/h)"));
+  Serial.println(speedEnc::selected == w ? F("  <- encoder") : F(""));
+}
+
 void printGenerators() {
-  Serial.println(F("---- Pot generators ----"));
-  printGenerator("Rear   A1 -> D44 :", genRear);
-  printGenerator("Front  A0 -> D3  :", genFront);
-  printGenerator("Declog A2 -> D11 :", genDeclog);
-  Serial.println(F("------------------------"));
+  Serial.println(F("---- Generators ----"));
+  printEncoderGenerator("Rear   enc -> D44 :", speedEnc::REAR);
+  printEncoderGenerator("Front  enc -> D3  :", speedEnc::FRONT);
+  printGenerator("Declog A2  -> D11 :", genDeclog);
+  Serial.println(F("--------------------"));
 }
 
 void setup() {
   Serial.begin(115200);  // USB Serial Monitor.
   for (PotGenerator* g : generators) g->begin();  // Timers 5, 3 and 1 stopped, outputs LOW.
   esp.begin(115200);     // ESP32 link on TX1 (D18).
-  pagePot::begin();      // Page pot on A5.
+  speedEnc::begin();     // Speed encoder on D22 / D23 / D24, both wheels at 0 km/h.
 
   pinMode(7, INPUT);
   pinMode(8, INPUT);
@@ -264,7 +281,7 @@ void loop() {
   unsigned long now = millis();
 
   for (PotGenerator* g : generators) g->update(now);
-  pagePot::update(now);
+  speedEnc::update(now);
 
   if (micros() - windowStartUs >= MEASURE_US) {
     unsigned long pulses1, pulses2, pulses3, elapsedUs, nowUs, edge[3];
@@ -327,8 +344,7 @@ void loop() {
     Serial.print(F("Battery (A4): ")); Serial.print(batteryV, 2);
     Serial.print(F(" V (pin ")); Serial.print(pinV[1], 2); Serial.println(F(" V)"));
     Serial.print(F("Supply (5V pin, measured): ")); Serial.print(supply::volts, 3); Serial.println(F(" V"));
-    Serial.print(F("Page pot (A5): ")); Serial.print(pagePot::raw);
-    Serial.print(F(" -> page ")); Serial.println(pagePot::page);
+    Serial.print(F("Speed encoder: adjusting ")); Serial.println(speedEnc::nameOf(speedEnc::selected));
     Serial.println();
   }
 

@@ -52,7 +52,11 @@ Serial link, no divider: Nano D5 (SoftwareSerial TX) → ESP32 RX2 (GPIO16), com
 ## Board settings
 ESP32 Dev Module, Flash Frequency 40MHz, Flash Mode DIO, Upload Speed 115200, ESP32 core 2.0.17. If upload reports "Wrong boot mode", hold BOOT, tap EN, release BOOT and retry.
 
-## Page navigation (page pot on the Mega's A5)
+## Speed encoder on the Mega or Nano (REAR / FRONT ADJUST marker)
+
+The current Mega firmware sets the rear / front test speeds with a KY-040 on the Mega (D22 / D23 / D24, see `arduino-mega/MegaAbsTester/README.md`) and has no A5 page pot. Its frames have 20 fields: `0,0` in the page pot slots (so the pot is ignored), then the wheel the encoder adjusts (1 rear, 2 front). The Nano (`arduino-nano/NanoAbsTester`, encoder on A0 / A1 / A5) does the same with 18 fields: its 17, then the wheel. Page 1 marks that wheel in amber with **ADJUST**: an amber dot and ADJUST after the FRONT gauge title, or an amber stripe, REAR name and ADJUST in the REAR bar. Also in the JSON as `speed_encoder` (`"rear"`, `"front"`, or null for the Nano / older Mega) and on the USB serial line (`ENC REAR ->D44 … (adjusting REAR)`). Older 17- and 19-field frames still work. Page selection is the ESP32's own encoder below (or a swipe).
+
+## Page navigation (page pot on the older Mega's A5)
 
 Three pages: 1 SPEED (front / rear speedometers), 2 INPUT (GPIO34 gauge and INPUT bar), 3 DECLOG (Declog gauge and DECLOG bar). The Mega reads a 10 kΩ pot on A5 and splits 0–1023 into the pages: **0–341 → page 1, 342–682 → page 2, 683–1023 → page 3**. The screen jumps to the pot's page whenever that changes (and when the Mega link starts). Swipes still work (left = next page, right = previous) and hold until the pot is turned into another page. The footer shows `PAGE n/3` at the left and the page name at the right. Page changes are logged on the USB serial monitor (`# PAGE POT A5 … -> page n`). The pot reading and page arrive as two extra fields at the end of the `A1` frame; older sender firmware without them still works (swipe only).
 
