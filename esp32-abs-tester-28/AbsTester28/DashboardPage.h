@@ -10,7 +10,9 @@
 //     180, NO SPEED SENSOR READING with no pulses) and DECLOG (LCD page 3:
 //     0-100 Hz gauge with the 0-100 % bar);
 //   footer: round ABS / TCS lights, KEY ON, the LCD page chip (page, name and
-//     the encoder's SELECT / LOCKED mode), the pot generator settings.
+//     the encoder's SELECT / LOCKED mode), the generator settings: REAR /
+//     FRONT from the sender's KY-040 speed encoder (the wheel it adjusts in
+//     amber, ADJUST on its gauge or bar as on LCD page 1), DECLOG from its pot.
 // Without live data from the sender a banner says WAITING FOR DATA / NO LINK
 // and the sender's cards dim; the speed sensor is measured on the ESP32
 // itself, so it keeps working. Opens with a short splash like the LCD, then
@@ -79,7 +81,8 @@ footer{display:flex;flex-wrap:wrap;align-items:center;gap:10px 20px;padding:10px
 .chip{padding:2px 10px;border-radius:999px;border:1px solid var(--edge);color:var(--muted);font-size:12px;font-weight:700;letter-spacing:.8px}
 .chip.sel{color:var(--amber);border-color:var(--amber)}.chip.lock{color:var(--accent);border-color:var(--accent)}
 .gens{display:flex;flex-wrap:wrap;gap:6px 16px;font-weight:600;color:var(--muted)}
-.gens b{color:var(--accent);font-weight:700}
+.gens b{color:var(--accent);font-weight:700}.gens .adj,.gens .adj b{color:var(--amber)}
+.gauge h2 .adjTag{color:var(--amber);font-weight:800;letter-spacing:1px}
 .stamp{margin-left:auto;font-weight:500;font-size:12px;color:var(--muted);letter-spacing:.5px}
 .overlay{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:16px;transition:opacity .4s}
 .absring{display:block;margin:0 auto;flex:none}
@@ -154,7 +157,7 @@ function card(p,o){
   if(major){const a=v==0?-.17:v==o.max?.17:0,[tx,ty]=pt(v-a*o.max/Math.PI,77);
    t+=`<text x="${tx}" y="${ty+4}" text-anchor="middle" fill="${c}" font-size="11" font-weight="600">${v}</text>`;}}
  const n=o.needle;
- $(p+'Card').innerHTML=`<h2>${o.label}</h2><svg viewBox="0 0 260 150" aria-label="${o.label}">
+ $(p+'Card').innerHTML=`<h2>${o.label}<small class="adjTag" id="${p}Adj"></small></h2><svg viewBox="0 0 260 150" aria-label="${o.label}">
  <path d="M14 140A116 116 0 0 1 246 140Z" fill="var(--face)"/>
  <path d="M10 140A120 120 0 0 1 250 140" fill="none" stroke="var(--edge)" stroke-width="1.2"/>
  <path d="M22 140A108 108 0 0 1 238 140" fill="none" stroke="var(--track)" stroke-width="9"/>
@@ -166,7 +169,7 @@ function card(p,o){
  <rect x="94" y="101" width="72" height="42" rx="8" fill="var(--plate)" stroke="#22303f" id="${p}Plate"/>
  <text x="130" y="113" text-anchor="middle" font-size="8" fill="var(--muted)" letter-spacing=".5" id="${p}Unit">${o.unit}</text>
  <text x="130" y="138" text-anchor="middle" font-size="26" font-weight="800" fill="var(--text)" class="num" id="${p}Val">--</text>
-</svg><div class="bar-row" id="${p}Row"><b>${o.bar}</b><div class="track"><div class="fill" id="${p}Bar"></div></div><strong class="num"><span id="${p}Text">--</span><small>${o.pct?'%':o.unit}</small></strong></div>
+</svg><div class="bar-row" id="${p}Row"><b id="${p}BarName">${o.bar}</b><div class="track"><div class="fill" id="${p}Bar"></div></div><strong class="num"><span id="${p}Text">--</span><small>${o.pct?'%':o.unit}</small></strong></div>
  <div class="err" id="${p}Err" hidden>NO SPEED SENSOR READING<small>Check the sensor and its wire</small></div>`;}
 for(const p in D)card(p,D[p]);
 // v: reading in the dial's unit; have false: needle parked, "--".
@@ -210,9 +213,18 @@ function show(d){
  const pg=d.page>=1&&d.page<=3?d.page:1,mode=d.page_mode;
  $('pageChip').textContent=`LCD ${pg}/3 ${PAGES[pg-1]}`+(mode==='select'?' · SELECT':mode==='locked'?' · LOCKED':'');
  $('pageChip').className='chip'+(mode==='select'?' sel':mode==='locked'?' lock':'');
- // Pot generator settings (no pin names, as on the LCD).
- const g=[['REAR',d.gen_rear_hz],['FRONT',d.gen_front_hz],['DECLOG',d.gen_declog_hz]];
- $('gens').innerHTML=on&&g.every(x=>typeof x[1]==='number')?'POT '+g.map(([n,v])=>`<span>${n} <b>${Math.round(v)}</b> Hz</span>`).join(''):'';
+ // Generator settings (no pin names, as on the LCD). With the KY-040 speed
+ // encoder (speed_encoder "rear" / "front") REAR / FRONT come from it and the
+ // wheel it adjusts is amber, with ADJUST on its gauge (FRONT) or bar (REAR);
+ // DECLOG is always the pot. Older sender firmware: all three are pots.
+ const enc=on&&(d.speed_encoder==='rear'||d.speed_encoder==='front')?d.speed_encoder:null;
+ const g=[['REAR',d.gen_rear_hz,'rear'],['FRONT',d.gen_front_hz,'front'],['DECLOG',d.gen_declog_hz]];
+ const sp=([n,v,w])=>`<span${enc&&w===enc?' class="adj"':''}>${n} <b>${Math.round(v)}</b> Hz</span>`;
+ $('gens').innerHTML=!on||!g.every(x=>typeof x[1]==='number')?'':enc
+  ?'ENCODER '+g.slice(0,2).map(sp).join('')+' POT '+sp(g[2]):'POT '+g.map(sp).join('');
+ $('frontAdj').textContent=enc==='front'?' · ADJUST':'';
+ $('frontBarName').textContent=enc==='rear'?'REAR · ADJUST':'REAR';
+ $('frontBarName').style.color=enc==='rear'?'var(--amber)':'';
  lampStates=on?{absLamp:d.abs_lamp,tcsLamp:d.tcs_lamp}:{};lamps();
  // Speed sensor on GPIO34, measured by the ESP32: always shown.
  // (Unreachable ESP32: the card dims instead of claiming a sensor fault.)

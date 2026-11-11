@@ -136,12 +136,12 @@ String liveJson() {
   json += '"';
   json += F(",\"sender\":");
   json += latest.sender == AbsData::MEGA ? F("\"mega\"") : latest.sender == AbsData::NANO ? F("\"nano\"") : F("null");
-  // Pot generator settings (null with older sender firmware).
-  // Nano: rear pot A0 -> D9, front pot A1 -> D10, Declog pot A2 -> D3.
-  // Mega: rear pot A1 -> D44, front pot A0 -> D3, Declog pot A2 -> D11.
+  // Generator settings (null with older sender firmware).
+  // Nano: KY-040 speed encoder (A0 / A1 / A5) -> rear D9 / front D10, Declog pot A2 -> D3.
+  // Mega: KY-040 speed encoder (D22 / D23 / D24) -> rear D44 / front D3, Declog pot A2 -> D11.
   const char* const GEN_KEYS[3] = {",\"gen_rear_hz\":", ",\"gen_front_hz\":", ",\"gen_declog_hz\":"};
   for (uint8_t i = 0; i < 3; ++i) { json += GEN_KEYS[i]; json += latest.gens ? String(latest.genHz[i], 1) : String("null"); }
-  // Wheel the Mega's speed encoder adjusts ("rear" / "front"; null without one).
+  // Wheel the sender's speed encoder adjusts ("rear" / "front"; null without one).
   json += F(",\"speed_encoder\":");
   json += latest.speedSel == 1 ? F("\"rear\"") : latest.speedSel == 2 ? F("\"front\"") : F("null");
   // Warning lights, the same as the LCD: ABS "on" / "off", TCS "flash" / "off",
@@ -274,7 +274,7 @@ void loop() {
       Serial.print(F(" V | BATTERY ")); Serial.print(latest.batteryV, 2);
       if (latest.gens) {
         const bool mega = latest.sender == AbsData::MEGA;
-        const bool enc = latest.speedSel != 0;  // Mega with the speed encoder.
+        const bool enc = latest.speedSel != 0;  // Sender with the speed encoder.
         Serial.print(enc ? (mega ? F(" V | ENC REAR ->D44 ") : F(" V | ENC REAR ->D9 "))
                          : mega ? F(" V | POT REAR A1->D44 ") : F(" V | POT REAR A0->D9 "));
         Serial.print(latest.genHz[0], 0);

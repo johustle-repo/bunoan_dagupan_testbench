@@ -71,7 +71,7 @@ struct AbsData {
   bool pagePot;                  // Frame carries the Mega's A5 page pot.
   uint16_t potRaw;               // A5 reading, 0-1023.
   uint8_t potPage;               // Page picked by the pot, 1-3.
-  uint8_t speedSel;              // Wheel the Mega's speed encoder adjusts: 1 rear, 2 front, 0 none / older firmware.
+  uint8_t speedSel;              // Wheel the sender's speed encoder adjusts: 1 rear, 2 front, 0 none / older firmware.
   bool absLamp;                  // ABS light, from AbsLamp.
 };
 
