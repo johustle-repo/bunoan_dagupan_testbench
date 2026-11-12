@@ -32,14 +32,15 @@ namespace potgen {
 
 constexpr uint8_t DECLOG_POT = A2;  // A0 / A1 are the speed encoder's CLK / DT now.
 constexpr uint8_t REAR_OUT = 9, FRONT_OUT = 10, DECLOG_OUT = 3;
-// Divided outputs: D4 = D9 / 6, D11 = D10 / 6 (1500 Hz -> 250 Hz), 50 % duty,
-// the same /6 as the speed formula, so their Hz equals the wheel's km/h
+// Divided outputs: D4 = D9 / 6 (1500 Hz -> 250 Hz), D11 = D10 / 15 (1500 Hz -> 100 Hz), 50 % duty.
+// D4 uses the same /6 as the speed formula, so its Hz equals the wheel's km/h
 // (100 km/h: D9 600 Hz, D4 100 Hz).
 // Each D9 / D10 edge (rising and falling) is counted in the Timer1 interrupt
 // and every 6th toggles the divided pin, so they stay locked to the main
 // outputs (exact average frequency; each edge up to about 0.1 ms late, which
 // is under 5 % of a 250 Hz half period). They stop LOW with the main output.
-constexpr uint8_t REAR_DIV_OUT = 4, FRONT_DIV_OUT = 11, DIVIDE = 6;
+constexpr uint8_t REAR_DIV_OUT = 4, FRONT_DIV_OUT = 11;
+constexpr uint8_t DIVIDE[2] = {6, 15};  // D4 = D9 / 6 (0-250 Hz), D11 = D10 / 15 (0-100 Hz).
 uint8_t divCount[2] = {0, 0};
 
 // Writing 1 to a PINx bit toggles that output (ATmega328P), in one instruction.
@@ -89,7 +90,7 @@ inline void onMatch(uint8_t c) {
   Channel& ch = chan[c];
   if (ch.edgeArmed) {
     ch.level = !ch.level;
-    if (++divCount[c] >= DIVIDE) { divCount[c] = 0; divToggle(c); }  // D4 / D11.
+    if (++divCount[c] >= DIVIDE[c]) { divCount[c] = 0; divToggle(c); }  // D4 / D11.
     const uint32_t half = ch.halfQ8;
     if (!half) {  // Stopped: let the pin finish LOW and turn the channel off.
       if (!ch.level) { TIMSK1 &= c ? ~_BV(OCIE1B) : ~_BV(OCIE1A); divLow(c); return; }
@@ -161,6 +162,7 @@ void setDeclogHz(uint16_t hz) {
 // ---- Settings ----
 uint16_t setHz[3] = {0xFFFF, 0xFFFF, 0xFFFF};  // Rear, front, Declog, whole Hz.
 uint32_t lastReadMs = 0;
+bool declogEnabled = true;  // false: D3 held LOW (another ESP32 page is shown).
 
 // Frequency each output is set to (Hz), for the frame and the Serial Monitor.
 float outHz(uint8_t i) { return setHz[i] == 0xFFFF ? 0 : setHz[i]; }
@@ -184,7 +186,7 @@ void begin() {
   pinMode(FRONT_OUT, OUTPUT);
   pinMode(DECLOG_OUT, OUTPUT);
   pinMode(REAR_DIV_OUT, OUTPUT);   // D4 = D9 / 6.
-  pinMode(FRONT_DIV_OUT, OUTPUT);  // D11 = D10 / 6 (plain output: Timer2 runs the sampler, no PWM).
+  pinMode(FRONT_DIV_OUT, OUTPUT);  // D11 = D10 / 15 (plain output: Timer2 runs the sampler, no PWM).
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
     TIMSK1 = 0;
     TCCR1A = 0;                // Normal mode, pins not connected yet.
@@ -205,7 +207,7 @@ void update(uint32_t nowMs) {
     sum += analogRead(DECLOG_POT);
     delayMicroseconds(50);
   }
-  const uint16_t hz = map(long(sum / NUM_SAMPLES), 0, 1023, 0, MAX_DECLOG_HZ);
+  const uint16_t hz = declogEnabled ? map(long(sum / NUM_SAMPLES), 0, 1023, 0, MAX_DECLOG_HZ) : 0;
   if (hz == setHz[2]) return;
   setHz[2] = hz;
   setDeclogHz(hz);

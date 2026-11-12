@@ -58,7 +58,7 @@ struct AbsData {
   float ref1V, batteryV;         // A0, A1.
   bool nanoLamps;                // Frame carries the Nano's RPM, TCS and ABS.
   uint16_t rpm;                  // D7 Hz x 15000 / 1560, from the Nano.
-  bool tcsSteady, absActive;     // The Nano's TCS (D13) and ABS (D12) LED states.
+  bool tcsSteady, absActive;     // The Nano's TCS state (speeds equal) and ABS (D12) LED state.
   float declogHz;                // D2, 0 with older firmware.
   // Sender board, from the frame length: the Mega adds the A5 page pot
   // (19 fields), the Nano doesn't. Kept after the link drops.
@@ -67,12 +67,16 @@ struct AbsData {
   // Pots, rear / front (0-1500 Hz) / Declog (0-100 Hz):
   //   Nano: A0 -> D9, A1 -> D10, A2 -> D3.  Mega: A1 -> D44, A0 -> D3, A2 -> D11.
   float genHz[3];
-  float inputHz;                 // ESP32 GPIO34 frequency input (page 2), measured here.
+  float inputHz;                 // Page 2 speed sensor Hz: Nano D6 (sensorHz) or ESP32 GPIO34.
+  bool nanoSensor;               // Frame carries the Nano's D6 speed sensor (21 fields).
+  float sensorHz;                // Nano D6 frequency, Hz.
+  bool absPin;                   // Frame carries the Nano's D13 ABS light input (22 fields).
+  bool absPinOn;                 // D13 HIGH: ABS light on.
   bool pagePot;                  // Frame carries the Mega's A5 page pot.
   uint16_t potRaw;               // A5 reading, 0-1023.
   uint8_t potPage;               // Page picked by the pot, 1-3.
   uint8_t speedSel;              // Wheel the sender's speed encoder adjusts: 1 rear, 2 front, 0 none / older firmware.
-  bool absLamp;                  // ABS light, from AbsLamp.
+  bool absLamp;                  // ABS light: Nano D13 input, or AbsLamp (rear speed).
 };
 
 inline const char* senderName(AbsData::Sender s) {

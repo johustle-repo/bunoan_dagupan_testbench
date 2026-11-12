@@ -28,6 +28,9 @@
 const char* const AP_SSID = "ABS-Tester";
 const char* const AP_PASSWORD = "ABSdemo2026";  // At least 8 characters.
 constexpr uint8_t LINK_RX = 16, LINK_TX = 17;  // RX2, TX2 (TX unused).
+// The page on screen, to the Nano so it runs only that page's signals:
+// GPIO5 -> Nano A6 (bit 0), GPIO14 -> Nano A7 (bit 1). Page 1 = 01, 2 = 10, 3 = 11.
+constexpr uint8_t PAGE_BIT0 = 5, PAGE_BIT1 = 14;  // Not GPIO32: the touch T_IRQ is wired there.
 HardwareSerial& nano = Serial2;
 WebServer server(80);
 char frame[128], lastBadFrame[128] = "";
@@ -57,12 +60,14 @@ bool parseFrame(char* text) {
   // 8 fields (oldest Nano), 10 (+ front sensor), 13 (+ RPM, TCS, ABS), 14 (+ Declog Hz)
   // 17 (+ the three generator settings), 18 (Nano with the speed encoder: + the wheel it adjusts,
   // 1 rear / 2 front), 19 (+ the older Mega's A5 page pot reading 0-1023 and page 1-3)
-  // or 20 (Mega with the speed encoder: 0,0 for the page pot, then the wheel it adjusts).
+  // or 20 (Mega with the speed encoder: 0,0 for the page pot, then the wheel it adjusts),
+  // 21 (Nano with the D6 speed sensor: the 20-field layout, then the D6 Hz x100 for page 2)
+  // or 22 (+ the Nano's D13 ABS light input: 1 = light on, 0 = off).
   constexpr uint8_t MIN_FIELDS = 8, FRONT_FIELDS = 10, LAMP_FIELDS = 13, DECLOG_FIELDS = 14, GEN_FIELDS = 17,
-                    NANO_ENC_FIELDS = 18, POT_FIELDS = 19, MAX_FIELDS = 20;
+                    NANO_ENC_FIELDS = 18, POT_FIELDS = 19, ENC_FIELDS = 20, SENSOR_FIELDS = 21, MAX_FIELDS = 22;
   // REF1 and battery: up to 30 V (0-30 V dividers, as on the ECU testbench).
   constexpr unsigned long maximum[MAX_FIELDS] = {1, 1, 100000000UL, 25000, 31000, 5500, 10500, 31000, 100000000UL, 25000,
-                                                 15000, 1, 1, 100000000UL, 250000, 250000, 25000, 1023, 3, 2};
+                                                 15000, 1, 1, 100000000UL, 250000, 250000, 25000, 1023, 3, 2, 1000000UL, 1};
   unsigned long values[MAX_FIELDS];
   uint8_t parsed = 0;
   char* p = text + 3;
@@ -73,7 +78,8 @@ bool parseFrame(char* text) {
     parsed = i + 1;
     if (!*end && (parsed == MIN_FIELDS || parsed == FRONT_FIELDS || parsed == LAMP_FIELDS ||
                     parsed == DECLOG_FIELDS || parsed == GEN_FIELDS || parsed == NANO_ENC_FIELDS ||
-                    parsed == POT_FIELDS || parsed == MAX_FIELDS)) break;
+                    parsed == POT_FIELDS || parsed == ENC_FIELDS || parsed == SENSOR_FIELDS ||
+                    parsed == MAX_FIELDS)) break;
     if (*end != ',' || parsed == MAX_FIELDS) return false;
     p = end + 1;
   }
@@ -92,11 +98,15 @@ bool parseFrame(char* text) {
   latest.tcsSteady = latest.nanoLamps && values[11] == 1;
   latest.absActive = latest.nanoLamps && values[12] == 1;
   latest.declogHz = parsed >= DECLOG_FIELDS ? values[13] / 100.0f : 0;
-  latest.sender = parsed >= POT_FIELDS ? AbsData::MEGA : AbsData::NANO;
+  latest.sender = parsed == POT_FIELDS || parsed == ENC_FIELDS ? AbsData::MEGA : AbsData::NANO;
+  latest.nanoSensor = parsed >= SENSOR_FIELDS;  // Nano D6 speed sensor (page 2).
+  latest.absPin = parsed == MAX_FIELDS;         // Nano D13 ABS light input.
+  latest.absPinOn = latest.absPin && values[21] == 1;
+  latest.sensorHz = latest.nanoSensor ? values[20] / 100.0f : 0;
   latest.gens = parsed >= GEN_FIELDS;
   for (uint8_t i = 0; i < 3; ++i) latest.genHz[i] = latest.gens ? values[14 + i] / 100.0f : 0;
   latest.pagePot = parsed >= POT_FIELDS && values[18] >= 1;  // The encoder Mega sends page 0: no pot.
-  latest.speedSel = parsed == MAX_FIELDS ? values[19] : parsed == NANO_ENC_FIELDS ? values[17] : 0;
+  latest.speedSel = parsed >= ENC_FIELDS ? values[19] : parsed == NANO_ENC_FIELDS ? values[17] : 0;
   latest.potRaw = latest.pagePot ? values[17] : 0;
   latest.potPage = latest.pagePot ? values[18] : 0;
   ++frameCount;
@@ -105,9 +115,19 @@ bool parseFrame(char* text) {
   return true;
 }
 
+// ABS light: the Nano's D13 input (HIGH = on) while live Nano frames carry it,
+// otherwise the switch-on check from the rear speed (AbsLamp).
+inline bool absLampOn(bool fresh) { return fresh && (latest.absPin ? latest.absPinOn : absLamp.on); }
+
+// Page 2 speed sensor: the Nano's D6 while live Nano frames carry it,
+// otherwise the ESP32's own GPIO34 input.
+inline bool sensorOnNano(bool fresh) { return fresh && latest.nanoSensor; }
+inline float sensorHz(bool fresh) { return sensorOnNano(fresh) ? latest.sensorHz : freqInput::hz; }
+
 // Same values the LCD shows; DECLOG is the D2 frequency (0-100 Hz = 0-100 %).
 String liveJson() {
   const bool fresh = havePacket && uint32_t(millis() - lastPacketMs) <= 3000;
+  const float inHz = sensorHz(fresh);
   const float percent = constrain(latest.declogHz / DECLOG_MAX_HZ * 100, 0.0f, 100.0f);
   String json;
   json.reserve(480);
@@ -126,10 +146,12 @@ String liveJson() {
   json += F(",\"declog_percent\":"); json += String(percent, 1);
   json += F(",\"ref1_v\":"); json += String(latest.ref1V, 3);
   json += F(",\"battery_v\":"); json += String(latest.batteryV, 3);
-  json += F(",\"input_hz\":"); json += String(freqInput::hz, 1);
-  // Page 2 speed sensor: GPIO34 Hz / 10 = km/h (0-200); null = NO SIGNAL.
+  json += F(",\"input_hz\":"); json += String(inHz, 1);
+  // Page 2 speed sensor: Hz / 10 = km/h (0-200); null = NO SIGNAL.
+  // input_source: "nano_d6" (Nano D6) or "gpio34" (the ESP32's own input).
   json += F(",\"input_kmh\":");
-  json += freqInput::hz > 0 ? String(min(freqInput::hz / INPUT_HZ_PER_KMH, INPUT_MAX_KMH), 1) : String("null");
+  json += inHz > 0 ? String(min(inHz / INPUT_HZ_PER_KMH, INPUT_MAX_KMH), 1) : String("null");
+  json += F(",\"input_source\":"); json += sensorOnNano(fresh) ? F("\"nano_d6\"") : F("\"gpio34\"");
   json += F(",\"page\":"); json += page;
   json += F(",\"page_mode\":\"");
   json += nav == Nav::LOCKED ? F("locked") : nav == Nav::SELECTING ? F("select") : F("free");
@@ -146,7 +168,7 @@ String liveJson() {
   json += latest.speedSel == 1 ? F("\"rear\"") : latest.speedSel == 2 ? F("\"front\"") : F("null");
   // Warning lights, the same as the LCD: ABS "on" / "off", TCS "flash" / "off",
   // SENSOR (web only) "ok" / "on" / "off".
-  json += F(",\"abs_lamp\":\""); json += fresh && absLamp.on ? "on" : "off";
+  json += F(",\"abs_lamp\":\""); json += absLampOn(fresh) ? "on" : "off";
   json += F("\",\"tcs_lamp\":\""); json += fresh && tcsBlinking(latest) ? "flash" : "off";
   json += F("\",\"sensor_lamp\":\""); json += fresh ? sensorState(latest) : "off";
   json += '"';
@@ -214,6 +236,8 @@ void encoderNav() {
 
 void setup() {
   Serial.begin(115200);
+  pinMode(PAGE_BIT0, OUTPUT);
+  pinMode(PAGE_BIT1, OUTPUT);
   absDisplay::begin();
   freqInput::begin();
   encoder::begin();
@@ -263,7 +287,7 @@ void loop() {
       Serial.print(F(" Hz = ")); Serial.print(latest.speedKmh, 1);
       Serial.print(F(" km/h | RPM ")); Serial.print(latest.rpm);
       Serial.print(F(" | TCS ")); Serial.print(tcsBlinking(latest) ? F("BLINKING") : F("OFF"));
-      Serial.print(F(" | ABS ")); Serial.print(absLamp.on ? F("ON") : F("OFF"));
+      Serial.print(latest.absPin ? F(" | ABS (NANO D13) ") : F(" | ABS ")); Serial.print(absLampOn(true) ? F("ON") : F("OFF"));
       Serial.print(F(" | SPEED 2 D8 "));
       if (latest.front) {
         Serial.print(latest.frontHz, 1); Serial.print(F(" Hz = "));
@@ -286,10 +310,11 @@ void loop() {
         if (enc) Serial.print(latest.speedSel == 1 ? F(" (adjusting REAR)") : F(" (adjusting FRONT)"));
       } else Serial.print(F(" V"));
       Serial.print(F(" | ")); Serial.print(senderName(latest.sender));
-      Serial.print(F(" | SENSOR GPIO34 "));
-      if (freqInput::hz > 0) {
-        Serial.print(freqInput::hz, 1); Serial.print(F(" Hz = "));
-        Serial.print(min(freqInput::hz / INPUT_HZ_PER_KMH, INPUT_MAX_KMH), 1); Serial.print(F(" km/h"));
+      const float inHz = sensorHz(true);
+      Serial.print(sensorOnNano(true) ? F(" | SENSOR NANO D6 ") : F(" | SENSOR GPIO34 "));
+      if (inHz > 0) {
+        Serial.print(inHz, 1); Serial.print(F(" Hz = "));
+        Serial.print(min(inHz / INPUT_HZ_PER_KMH, INPUT_MAX_KMH), 1); Serial.print(F(" km/h"));
       } else Serial.print(F("NO SIGNAL"));
       if (brakeButton::held) { Serial.print(F(" | BRAKE GPIO13 rear ")); Serial.print(brakeButton::rear, 0); Serial.print(F(" front ")); Serial.print(brakeButton::front, 0); Serial.print(F(" km/h")); }
       Serial.print(F(" | bad frames ")); Serial.print(badFrames);
@@ -307,7 +332,8 @@ void loop() {
   AbsData d = latest;
   const bool fresh = havePacket && uint32_t(millis() - lastPacketMs) <= 3000;
   d.link = !havePacket ? AbsData::WAITING : !fresh ? AbsData::STALE : AbsData::LIVE;
-  d.inputHz = freqInput::update();
+  freqInput::update();       // GPIO34, always measured (fallback for page 2).
+  d.inputHz = sensorHz(fresh);  // Nano D6 while live Nano frames carry it.
   // Brake button (GPIO13): shown rear / front speeds drop 10 km/h per 100 ms to 0 while held.
   brakeButton::update(latest.speedKmh, latest.frontKmh);
   d.speedKmh = brakeButton::rearKmh(latest.speedKmh);
@@ -316,7 +342,7 @@ void loop() {
   // ABS light: follows the rear speed while live; losing the link resets it
   // (the next start begins with it on).
   if (fresh) absLamp.update(d.speedKmh); else absLamp.reset();
-  d.absLamp = absLamp.on;
+  d.absLamp = absLampOn(fresh);
   encoderNav();
   pagePotFollow.update(fresh, nav == Nav::FREE);
   // Swipe left: next page, swipe right: previous page. While selecting a
@@ -335,6 +361,9 @@ void loop() {
       Serial.print(F(") -> page ")); Serial.println(page);
     }
   }
+  // Tell the Nano the page shown, so the other pages' signals are off.
+  digitalWrite(PAGE_BIT0, page & 1 ? HIGH : LOW);
+  digitalWrite(PAGE_BIT1, page & 2 ? HIGH : LOW);
   absDisplay::update(d, page, nav == Nav::SELECTING ? selPage : 0, nav == Nav::LOCKED);
   server.handleClient();
   yield();
