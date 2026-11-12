@@ -1,7 +1,7 @@
 #pragma once
 #include <Arduino.h>
 
-// Brake button on GPIO13: a push button from GPIO13 to GND (internal
+// Brake button on GPIO15: a push button from GPIO15 to GND (internal
 // pull-up, no resistor needed). While it is held the REAR and FRONT speeds
 // shown (LCD, dashboard, JSON) drop by 10 km/h every STEP_MS from where they
 // were at the press, down to 0, and stay at 0 while held. Released: back to
@@ -10,7 +10,7 @@
 // TCS / ABS states are untouched. The ABS light follows the braked rear speed.
 namespace brakeButton {
 
-constexpr uint8_t PIN = 13;
+constexpr uint8_t PIN = 15;  // Was GPIO13 (read LOW with nothing wired on this board).
 constexpr uint32_t DEBOUNCE_MS = 30, STEP_MS = 100;
 constexpr float STEP_KMH = 10;
 
@@ -21,7 +21,7 @@ float rear = 0, front = 0;       // Braked speeds while held.
 
 inline void begin() {
   pinMode(PIN, INPUT_PULLUP);
-  Serial.println(F("Brake button ready: GPIO13 to GND."));
+  Serial.println(F("Brake button ready: GPIO15 to GND."));
 }
 
 // Call every loop with the live speeds.

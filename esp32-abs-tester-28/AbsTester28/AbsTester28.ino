@@ -316,8 +316,10 @@ void loop() {
         Serial.print(inHz, 1); Serial.print(F(" Hz = "));
         Serial.print(min(inHz / INPUT_HZ_PER_KMH, INPUT_MAX_KMH), 1); Serial.print(F(" km/h"));
       } else Serial.print(F("NO SIGNAL"));
-      if (brakeButton::held) { Serial.print(F(" | BRAKE GPIO13 rear ")); Serial.print(brakeButton::rear, 0); Serial.print(F(" front ")); Serial.print(brakeButton::front, 0); Serial.print(F(" km/h")); }
+      if (brakeButton::held) { Serial.print(F(" | BRAKE GPIO15 rear ")); Serial.print(brakeButton::rear, 0); Serial.print(F(" front ")); Serial.print(brakeButton::front, 0); Serial.print(F(" km/h")); }
       Serial.print(F(" | bad frames ")); Serial.print(badFrames);
+      Serial.print(F(" | PAGE ")); Serial.print(page);
+      Serial.print(nav == Nav::LOCKED ? F(" locked") : nav == Nav::SELECTING ? F(" selecting") : F(""));
       Serial.print(F(" | ")); encoder::printStatus(Serial); Serial.println();
     } else {
       Serial.print(F("# NO DATA from the ")); Serial.print(senderName(latest.sender));
@@ -334,7 +336,7 @@ void loop() {
   d.link = !havePacket ? AbsData::WAITING : !fresh ? AbsData::STALE : AbsData::LIVE;
   freqInput::update();       // GPIO34, always measured (fallback for page 2).
   d.inputHz = sensorHz(fresh);  // Nano D6 while live Nano frames carry it.
-  // Brake button (GPIO13): shown rear / front speeds drop 10 km/h per 100 ms to 0 while held.
+  // Brake button (GPIO15): shown rear / front speeds drop 10 km/h per 100 ms to 0 while held.
   brakeButton::update(latest.speedKmh, latest.frontKmh);
   d.speedKmh = brakeButton::rearKmh(latest.speedKmh);
   d.frontKmh = brakeButton::frontKmh(latest.frontKmh);
