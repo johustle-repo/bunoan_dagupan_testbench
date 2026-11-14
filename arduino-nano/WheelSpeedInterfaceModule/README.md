@@ -17,15 +17,16 @@ Not part of the ABS tester or the ECU testbench.
 | D7  | OUT | 10 pulses/s with 0.5 s interruptions, from 2 s to 10 s of D6 time |
 | D8  | OUT | FREQ output #1 (1:1 front) |
 | D9  | OUT | FREQ output #2 (1:1 rear) |
-| D10 | OUT | Front FREQ ÷ 60 (RPM) |
+| D10 | OUT | RPM in Hz: front FREQ × 10 (60 Hz → 600 Hz, 1500 Hz → 15 kHz), 50 % duty, LOW below 31 Hz |
 | D11 | OUT | Front FREQ ÷ 6 (speed display, 1 Hz = 1 km/h) |
-| D12 | OUT | LOCK: logic 1 once front reaches 60 Hz (10 km/h), reset only at power-off |
-| D13 | OUT | Onboard LED: 1 Hz normal, 4 Hz once LOCK latched |
+| D12 | OUT | LOCK: LOW at power-up, HIGH once front reaches 60 Hz (10 km/h) for 200 ms, latched until power-off |
+| D13 | OUT | 4-digit display (TM1637) CLK. Onboard LED flickers dimly; no heartbeat |
 | A0  | IN  | Encoder A / CLK |
 | A1  | IN  | Encoder B / DT |
 | A2  | IN  | Encoder button / SW |
 | A3  | OUT | Generated FRONT test frequency 0-1500 Hz, jumper to D2 |
 | A4  | OUT | Generated REAR test frequency 0-1500 Hz, jumper to D3 |
+| A5  | I/O | 4-digit display (TM1637) DIO |
 
 ## Test generator (rotary encoder)
 
@@ -37,6 +38,12 @@ Not part of the ABS tester or the ECU testbench.
 Fit jumpers A3 → D2 and A4 → D3 for bench tests. Remove them when real wheel
 sensors are connected.
 
+## 4-digit display
+
+TM1637 module: **CLK → D13, DIO → A5, VCC → 5V, GND → GND**. Shows the front
+speed in whole km/h (front Hz ÷ 6), right-aligned, refreshed every 200 ms.
+Brightness: `DISP_BRIGHTNESS` (0-7). LOCK is shown on D12 and in serial `lock=`.
+
 ## Configuration
 
 Thresholds that the drawing does not specify are assumptions, set in the
@@ -44,11 +51,10 @@ CONFIG section at the top of `WheelSpeedInterfaceModule.ino`:
 
 - `BRAKE_REQUIRES_DECEL`: `false` = brake OR abrupt decel (as drawn); `true` = both
 - `DECEL_TRIGGER_HZ_PER_S`: 130 Hz/s (~6 m/s²), above 60 Hz
-- `LOCK_ACTIVE_HIGH`: `true` (drawing margin note says "logic 0", unconfirmed)
 - `TCS_MARGIN`: rear > front by 10 %, rear above 30 Hz, for 200 ms
 - `ENC_REVERSE`: flip encoder direction
 
-Serial monitor: 115200 baud, status line every 0.5 s.
+Serial monitor: 115200 baud, status line every 0.5 s. `RPM=` is front Hz × 10, the same frequency D10 puts out.
 
 ## Hardware notes
 
