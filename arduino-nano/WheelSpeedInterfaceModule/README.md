@@ -13,7 +13,7 @@ Not part of the ABS tester or the ECU testbench.
 | D3  | IN  | FREQ input #2 (rear), INT1 |
 | D4  | OUT | TCS: blinks when rear is faster than front |
 | D5  | IN  | Brake switch, `INPUT_PULLUP`, to GND = pressed |
-| D6  | OUT | Logic 1 for 13 s on brake event, starting 0.5 s after the trigger (`D6_DELAY_MS`). D6 / D7 only respond at 30 km/h (180 Hz) or more (`EVENT_MIN_FREQ_HZ`) |
+| D6  | OUT | Logic 1 for 13 s on brake event, starting 0.5 s after the trigger (`D6_DELAY_MS`). Brake triggers only count at 30 km/h (180 Hz) or more (`EVENT_MIN_FREQ_HZ`). The same D6 / D7 sequence also runs **once** when LOCK latches at 10 km/h (once per power-on) |
 | D7  | OUT | 10 pulses/s with 0.5 s interruptions, from 2 s to 10 s of D6 time |
 | D8  | OUT | FREQ output #1 (1:1 front) |
 | D9  | OUT | FREQ output #2 (1:1 rear) |

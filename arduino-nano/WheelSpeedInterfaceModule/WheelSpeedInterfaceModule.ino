@@ -2,7 +2,8 @@
 //
 // Implements the hand-drawn "NANO" signal-module sketch:
 //   * Brake switch / abrupt deceleration -> D6 held 13 s, D7 pulse bursts (only at 30 km/h or more)
-//   * Front FREQ >= 60 Hz (10 km/h)      -> LOCK output on D12, latched until power-off
+//   * Front FREQ >= 60 Hz (10 km/h)      -> LOCK output on D12, latched until power-off,
+//                                           and the D6 / D7 sequence runs once
 //   * Front FREQ / 60 (RPM), / 6 (speed display)
 //   * Front and rear FREQ passed through 1:1
 //   * Rear FREQ higher than front        -> blinking TCS output
@@ -15,7 +16,7 @@
 //   D3  IN   FREQ input #2 (rear)    INT1
 //   D4  OUT  TCS blinking output
 //   D5  IN   Brake switch            INPUT_PULLUP, switch to GND = pressed
-//   D6  OUT  Logic 1 for 13 s on brake event, starting 0.5 s after the trigger
+//   D6  OUT  Logic 1 for 13 s on brake event (or once at LOCK), starting 0.5 s after the trigger
 //   D7  OUT  10 pulses/s with 0.5 s interruption, 2 s .. 10 s of D6 time
 //   D8  OUT  FREQ output #1 (1:1 of front)
 //   D9  OUT  FREQ output #2 (1:1 of rear)
@@ -359,7 +360,9 @@ void sampleFrequencies() {
 
 // D6 / D7 event. Triggers on the *start* of a condition so holding the brake
 // does not re-trigger forever; a new event can start once the 13 s are over.
+// The same sequence also fires ONCE per power-on when LOCK latches (10 km/h).
 bool prevTrigger = false;
+bool lockEventPending = false;             // set by updateLock() on latch
 
 void updateBrakeEvent(uint32_t now) {
   bool trigger = BRAKE_REQUIRES_DECEL ? (brakePressed && abruptDecel)
@@ -371,6 +374,14 @@ void updateBrakeEvent(uint32_t now) {
     eventStartMs = now;
   }
   prevTrigger = trigger;
+
+  // One-shot LOCK event (no 30 km/h requirement). If a brake event is running
+  // it waits and starts right after that one ends.
+  if (lockEventPending && !eventActive) {
+    lockEventPending = false;
+    eventActive = true;
+    eventStartMs = now;
+  }
 
   bool d6 = false, d7 = false;
   if (eventActive) {
@@ -393,7 +404,10 @@ void updateLock(uint32_t now) {
   if (!lockLatched) {
     if (front.hz >= LOCK_FREQ_HZ) {
       if (lockAboveSinceMs == 0) lockAboveSinceMs = now ? now : 1;
-      if (now - lockAboveSinceMs >= LOCK_CONFIRM_MS) lockLatched = true;
+      if (now - lockAboveSinceMs >= LOCK_CONFIRM_MS) {
+        lockLatched = true;
+        lockEventPending = true;     // fire D6 / D7 once (latch never repeats)
+      }
     } else {
       lockAboveSinceMs = 0;
     }
