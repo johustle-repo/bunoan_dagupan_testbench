@@ -13,11 +13,11 @@ Not part of the ABS tester or the ECU testbench.
 | D3  | IN  | FREQ input #2 (rear), INT1 |
 | D4  | OUT | TCS: blinks when rear is faster than front |
 | D5  | IN  | Brake switch, `INPUT_PULLUP`, to GND = pressed |
-| D6  | OUT | Logic 1 for 13 s on brake event |
+| D6  | OUT | Logic 1 for 13 s on brake event, starting 0.5 s after the trigger (`D6_DELAY_MS`). D6 / D7 only respond at 30 km/h (180 Hz) or more (`EVENT_MIN_FREQ_HZ`) |
 | D7  | OUT | 10 pulses/s with 0.5 s interruptions, from 2 s to 10 s of D6 time |
 | D8  | OUT | FREQ output #1 (1:1 front) |
 | D9  | OUT | FREQ output #2 (1:1 rear) |
-| D10 | OUT | RPM in Hz: front FREQ × 10 (60 Hz → 600 Hz, 1500 Hz → 15 kHz), 50 % duty, LOW below 31 Hz |
+| D10 | OUT | Front FREQ ÷ 60 (RPM) |
 | D11 | OUT | Front FREQ ÷ 6 (speed display, 1 Hz = 1 km/h) |
 | D12 | OUT | LOCK: LOW at power-up, HIGH once front reaches 60 Hz (10 km/h) for 200 ms, latched until power-off |
 | D13 | OUT | 4-digit display (TM1637) CLK. Onboard LED flickers dimly; no heartbeat |
@@ -54,7 +54,7 @@ CONFIG section at the top of `WheelSpeedInterfaceModule.ino`:
 - `TCS_MARGIN`: rear > front by 10 %, rear above 30 Hz, for 200 ms
 - `ENC_REVERSE`: flip encoder direction
 
-Serial monitor: 115200 baud, status line every 0.5 s. `RPM=` is front Hz × 10, the same frequency D10 puts out.
+Serial monitor: 115200 baud, status line every 0.5 s.
 
 ## Hardware notes
 

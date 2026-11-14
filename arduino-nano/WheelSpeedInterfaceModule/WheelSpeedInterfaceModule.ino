@@ -1,9 +1,9 @@
 // Wheel Speed Interface Module (WSIM) — Arduino Nano (ATmega328P, 16 MHz)
 //
 // Implements the hand-drawn "NANO" signal-module sketch:
-//   * Brake switch / abrupt deceleration -> D6 held 13 s, D7 pulse bursts
+//   * Brake switch / abrupt deceleration -> D6 held 13 s, D7 pulse bursts (only at 30 km/h or more)
 //   * Front FREQ >= 60 Hz (10 km/h)      -> LOCK output on D12, latched until power-off
-//   * Front FREQ x 10 (RPM, in Hz), / 6 (speed display)
+//   * Front FREQ / 60 (RPM), / 6 (speed display)
 //   * Front and rear FREQ passed through 1:1
 //   * Rear FREQ higher than front        -> blinking TCS output
 //
@@ -15,11 +15,11 @@
 //   D3  IN   FREQ input #2 (rear)    INT1
 //   D4  OUT  TCS blinking output
 //   D5  IN   Brake switch            INPUT_PULLUP, switch to GND = pressed
-//   D6  OUT  Logic 1 for 13 s on brake event
+//   D6  OUT  Logic 1 for 13 s on brake event, starting 0.5 s after the trigger
 //   D7  OUT  10 pulses/s with 0.5 s interruption, 2 s .. 10 s of D6 time
 //   D8  OUT  FREQ output #1 (1:1 of front)
 //   D9  OUT  FREQ output #2 (1:1 of rear)
-//   D10 OUT  RPM in Hz: front FREQ x 10
+//   D10 OUT  FREQ output / 60  (RPM)
 //   D11 OUT  FREQ output / 6   (speed display)
 //   D12 OUT  LOCK: LOW until LOCK latches, then HIGH until power-off
 //   D13 OUT  4-digit display CLK (TM1637), shows front speed in km/h
@@ -52,6 +52,9 @@ const float    DECEL_TRIGGER_HZ_PER_S = 130.0;
 // ASSUMPTION: ignore decel detection below this speed (noise at low speed).
 const float    DECEL_MIN_FREQ_HZ      = 60.0;   // 10 km/h
 
+// D6 / D7 only start when the front speed is at least this (30 km/h = 180 Hz).
+const float    EVENT_MIN_FREQ_HZ = 180.0;
+const uint32_t D6_DELAY_MS       = 500;    // D6 turns on this long after the trigger
 const uint32_t D6_HOLD_MS        = 13000;  // drawing: logic 1 for 13 s
 const uint32_t D7_START_MS       = 2000;   // drawing text: starts after 2 s
 const uint32_t D7_END_MS         = 10000;  // drawing: ends at 10 s
@@ -72,10 +75,9 @@ const float    TCS_MIN_REAR_HZ   = 30.0;   // ASSUMPTION: ignore below 5 km/h
 const uint32_t TCS_CONFIRM_MS    = 200;    // ASSUMPTION: slip must last 200 ms
 const uint32_t TCS_BLINK_HALF_MS = 250;    // ASSUMPTION: 2 Hz blink
 
-// --- RPM output (D10) and speed divider (D11) ------------------------------
-const uint8_t  RPM_MULT          = 10;     // D10 Hz = front Hz x 10
-const uint8_t  RPM_MIN_HZ        = 31;     // Timer2 floor; below this D10 stays LOW
-// D11 toggles every N/2 rising edges -> square wave at input / N.
+// --- Dividers (D10 / D11) --------------------------------------------------
+// Output toggles every N/2 rising edges -> square wave at input / N.
+const uint8_t  DIV_RPM_HALF      = 30;     // / 60
 const uint8_t  DIV_SPEED_HALF    = 3;      // / 6
 
 // --- Test generator / rotary encoder (A0..A4) ------------------------------
@@ -157,50 +159,6 @@ void genBegin() {
   OCR1B = TCNT1 + 1500;
   TIFR1 = _BV(OCF1A) | _BV(OCF1B);
   TIMSK1 = _BV(OCIE1A) | _BV(OCIE1B);
-}
-
-// ============================ RPM OUTPUT (D10) ==============================
-// D10 puts out RPM as a frequency: front Hz x 10 (60 Hz in -> 600 Hz out).
-// Timer2 runs in CTC mode and interrupts every half period; the ISR toggles
-// D10. For each frequency the smallest prescaler that fits is picked, for the
-// finest step (< 0.8 % error up to 15 kHz). Below RPM_MIN_HZ D10 is held LOW.
-const uint8_t  T2_CS[]  = { 1, 2, 3, 4, 5, 6, 7 };   // CS22..CS20 codes
-const uint16_t T2_DIV[] = { 1, 8, 32, 64, 128, 256, 1024 };
-uint8_t  rpmCs = 0;                    // 0 = off
-uint16_t rpmTop = 0;
-
-ISR(TIMER2_COMPA_vect) { PINB = _BV(PB2); }   // toggle D10
-
-void rpmBegin() {
-  TCCR2A = _BV(WGM21);                 // CTC, no hardware pin output
-  TCCR2B = 0;
-  TIMSK2 = 0;
-}
-
-void rpmSet(uint32_t hz) {
-  uint8_t cs = 0;
-  uint32_t top = 0;
-  if (hz >= RPM_MIN_HZ) {
-    for (uint8_t i = 0; i < 7; i++) {
-      top = (F_CPU / 2 / T2_DIV[i] + hz / 2) / hz;   // ticks per half period
-      if (top >= 2 && top <= 256) { cs = T2_CS[i]; break; }
-    }
-  }
-  if (cs == rpmCs && top == rpmTop) return;          // unchanged: no glitch
-  rpmCs = cs;
-  rpmTop = top;
-  noInterrupts();
-  if (!cs) {                           // off: stop and hold LOW
-    TCCR2B = 0;
-    TIMSK2 = 0;
-    PORTB &= ~_BV(PB2);
-  } else {
-    OCR2A = top - 1;
-    if (TCNT2 >= OCR2A) TCNT2 = 0;     // new TOP below counter: restart
-    TCCR2B = cs;
-    TIMSK2 = _BV(OCIE2A);
-  }
-  interrupts();
 }
 
 // ============================ ROTARY ENCODER ================================
@@ -285,13 +243,14 @@ void updateEncoder(uint32_t now) {
 // ISRs use direct port access so the 1:1 outputs and dividers have minimal lag.
 volatile uint32_t frontEdges = 0, frontLastUs = 0;
 volatile uint32_t rearEdges  = 0, rearLastUs  = 0;
-volatile uint8_t  divSpeedCnt = 0;
+volatile uint8_t  divRpmCnt = 0, divSpeedCnt = 0;
 
 void isrFront() {
   if (PIND & _BV(PD2)) {               // rising edge
     PORTB |= _BV(PB0);                 // D8 follows input
     frontEdges++;
     frontLastUs = micros();
+    if (++divRpmCnt >= DIV_RPM_HALF)     { divRpmCnt = 0;   PINB = _BV(PB2); } // toggle D10
     if (++divSpeedCnt >= DIV_SPEED_HALF) { divSpeedCnt = 0; PINB = _BV(PB3); } // toggle D11
   } else {
     PORTB &= ~_BV(PB0);
@@ -366,7 +325,6 @@ void setup() {
   pinMode(PIN_GEN_FRONT, OUTPUT); digitalWrite(PIN_GEN_FRONT, LOW);
   pinMode(PIN_GEN_REAR, OUTPUT);  digitalWrite(PIN_GEN_REAR, LOW);
   genBegin();
-  rpmBegin();
   encBegin();
   dispBegin();
 
@@ -389,7 +347,6 @@ void readBrake(uint32_t now) {
 void sampleFrequencies() {
   front.update(frontEdges, frontLastUs);
   rear.update(rearEdges, rearLastUs);
-  rpmSet((uint32_t)(front.hz * RPM_MULT + 0.5f));   // D10 = RPM in Hz
 
   // Abrupt deceleration: drop over the last (DECEL_SAMPLES-1) samples.
   frontHist[histIdx] = front.hz;
@@ -407,7 +364,9 @@ bool prevTrigger = false;
 void updateBrakeEvent(uint32_t now) {
   bool trigger = BRAKE_REQUIRES_DECEL ? (brakePressed && abruptDecel)
                                       : (brakePressed || abruptDecel);
-  if (trigger && !prevTrigger && !eventActive) {
+  // Below 30 km/h a trigger is ignored. A running event finishes even if the
+  // speed then drops (it does when braking).
+  if (trigger && !prevTrigger && !eventActive && front.hz >= EVENT_MIN_FREQ_HZ) {
     eventActive = true;
     eventStartMs = now;
   }
@@ -416,10 +375,10 @@ void updateBrakeEvent(uint32_t now) {
   bool d6 = false, d7 = false;
   if (eventActive) {
     uint32_t t = now - eventStartMs;
-    if (t >= D6_HOLD_MS) {
+    if (t >= D6_DELAY_MS + D6_HOLD_MS) {
       eventActive = false;
     } else {
-      d6 = true;
+      d6 = t >= D6_DELAY_MS;
       if (t >= D7_START_MS && t < D7_END_MS) {
         uint32_t c = (t - D7_START_MS) % (D7_BURST_MS + D7_GAP_MS);
         d7 = c < D7_BURST_MS && (c % D7_PULSE_PERIOD_MS) < D7_PULSE_HIGH_MS;
@@ -539,7 +498,7 @@ void updateDisplay(uint32_t now) {
 void printStatus() {
   Serial.print(F("F="));     Serial.print(front.hz, 1);
   Serial.print(F("Hz ("));   Serial.print(front.hz / 6.0f, 1);
-  Serial.print(F("kph) RPM=")); Serial.print((uint32_t)(front.hz * RPM_MULT + 0.5f));
+  Serial.print(F("kph)"));
   Serial.print(F(" R="));    Serial.print(rear.hz, 1);
   Serial.print(F("Hz brake=")); Serial.print(brakePressed);
   Serial.print(F(" decel=")); Serial.print(abruptDecel);
