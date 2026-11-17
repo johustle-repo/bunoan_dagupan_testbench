@@ -3,7 +3,7 @@
 // Implements the hand-drawn "NANO" signal-module sketch:
 //   * Brake switch / abrupt deceleration -> D6 held 13 s, D7 pulse bursts (only at 30 km/h or more)
 //   * Front FREQ >= 60 Hz (10 km/h)      -> LOCK output on D12, latched until power-off,
-//                                           and the D6 / D7 sequence runs once
+//                                           and D6 turns on once for 1 s (no D7)
 //   * Front FREQ / 60 (RPM), / 6 (speed display)
 //   * Front and rear FREQ passed through 1:1
 //   * Rear FREQ higher than front        -> blinking TCS output
@@ -16,7 +16,8 @@
 //   D3  IN   FREQ input #2 (rear)    INT1
 //   D4  OUT  TCS blinking output
 //   D5  IN   Brake switch            INPUT_PULLUP, switch to GND = pressed
-//   D6  OUT  Logic 1 for 13 s on brake event (or once at LOCK), starting 0.5 s after the trigger
+//   D6  OUT  Logic 1 for 13 s on brake event, starting 0.5 s after the trigger;
+//            also a 1 s pulse once when LOCK latches at 10 km/h
 //   D7  OUT  10 pulses/s with 0.5 s interruption, 2 s .. 10 s of D6 time
 //   D8  OUT  FREQ output #1 (1:1 of front)
 //   D9  OUT  FREQ output #2 (1:1 of rear)
@@ -67,6 +68,7 @@ const uint32_t D7_PULSE_HIGH_MS   = 50;    // ASSUMPTION: 50% duty
 // --- LOCK (D12) ------------------------------------------------------------
 const float    LOCK_FREQ_HZ      = 60.0;   // drawing: 60 Hz (10 km/h)
 const uint32_t LOCK_CONFIRM_MS   = 200;    // ASSUMPTION: must hold 200 ms
+const uint32_t LOCK_D6_PULSE_MS  = 1000;   // D6 on for 1 s when LOCK latches
 // D12 is LOW at power-up and goes HIGH only once LOCK is active.
 
 // --- TCS (D4) --------------------------------------------------------------
@@ -360,9 +362,11 @@ void sampleFrequencies() {
 
 // D6 / D7 event. Triggers on the *start* of a condition so holding the brake
 // does not re-trigger forever; a new event can start once the 13 s are over.
-// The same sequence also fires ONCE per power-on when LOCK latches (10 km/h).
+// When LOCK latches (10 km/h) D6 alone turns on for 1 s, once per power-on.
 bool prevTrigger = false;
 bool lockEventPending = false;             // set by updateLock() on latch
+bool lockPulseActive = false;
+uint32_t lockPulseStartMs = 0;
 
 void updateBrakeEvent(uint32_t now) {
   bool trigger = BRAKE_REQUIRES_DECEL ? (brakePressed && abruptDecel)
@@ -375,13 +379,13 @@ void updateBrakeEvent(uint32_t now) {
   }
   prevTrigger = trigger;
 
-  // One-shot LOCK event (no 30 km/h requirement). If a brake event is running
-  // it waits and starts right after that one ends.
-  if (lockEventPending && !eventActive) {
+  // One-shot LOCK pulse: D6 on for 1 s right away, D7 stays off.
+  if (lockEventPending) {
     lockEventPending = false;
-    eventActive = true;
-    eventStartMs = now;
+    lockPulseActive = true;
+    lockPulseStartMs = now;
   }
+  if (lockPulseActive && now - lockPulseStartMs >= LOCK_D6_PULSE_MS) lockPulseActive = false;
 
   bool d6 = false, d7 = false;
   if (eventActive) {
@@ -396,6 +400,7 @@ void updateBrakeEvent(uint32_t now) {
       }
     }
   }
+  if (lockPulseActive) d6 = true;
   digitalWrite(PIN_D6_HOLD, d6);
   digitalWrite(PIN_D7_PULSE, d7);
 }
@@ -406,7 +411,7 @@ void updateLock(uint32_t now) {
       if (lockAboveSinceMs == 0) lockAboveSinceMs = now ? now : 1;
       if (now - lockAboveSinceMs >= LOCK_CONFIRM_MS) {
         lockLatched = true;
-        lockEventPending = true;     // fire D6 / D7 once (latch never repeats)
+        lockEventPending = true;     // D6 1 s pulse once (latch never repeats)
       }
     } else {
       lockAboveSinceMs = 0;
