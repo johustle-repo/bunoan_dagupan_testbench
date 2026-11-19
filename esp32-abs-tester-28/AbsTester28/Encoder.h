@@ -1,7 +1,10 @@
 #pragma once
 #include <Arduino.h>
 
-// KY-040 rotary encoder for page selection, wired straight to the ESP32:
+// Page push button on GPIO4 (to GND, internal pull-up): each press = next
+// page (AbsTester28.ino encoderNav()). It replaced the KY-040 knob; set
+// USE_ROTATION to true to read a knob's CLK / DT again (GPIO21 / 22, free now).
+// Old KY-040 notes, for USE_ROTATION:
 //   CLK -> GPIO21, DT -> GPIO22, SW -> GPIO4 (not GPIO2: strapping pin),
 //   + -> 3V3 (never 5V), GND -> GND. Internal pull-ups on all three.
 // Use (AbsTester28.ino):
@@ -21,6 +24,7 @@ const int pinA = 21;   // CLK / channel A.
 const int pinB = 22;   // DT / channel B.
 const int pinSW = 4;   // Button.
 constexpr bool REVERSE = false;
+constexpr bool USE_ROTATION = false;  // Push button only: GPIO21 / 22 not used.
 const int debounceDelay = 50;  // Button debounce, ms.
 
 int counter = 0;  // Position, for the serial log.
@@ -33,18 +37,20 @@ unsigned long lastDebounceTime = 0;
 bool pressEvent = false;      // A press not yet taken by pressed().
 
 void begin() {
-  pinMode(pinA, INPUT_PULLUP);
-  pinMode(pinB, INPUT_PULLUP);
   pinMode(pinSW, INPUT_PULLUP);
-  lastStateA = digitalRead(pinA);
-  Serial.println(F("Encoder ready: CLK GPIO21, DT GPIO22, SW GPIO4."));
+  if (USE_ROTATION) {
+    pinMode(pinA, INPUT_PULLUP);
+    pinMode(pinB, INPUT_PULLUP);
+    lastStateA = digitalRead(pinA);
+    Serial.println(F("Encoder ready: CLK GPIO21, DT GPIO22, SW GPIO4."));
+  } else Serial.println(F("Page button ready: GPIO4 to GND (press = next page)."));
 }
 
 // Call every loop.
 void poll() {
-  // 1. Rotation.
-  const int currentStateA = digitalRead(pinA);
-  if (currentStateA != lastStateA && currentStateA == LOW) {
+  // 1. Rotation (knob only).
+  const int currentStateA = USE_ROTATION ? digitalRead(pinA) : HIGH;
+  if (USE_ROTATION && currentStateA != lastStateA && currentStateA == LOW) {
     const bool clockwise = (digitalRead(pinB) != currentStateA) != REVERSE;
     if (clockwise) { counter++; if (steps < 10) steps++; }
     else { counter--; if (steps > -10) steps--; }
@@ -60,7 +66,7 @@ void poll() {
   if (millis() - lastDebounceTime > (unsigned long)debounceDelay && currentButtonReading != buttonState) {
     buttonState = currentButtonReading;
     if (buttonState == LOW) {
-      Serial.println(F("# ENCODER Button Pressed!"));
+      Serial.println(F("# PAGE BUTTON pressed"));
       pressEvent = true;
     }
   }
@@ -86,6 +92,7 @@ bool pressed() {
 
 // Pin levels for the USB serial line (1 = high).
 void printStatus(Print& out) {
+  if (!USE_ROTATION) { out.print(F("PAGE BTN GPIO4 ")); out.print(digitalRead(pinSW)); return; }
   out.print(F("ENC CLK ")); out.print(digitalRead(pinA));
   out.print(F(" DT ")); out.print(digitalRead(pinB));
   out.print(F(" SW ")); out.print(digitalRead(pinSW));

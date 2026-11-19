@@ -6,6 +6,7 @@
 #include "FreqInput.h"
 #include "Encoder.h"
 #include "BrakeButton.h"
+#include "EcuReset.h"
 
 // ABS tester: ESP32 + 2.8" ILI9341 (Adafruit libraries), fed by the Arduino
 // Nano running arduino-nano/NanoAbsTester (or the Mega 2560 Pro running
@@ -62,12 +63,14 @@ bool parseFrame(char* text) {
   // 1 rear / 2 front), 19 (+ the older Mega's A5 page pot reading 0-1023 and page 1-3)
   // or 20 (Mega with the speed encoder: 0,0 for the page pot, then the wheel it adjusts),
   // 21 (Nano with the D6 speed sensor: the 20-field layout, then the D6 Hz x100 for page 2)
-  // or 22 (+ the Nano's D13 ABS light input: 1 = light on, 0 = off).
+  // 22 (+ the Nano's D13 ABS light input: 1 = light on, 0 = off)
+  // 23 (+ the Nano's D6 sensor state: 0 pulses OK, 1 open / short (stuck LOW), 2 stuck HIGH)
+  // or 24 (+ the Nano's knob-click reset counter 0-255: a +1 step fires the GPIO13 ECU relay).
   constexpr uint8_t MIN_FIELDS = 8, FRONT_FIELDS = 10, LAMP_FIELDS = 13, DECLOG_FIELDS = 14, GEN_FIELDS = 17,
-                    NANO_ENC_FIELDS = 18, POT_FIELDS = 19, ENC_FIELDS = 20, SENSOR_FIELDS = 21, MAX_FIELDS = 22;
+                    NANO_ENC_FIELDS = 18, POT_FIELDS = 19, ENC_FIELDS = 20, SENSOR_FIELDS = 21, ABS_PIN_FIELDS = 22, D6_FIELDS = 23, MAX_FIELDS = 24;
   // REF1 and battery: up to 30 V (0-30 V dividers, as on the ECU testbench).
   constexpr unsigned long maximum[MAX_FIELDS] = {1, 1, 100000000UL, 25000, 31000, 5500, 10500, 31000, 100000000UL, 25000,
-                                                 15000, 1, 1, 100000000UL, 250000, 250000, 25000, 1023, 3, 2, 1000000UL, 1};
+                                                 15000, 1, 1, 100000000UL, 250000, 250000, 25000, 1023, 3, 2, 1000000UL, 1, 2, 255};
   unsigned long values[MAX_FIELDS];
   uint8_t parsed = 0;
   char* p = text + 3;
@@ -79,7 +82,7 @@ bool parseFrame(char* text) {
     if (!*end && (parsed == MIN_FIELDS || parsed == FRONT_FIELDS || parsed == LAMP_FIELDS ||
                     parsed == DECLOG_FIELDS || parsed == GEN_FIELDS || parsed == NANO_ENC_FIELDS ||
                     parsed == POT_FIELDS || parsed == ENC_FIELDS || parsed == SENSOR_FIELDS ||
-                    parsed == MAX_FIELDS)) break;
+                    parsed == ABS_PIN_FIELDS || parsed == D6_FIELDS || parsed == MAX_FIELDS)) break;
     if (*end != ',' || parsed == MAX_FIELDS) return false;
     p = end + 1;
   }
@@ -100,9 +103,11 @@ bool parseFrame(char* text) {
   latest.declogHz = parsed >= DECLOG_FIELDS ? values[13] / 100.0f : 0;
   latest.sender = parsed == POT_FIELDS || parsed == ENC_FIELDS ? AbsData::MEGA : AbsData::NANO;
   latest.nanoSensor = parsed >= SENSOR_FIELDS;  // Nano D6 speed sensor (page 2).
-  latest.absPin = parsed == MAX_FIELDS;         // Nano D13 ABS light input.
+  latest.absPin = parsed >= ABS_PIN_FIELDS;     // Nano D13 ABS light input.
   latest.absPinOn = latest.absPin && values[21] == 1;
   latest.sensorHz = latest.nanoSensor ? values[20] / 100.0f : 0;
+  latest.d6State = parsed >= D6_FIELDS ? values[22] : 0;  // 0 also for older Nano firmware.
+  if (parsed == MAX_FIELDS) ecuReset::onCounter(uint8_t(values[23]));  // Knob click -> GPIO13 relay.
   latest.gens = parsed >= GEN_FIELDS;
   for (uint8_t i = 0; i < 3; ++i) latest.genHz[i] = latest.gens ? values[14 + i] / 100.0f : 0;
   latest.pagePot = parsed >= POT_FIELDS && values[18] >= 1;  // The encoder Mega sends page 0: no pot.
@@ -123,6 +128,8 @@ inline bool absLampOn(bool fresh) { return fresh && (latest.absPin ? latest.absP
 // otherwise the ESP32's own GPIO34 input.
 inline bool sensorOnNano(bool fresh) { return fresh && latest.nanoSensor; }
 inline float sensorHz(bool fresh) { return sensorOnNano(fresh) ? latest.sensorHz : freqInput::hz; }
+// Nano D6 check: 1 open / short sensor (stuck LOW), 2 no pulse (stuck HIGH), 0 OK or not sent.
+inline uint8_t d6State(bool fresh) { return sensorOnNano(fresh) ? latest.d6State : 0; }
 
 // Same values the LCD shows; DECLOG is the D2 frequency (0-100 Hz = 0-100 %).
 String liveJson() {
@@ -152,6 +159,9 @@ String liveJson() {
   json += F(",\"input_kmh\":");
   json += inHz > 0 ? String(min(inHz / INPUT_HZ_PER_KMH, INPUT_MAX_KMH), 1) : String("null");
   json += F(",\"input_source\":"); json += sensorOnNano(fresh) ? F("\"nano_d6\"") : F("\"gpio34\"");
+  // input_fault: "open_short" (Nano D6 stuck LOW), "stuck_high" or null.
+  json += F(",\"input_fault\":");
+  json += d6State(fresh) == 1 ? F("\"open_short\"") : d6State(fresh) == 2 ? F("\"stuck_high\"") : F("null");
   json += F(",\"page\":"); json += page;
   json += F(",\"page_mode\":\"");
   json += nav == Nav::LOCKED ? F("locked") : nav == Nav::SELECTING ? F("select") : F("free");
@@ -207,30 +217,16 @@ struct PagePotFollow {
   }
 } pagePotFollow;
 
-// KY-040 encoder page selection (Encoder.h): press to start selecting, turn
-// to pick a page (the footer's blinking dot), press again to go to it and
-// lock it there. FREE is the start-up state (swipes and the page pot work as
-// before); after the first press the screen alternates SELECTING / LOCKED.
+// Page push button (GPIO4 to GND, Encoder.h; replaces the KY-040 knob):
+// every press goes to the next page, 1 -> 2 -> 3 -> 1. Swipes still work
+// (nav stays FREE, nothing is locked).
 void encoderNav() {
   encoder::poll();
-  const int8_t steps = encoder::takeSteps();
+  encoder::takeSteps();  // No knob any more: rotation is not used.
   if (encoder::pressed()) {
-    if (nav != Nav::SELECTING) {
-      nav = Nav::SELECTING;
-      selPage = page;
-      encoder::clearSteps();
-      Serial.print(F("# ENCODER press -> SELECT (page ")); Serial.print(page); Serial.println(')');
-    } else {
-      nav = Nav::LOCKED;
-      page = selPage;
-      Serial.print(F("# ENCODER press -> LOCKED on page ")); Serial.println(page);
-    }
-    return;
-  }
-  if (steps && nav == Nav::SELECTING) {
-    selPage = wrapPage(selPage + steps);
-    Serial.print(F("# ENCODER turn ")); Serial.print(steps); Serial.print(F(" -> select page "));
-    Serial.println(selPage);
+    nav = Nav::FREE;
+    page = wrapPage(page + 1);
+    Serial.print(F("# PAGE BUTTON GPIO4 -> page ")); Serial.println(page);
   }
 }
 
@@ -242,6 +238,7 @@ void setup() {
   freqInput::begin();
   encoder::begin();
   brakeButton::begin();
+  ecuReset::begin();
   nano.setRxBufferSize(512);
   nano.begin(115200, SERIAL_8N1, LINK_RX, LINK_TX);
   WiFi.mode(WIFI_AP);
@@ -315,7 +312,8 @@ void loop() {
       if (inHz > 0) {
         Serial.print(inHz, 1); Serial.print(F(" Hz = "));
         Serial.print(min(inHz / INPUT_HZ_PER_KMH, INPUT_MAX_KMH), 1); Serial.print(F(" km/h"));
-      } else Serial.print(F("NO SIGNAL"));
+      } else Serial.print(latest.d6State == 1 && sensorOnNano(true) ? F("OPEN OR SHORT SENSOR")
+                          : latest.d6State == 2 && sensorOnNano(true) ? F("NO PULSE (STUCK HIGH)") : F("NO SIGNAL"));
       if (brakeButton::held) { Serial.print(F(" | BRAKE GPIO15 rear ")); Serial.print(brakeButton::rear, 0); Serial.print(F(" front ")); Serial.print(brakeButton::front, 0); Serial.print(F(" km/h")); }
       Serial.print(F(" | bad frames ")); Serial.print(badFrames);
       Serial.print(F(" | PAGE ")); Serial.print(page);
@@ -336,8 +334,11 @@ void loop() {
   d.link = !havePacket ? AbsData::WAITING : !fresh ? AbsData::STALE : AbsData::LIVE;
   freqInput::update();       // GPIO34, always measured (fallback for page 2).
   d.inputHz = sensorHz(fresh);  // Nano D6 while live Nano frames carry it.
+  d.d6State = d6State(fresh);
   // Brake button (GPIO15): shown rear / front speeds drop 10 km/h per 100 ms to 0 while held.
   brakeButton::update(latest.speedKmh, latest.frontKmh);
+  if (!fresh) ecuReset::resync();  // Link lost: next frame only resyncs the counter.
+  ecuReset::update();             // GPIO13 relay pulse end.
   d.speedKmh = brakeButton::rearKmh(latest.speedKmh);
   d.frontKmh = brakeButton::frontKmh(latest.frontKmh);
   d.brake = latest.brake || brakeButton::held;

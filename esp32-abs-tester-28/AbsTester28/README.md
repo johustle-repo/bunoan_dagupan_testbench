@@ -8,14 +8,14 @@ Shows the ABS tester screen for the Nano sender (`arduino-nano/NanoAbsTester`). 
 - **Pages:** **swipe left** on the touchscreen for page 2, **swipe right** for page 1 (a quick sideways stroke of about 1/6 of the screen width). The footer shows the page dots, with the ABS and TCS lights either side on page 1 only (pages 2 and 3 have no lights); REF1 and BAT are in the header. Page 1 has the FRONT speedometer with the REAR speed bar below. Each swipe is logged on the USB serial monitor (`# SWIPE left (raw dx …, dy …) -> page 2`); if left and right come out swapped, set `SWIPE_FLIP` to `true` in AbsDisplay.h.
 - **Top row (both pages):** **REF1** and **BAT** volts, with two small warning lights between them, **ABS** and **TCS** (amber when lit).
 - **Page 1 (speeds):** one full-width **FRONT speedometer** (D8, green needle; `--` with older Nano firmware), 0–250 km/h (numbers every 50, red from 210, lit arc cyan → amber → red) with the digital speed on the centre plate, and the **REAR speed bar** below it (bar and value in km/h). The LCD shows no pin names or raw Hz; the serial log and dashboard still do.
-- **Page 2 (SENSOR):** a **SPEED SENSOR** gauge for the **Nano's D6** input (sent in the 21-field Nano frame) while live Nano data carries it, otherwise the ESP32's own **GPIO34** frequency input: **0–2000 Hz = 0–200 km/h** (10 Hz per km/h, numbers every 50, red from 180, km/h readout in the centre), and the **SPEED** bar below it in km/h (with the GPIO34 Hz underneath). **No pulses for 2.5 s = NO SIGNAL:** the centre plate shows `NO SIGNAL` / `--` with a red edge, the needle drops to 0 and the bar reads `NO SIGNAL ON GPIO34` in red. JSON: `input_kmh` (null with no signal) and `input_source` (`nano_d6` / `gpio34`); serial: `SENSOR NANO D6 …` / `SENSOR GPIO34 … Hz = … km/h` or `NO SIGNAL`.
+- **Page 2 (SENSOR):** a **SPEED SENSOR** gauge for the **Nano's D6** input (sent in the 21-field Nano frame) while live Nano data carries it, otherwise the ESP32's own **GPIO34** frequency input: **0–120 Hz = 0–20 km/h** (6 Hz per km/h, numbers 0 / 4 / 8 / 12 / 16 / 20, no red zone, km/h readout in the centre), and the **SPEED** text below it in km/h (one decimal, no bar). **Logic lamps** in the footer: **LOW** (yellow, logic 0) and **HIGH** (green, logic 1) alternate with the signal. The real signal is too fast for the LCD, so they blink at a display rate that rises with the frequency: the real rate up to 2 Hz, then 2 Hz rising to 8 Hz at 120 Hz. No pulses: stuck LOW = LOW lamp steady, stuck HIGH = HIGH lamp steady; no live data = both off. **No pulses for 2.5 s = NO SIGNAL:** the centre plate shows `NO SIGNAL` / `--` with a red edge, the needle drops to 0 and the bar reads `NO SIGNAL ON GPIO34` in red. JSON: `input_kmh` (null with no signal) and `input_source` (`nano_d6` / `gpio34`); serial: `SENSOR NANO D6 …` / `SENSOR GPIO34 … Hz = … km/h` or `NO SIGNAL`.
 - **Page 3 (DECLOG):** one **0–100 Hz DECLOG gauge** for the sender's D2 frequency (numbers every 25, Hz readout in the centre), and the **DECLOG** bar below it: 0–100 Hz shown as **0–100 %** (with the Hz underneath). Pages 2 and 3 work without the sender (DECLOG then shows 0 and NO LINK).
 - **Needles** ease toward each new reading (the Nano measures D7, D8 and D2 and sends a frame every 100 ms, GPIO34 is measured every 100 ms), so they move smoothly. The pot generator settings are no longer on the LCD (still in the JSON and the USB serial line).
 - **Warning lights** (worked out on the ESP32 from the Nano's speeds, AbsDisplay.h):
 
   | Light | Meaning |
   |---|---|
-  | **ABS** | Start-up check from the **rear** speed: **on** at switch-on (when live data arrives); **off** once the rear speed goes above 10 km/h; after that **on** again below 10 km/h and **off** at 0 km/h (and above 10). Losing the Nano link counts as switching off, so the next start begins with ABS on. |
+  | **ABS** | Start-up check from the **rear** speed: **on** at switch-on (when live data arrives); **off** once the rear speed reaches 10 km/h; after that **on** again below 10 km/h and **off** at 0 km/h (and at 10 km/h and above). Losing the Nano link counts as switching off, so the next start begins with ABS on. |
   | **TCS** | **Blinking** (2 Hz) while the rear and front speeds differ (to the whole km/h); **off** when they are equal. |
 
   Both light for the switch-on bulb check. The Nano's own D12 / D13 LEDs keep their old rules. SENSOR is only on the web dashboard now.
@@ -62,18 +62,19 @@ The current Mega firmware sets the rear / front test speeds with a KY-040 on the
 
 Three pages: 1 SPEED (front / rear speedometers), 2 INPUT (GPIO34 gauge and INPUT bar), 3 DECLOG (Declog gauge and DECLOG bar). The Mega reads a 10 kΩ pot on A5 and splits 0–1023 into the pages: **0–341 → page 1, 342–682 → page 2, 683–1023 → page 3**. The screen jumps to the pot's page whenever that changes (and when the Mega link starts). Swipes still work (left = next page, right = previous) and hold until the pot is turned into another page. The footer shows `PAGE n/3` at the left and the page name at the right. Page changes are logged on the USB serial monitor (`# PAGE POT A5 … -> page n`). The pot reading and page arrive as two extra fields at the end of the `A1` frame; older sender firmware without them still works (swipe only).
 
-## Rotary encoder (KY-040) page selection
+## Page push button
 
-| KY-040 | ESP32 |
+The KY-040 knob is replaced by one push button: **GPIO4 → button → GND** (internal pull-up, no resistor). Each press goes to the **next page**, 1 → 2 → 3 → 1 (debounced 50 ms, acts on the press). Swipes still change the page too; nothing is locked. USB serial: `# PAGE BUTTON GPIO4 -> page 2`, and the status line shows `PAGE BTN GPIO4 1` (0 while pressed). GPIO21 / GPIO22 (the knob's CLK / DT) are free now; set `USE_ROTATION` to `true` in `Encoder.h` to use a knob there again (the old select / lock behaviour would then need the previous `encoderNav()`).
+
+## ABS ECU reset relay (GPIO13)
+
+A short click on the Nano's EC11 knob power-cycles the real ABS ECU, so a latched error (lamp stuck on, e.g. after 3 ABS triggers in a row) is cleared without restarting the ECU by hand. The Nano adds 1 to its reset counter (24th `A1` field); when the ESP32 sees the counter step by +1 it switches **GPIO13 HIGH for 2 s** (`EcuReset.h`), then LOW again. The first frame after boot, a lost link or a Nano reset (counter back to 0) only resyncs the counter, so the relay never fires at power-up.
+
+| Relay module | Connect to |
 |---|---|
-| CLK | GPIO21 |
-| DT | GPIO22 |
-| SW | GPIO4 |
-| GND | GND |
-| + | **3V3** (required: the module's CLK / DT pull-ups go to +; left open they tie CLK and DT together). **Never 5V.** |
+| IN | **GPIO13** (HIGH = relay on) |
+| VCC | 5 V |
+| GND | common GND |
+| COM + **NC** | in series with the ABS ECU's +12 V ignition / power feed |
 
-- **Press** → **SELECT**: the footer reads `SELECT n/3` in amber and the selected page's dot blinks. Turn the knob to move the selection (wraps round 1 → 2 → 3 → 1). The page shown doesn't change yet.
-- **Press again** → **LOCKED**: the screen goes to the selected page and holds it. The footer reads `LOCKED n/3` in cyan. Swipes and the Mega's A5 page pot are ignored while locked, and turning does nothing.
-- **Press again** → SELECT again, and so on.
-
-Before the first press, swipes and the page pot change the page as before. While selecting, a swipe moves the selection. Encoder events are logged on the USB serial monitor (`# ENCODER press -> SELECT …`, `# ENCODER turn …`, `# ENCODER press -> LOCKED on page n`), and the JSON has `page_mode` (`free`, `select` or `locked`). If turning clockwise moves the wrong way, set `REVERSE` to `true` in `Encoder.h` (or swap CLK and DT). Pins and debounce are in `Encoder.h`. Reading: polled every loop, one step each time CLK goes LOW (DT ≠ CLK = clockwise), 50 ms button debounce. Each step and press is logged (`# ENCODER Direction: Clockwise | Position: n`, `# ENCODER Button Pressed!`), and the once-a-second line ends with `ENC CLK 1 DT 1 SW 1 pos n` (pin levels, 1 = high).
+Use the **NC** contact so the ECU stays powered while the relay is off (also with the tester unplugged), and a **high-level-trigger or 3.3 V-compatible** module (many 5 V active-low opto modules do not release from a 3.3 V output). Contacts rated for the ECU current; keep the feed fused. USB serial: `# ECU RESET: knob click -> GPIO13 relay ON ...` / `... relay OFF, ECU power back on`.

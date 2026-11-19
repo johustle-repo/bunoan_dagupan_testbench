@@ -6,7 +6,7 @@
 //   header: REF1 | ABS TESTER + link pill | BAT;
 //   row 1 (LCD page 1): the FRONT 0-250 km/h speedometer (green) with the
 //     REAR speed bar below it;
-//   row 2: SPEED SENSOR (LCD page 2: 0-200 km/h, red from
+//   row 2: SPEED SENSOR (LCD page 2: 0-120 Hz = 0-20 km/h, no red; was 0-200 km/h, red from
 //     180, NO SPEED SENSOR READING with no pulses) and DECLOG (LCD page 3:
 //     0-100 Hz gauge with the 0-100 % bar);
 //   footer: round ABS / TCS lights, KEY ON, the LCD page chip (page, name and
@@ -139,7 +139,7 @@ const $=id=>document.getElementById(id),CX=130,CY=140;
 // FRONT card's bar shows the REAR speed, as on LCD page 1).
 const D={
  front:{label:'FRONT',bar:'REAR',max:250,minor:10,major:50,red:210,unit:'km/h',needle:'var(--green)',speed:true},
- sensor:{label:'SPEED SENSOR',bar:'SPEED',max:200,minor:10,major:50,red:180,unit:'km/h',needle:'var(--red)'},
+ sensor:{label:'SPEED SENSOR',bar:'SPEED',max:20,minor:1,major:4,red:21,unit:'km/h',needle:'var(--red)'},
  declog:{label:'DECLOG',bar:'DECLOG',max:100,minor:5,major:25,red:1e9,unit:'Hz',needle:'var(--red)',pct:true}};
 const clamp=(v,m)=>Math.min(Math.max(+v||0,0),m);
 // Speed colour, as on the LCD: cyan to 140, to amber by 170, amber to red from 200 to 215.

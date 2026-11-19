@@ -18,9 +18,11 @@
 //   D7 speed 1 (rear) and RPM, D8 speed 2 (front, e.g. Mega D44), 0-5 V square waves
 //   speed = Hz / 6 km/h, max 250; RPM = D7 Hz x 15000 / 1560, max 15000
 //   D2 Declog frequency, 0-100 Hz square wave, 0-5 V (e.g. Mega D2)
-//   D6 speed sensor for page 2 of the ESP32 screen, 0-2000 Hz (Hz / 10 =
-//   km/h, 0-200), 0-5 V straight in (internal pull-up), common GND. Sent as
-//   the 21st frame field; the ESP32 uses it instead of its GPIO34.
+//   D6 speed sensor for page 2 of the ESP32 screen, 0-120 Hz (Hz / 6 =
+//   km/h, 0-20), 0-5 V straight in (plain INPUT, no pull-up), common GND. Sent as
+//   the 21st frame field; the ESP32 uses it instead of its GPIO34. With no
+//   pulses the D6 level is the 23rd field: LOW = "OPEN OR SHORT SENSOR",
+//   HIGH = "NO PULSE (STUCK HIGH)" on the ESP32 page 2.
 //   D13 ABS light button for the ESP32 screen: wire a push button from D13
 //   to 5V (no resistor). The ABS light is ON while the button is released
 //   (the Nano's onboard LED and its resistor hold D13 LOW) and OFF while it
@@ -33,7 +35,7 @@
 //   Frequency generators (PotGenerator.h), 50 % duty 0-5 V square waves:
 //   rear -> D9 0-1500 Hz and front -> D10 0-1500 Hz set by the DFRobot EC11 (SEN0235) speed
 //   encoder (SpeedEncoder.h: A -> A0, B -> A1, C -> A5; turn = both wheels
-//   together, short click = REAR +60 Hz (+10 km/h) for 1.5 s, the TCS test), Declog pot
+//   together, click = fresh start of page 1 at 0 km/h, double click = TCS test, hold = brake), Declog pot
 //   A2 -> D3 0-100 Hz. Jumper D9 -> D7, D10 -> D8, D3 -> D2 to self-test.
 //   Divided outputs: D4 = D9 / 6 (0-250 Hz, Hz = km/h), D11 = D10 / 15 (0-100 Hz), 50 % duty.
 //   D5 (TX) -> ESP32 RX2 (GPIO16), common GND, 115200 8N1, one-way
@@ -81,9 +83,17 @@ unsigned int voltsMv[2] = {0, 0};  // REF1, battery, as sent to the ESP32.
 
 bool speedsEqual = true;
 bool absInputOn = true;  // D13 ABS light button (on until pressed), read every 100 ms.
+// ECU reset counter: +1 on every knob click (fresh start), sent as the 24th
+// A1 field. The ESP32 fires its GPIO13 relay on each +1 step, which cuts the
+// ABS ECU's power for 2 s so it boots fresh (latched error cleared).
+uint8_t ecuResetCount = 0;
 bool absActive = false;
 
 float frequencyHz1 = 0, frequencyHz2 = 0, declogHz = 0, sensorHz = 0;  // sensorHz: D6.
+// D6 sensor check, only while D6 gives no pulses: 0 = pulses (reading OK),
+// 1 = stuck LOW (open or short sensor), 2 = stuck HIGH (no pulse).
+enum : uint8_t { SENSOR_OK = 0, SENSOR_OPEN_SHORT = 1, SENSOR_STUCK_HIGH = 2 };
+uint8_t sensorState = SENSOR_OPEN_SHORT;
 float ref1V = 0, batteryV = 0;
 float pinV[2] = {0, 0};  // A3 / A4 pin volts (20-reading average), 0-5 V.
 float speed1 = 0, speed2 = 0;
@@ -156,16 +166,29 @@ float readInput(uint8_t i) {
   return getTrueVoltage(pinV[i]);
 }
 
-// A1 frame: key (always 1), brake (none, 0), D7 Hz x100, speed 1 x100,
+// A1 frame: key (always 1), brake (1 while the EC11 knob is held: SpeedEncoder.h), D7 Hz x100, speed 1 x100,
 // REF1 mV, REF2 (unused, 0), current (unused, 0), battery mV, D8 Hz x100,
 // speed 2 x100, RPM, TCS (1 steady, 0 blinking), ABS (1 active), D2 Declog
 // Hz x100, the rear (D9) / front (D10) encoder and Declog (A2 pot -> D3)
 // generator outputs in Hz x100, 0,0 (the Mega's old page pot slots), the
 // single wheel the speed encoder adjusts (always 0: the knob drives both),
-// the D6 speed sensor Hz x100, the D13 ABS light button (1 = light on, button released; 22
-// fields, the ESP32's MAX_FIELDS frame), then
+// the D6 speed sensor Hz x100, the D13 ABS light button (1 = light on, button released),
+// the D6 sensor state (0 pulses OK, 1 open / short = stuck LOW, 2 stuck HIGH),
+// the knob-click ECU reset counter (0-255, ESP32 GPIO13 relay; 24 fields, the ESP32's MAX_FIELDS frame), then
 // an XOR checksum of everything before '*'. The ESP32 shows
 // these values as they are.
+// Wheel Hz -> km/h, Hz / 6 with a low-speed band matching the knob output
+// (SpeedEncoder.h frontHz()): the ECU's ABS lamp goes off at about 55 Hz,
+// which should read 10 km/h.
+//   below 54 Hz: Hz / 5.4 (0-10 km/h)
+//   54-60 Hz:    10 km/h
+//   60 Hz up:    Hz / 6, as before
+float hzToKmh(float hz) {
+  if (hz < 54.0f) return hz / 5.4f;
+  if (hz < 60.0f) return 10.0f;
+  return hz / 6.0f;
+}
+
 void readVolts() {
   supply::read();  // Measured 5 V rail for the pin volts (about 4 ms).
   for (uint8_t i = 0; i < 2; i++) voltsMv[i] = unsigned(readInput(i) * 1000 + 0.5);
@@ -175,14 +198,15 @@ void readVolts() {
 
 void sendFrame() {
   const unsigned int* mv = voltsMv;
-  const int count = snprintf(linkBuffer, sizeof(linkBuffer), "A1,1,0,%lu,%u,%u,0,0,%u,%lu,%u,%u,%u,%u,%lu,%lu,%lu,%lu,0,0,%u,%lu,%u",
+  const int count = snprintf(linkBuffer, sizeof(linkBuffer), "A1,1,%u,%lu,%u,%u,0,0,%u,%lu,%u,%u,%u,%u,%lu,%lu,%lu,%lu,0,0,%u,%lu,%u,%u,%u",
+    unsigned(speedEnc::braking),
     (unsigned long)(frequencyHz1 * 100 + 0.5), unsigned(speed1 * 100 + 0.5), mv[0], mv[1],
     (unsigned long)(frequencyHz2 * 100 + 0.5), unsigned(speed2 * 100 + 0.5),
     unsigned(rpm + 0.5), unsigned(speedsEqual), unsigned(absActive),
     (unsigned long)(declogHz * 100 + 0.5), (unsigned long)(potgen::outHz(0) * 100 + 0.5),
     (unsigned long)(potgen::outHz(1) * 100 + 0.5), (unsigned long)(potgen::outHz(2) * 100 + 0.5),
     0u, (unsigned long)(min(sensorHz, 10000.0f) * 100 + 0.5),  // ESP32 limit: 10 kHz.
-    unsigned(absInputOn));
+    unsigned(absInputOn), unsigned(sensorState), unsigned(ecuResetCount));
   if (count < 0 || count > int(sizeof(linkBuffer) - 5)) return;
   uint8_t checksum = 0;
   for (int i = 0; i < count; i++) checksum ^= uint8_t(linkBuffer[i]);
@@ -199,10 +223,17 @@ void sendFrame() {
 // (+-10 Hz on a 100 ms window) from window to window; the error is the 50 us
 // sampling step over the ~100 ms span (about +-1 Hz at 2000 Hz, 0.2 km/h). With no edge in a window the
 // last value is held for up to 2.5 s (slow signals), then it drops to 0.
+unsigned long prevEdgeUs[4];
+bool prevValid[4] = {false, false, false, false};
+float lastHz[4] = {0, 0, 0, 0};
+
+// Fresh start (knob click): forget the held D7 / D8 readings so they read 0
+// at once instead of after the 2.5 s hold.
+void clearWheelReadings() {
+  for (uint8_t i = 0; i < 2; i++) { prevValid[i] = false; lastHz[i] = 0; }
+}
+
 float measureHz(uint8_t i, unsigned long pulses, unsigned long edgeUs, unsigned long nowUs, unsigned long elapsedUs) {
-  static unsigned long prevEdgeUs[4];
-  static bool prevValid[4] = {false, false, false, false};
-  static float lastHz[4] = {0, 0, 0, 0};
   if (pulses == 0) {
     if (!prevValid[i] || nowUs - prevEdgeUs[i] > 2500000UL) { prevValid[i] = false; lastHz[i] = 0; }
     return lastHz[i];
@@ -219,7 +250,7 @@ void setup() {
   Serial.println(F("# NANO ABS TESTER start (a reset sets both speeds to 0)"));
   esp.begin(115200);     // ESP32 link on D5.
   esp.stopListening();   // One-way link: D6 (its RX) is never read by SoftwareSerial.
-  pinMode(6, INPUT_PULLUP);  // D6 speed sensor (page 2); the pull-up holds it HIGH (0 Hz) when unplugged.
+  pinMode(6, INPUT);  // D6 speed sensor (page 2), no pull-up: LOW with no pulses = open or short sensor.
 
   pinMode(7, INPUT);
   pinMode(8, INPUT);
@@ -279,18 +310,31 @@ void loop() {
       for (uint8_t i = 0; i < 4; i++) edge[i] = lastEdgeUs[i];
     }
 
+    if (speedEnc::freshStart) {  // Knob click: D7 / D8 start from 0, as after power-up.
+      speedEnc::freshStart = false;
+      clearWheelReadings();
+      pulses1 = pulses2 = 0;     // Edges from before the click don't count.
+      ++ecuResetCount;           // ESP32 GPIO13 relay: ECU power off 2 s.
+      Serial.print(F("# ECU RESET request "));
+      Serial.print(ecuResetCount);
+      Serial.println(F(" -> ESP32 GPIO13 relay cuts the ABS ECU power for 2 s"));
+    }
     frequencyHz1 = measureHz(0, pulses1, edge[0], nowUs, elapsedUs);
     frequencyHz2 = measureHz(1, pulses2, edge[1], nowUs, elapsedUs);
     declogHz = measureHz(2, pulses3, edge[2], nowUs, elapsedUs);
     sensorHz = measureHz(3, pulses4, edge[3], nowUs, elapsedUs);
     // Inputs of the pages not on the ESP32 screen read 0.
     if (!pageSel::speedOn()) frequencyHz1 = frequencyHz2 = 0;
+    // No-input cut: D9 stops without D7 pulses, D10 without D8 (SpeedEncoder.h).
+    speedEnc::checkInputs(now, pulses1 > 0, pulses2 > 0);
     if (!pageSel::declogOn()) declogHz = 0;
     if (!pageSel::sensorOn()) sensorHz = 0;
+    // D6 check before using the reading: no pulses -> look at the level.
+    sensorState = sensorHz > 0 ? SENSOR_OK : D6_HIGH() ? SENSOR_STUCK_HIGH : SENSOR_OPEN_SHORT;
     absInputOn = digitalRead(ABS_IN) == LOW;  // D13 button: released = ABS light on, pressed = off.
 
-    float rawSpeed1 = frequencyHz1 / 6.0;
-    float rawSpeed2 = frequencyHz2 / 6.0;
+    float rawSpeed1 = hzToKmh(frequencyHz1);
+    float rawSpeed2 = hzToKmh(frequencyHz2);
 
     // Display speeds capped at 250 km/h
     speed1 = constrain(rawSpeed1, 0.0, 250.0);
@@ -365,20 +409,25 @@ void loop() {
     Serial.println(" Hz");
 
     Serial.print("Speed sensor (D6, ESP32 page 2): ");
-    Serial.print(sensorHz, 1);
-    Serial.print(" Hz = ");
-    Serial.print(min(sensorHz / 10.0f, 200.0f), 1);
-    Serial.println(" km/h");
+    if (sensorState != SENSOR_OK) {
+      Serial.println(sensorState == SENSOR_OPEN_SHORT ? "Open or Short Sensor (D6 stuck LOW)" : "No Pulse (D6 stuck HIGH)");
+    } else {
+      Serial.print(sensorHz, 1);
+      Serial.print(" Hz = ");
+      Serial.print(min(sensorHz / 6.0f, 20.0f), 1);  // ESP32 page 2: 0-120 Hz = 0-20 km/h.
+      Serial.println(" km/h");
+    }
 
     Serial.print("Encoder rear -> D9: ");
     Serial.print(potgen::outHz(0), 0);
-    Serial.print(" Hz (+");
-    Serial.print(speedEnc::rearOffsetHz);
-    Serial.print(" Hz offset), front -> D10: ");
+    Serial.print(" Hz, front -> D10: ");
     Serial.print(potgen::outHz(1), 0);
     Serial.print(" Hz | knob ");
-    Serial.print(speedEnc::kmh);
-    Serial.println(" km/h");
+    Serial.print(speedEnc::kmh * speedEnc::UNIT_HZ / float(speedEnc::HZ_PER_KMH), 1);  // Knob setting (km/h).
+    Serial.print(" km/h");
+    if (speedEnc::cut[0]) Serial.print(" | D9 REAR CUT (no D7 input)");
+    if (speedEnc::cut[1]) Serial.print(" | D10 FRONT CUT (no D8 input)");
+    Serial.println();
     speedEnc::printStatus(Serial);
     Serial.print("Declog pot A2 -> D3: ");
     Serial.print(potgen::outHz(2), 0);

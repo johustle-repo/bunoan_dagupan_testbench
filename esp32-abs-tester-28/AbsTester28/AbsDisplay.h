@@ -9,7 +9,7 @@
 // drawn anti-aliased (AaGraphics.h) with the Barlow Semi Condensed fonts in
 // AaFonts.h, into off-screen strips that are pushed in one SPI burst each, so
 // nothing flickers. Two pages: swipe left for page 2, swipe right for page 1.
-//   Header (both pages): REF1 | BAT.
+//   Header (both pages): SEN VCC (REF1) | BAT.
 //   Page 1: one FRONT (D8) speedometer, 0-250 km/h, with the REAR (D7)
 //           speed bar below.
 //   Page 2: SPEED SENSOR gauge for the ESP32's own frequency input (GPIO34),
@@ -43,10 +43,11 @@ constexpr bool SWIPE_FLIP = false;
 // formula as the Nano. DECLOG: the D2 frequency, 0-100 Hz = 0-100 %.
 constexpr float ABS_SPEED_MAX = 250, SPEED_RED = 210, HZ_PER_KMH = 6;
 constexpr float DECLOG_MAX_HZ = 100;
-// Page 2 speed sensor on GPIO34: 0-2000 Hz = 0-200 km/h (10 Hz per km/h).
-constexpr float INPUT_MAX_HZ = 2000, INPUT_HZ_PER_KMH = 10;
-constexpr float INPUT_MAX_KMH = INPUT_MAX_HZ / INPUT_HZ_PER_KMH, INPUT_RED_KMH = 180;
-constexpr float ABS_CHECK_KMH = 10;   // ABS lamp: off above, on below (see AbsLamp).
+// Page 2 speed sensor (Nano D6, or GPIO34): 0-120 Hz = 0-20 km/h (6 Hz per
+// km/h), gauge numbers every 4 km/h, no red zone.
+constexpr float INPUT_MAX_HZ = 120, INPUT_HZ_PER_KMH = 6;
+constexpr float INPUT_MAX_KMH = INPUT_MAX_HZ / INPUT_HZ_PER_KMH, INPUT_RED_KMH = INPUT_MAX_KMH + 1;
+constexpr float ABS_CHECK_KMH = 10;   // ABS lamp: off from this speed up, on below (see AbsLamp).
 
 // What the screen shows, filled by the sketch each loop.
 struct AbsData {
@@ -70,6 +71,7 @@ struct AbsData {
   float inputHz;                 // Page 2 speed sensor Hz: Nano D6 (sensorHz) or ESP32 GPIO34.
   bool nanoSensor;               // Frame carries the Nano's D6 speed sensor (21 fields).
   float sensorHz;                // Nano D6 frequency, Hz.
+  uint8_t d6State;               // Nano D6 check: 0 OK, 1 open / short (stuck LOW), 2 stuck HIGH (23 fields).
   bool absPin;                   // Frame carries the Nano's D13 ABS light input (22 fields).
   bool absPinOn;                 // D13 HIGH: ABS light on.
   bool pagePot;                  // Frame carries the Mega's A5 page pot.
@@ -85,22 +87,22 @@ inline const char* senderName(AbsData::Sender s) {
 
 // ABS light, like a real bike's start-up check, worked out from the REAR speed:
 //   switched on (live data arrives): ON;
-//   rear speed above 10 km/h: OFF (check passed);
-//   after that: below 10 km/h ON again, 0 km/h OFF, above 10 km/h OFF.
+//   rear speed reaches 10 km/h: OFF (check passed);
+//   after that: below 10 km/h ON again, 0 km/h OFF, 10 km/h and above OFF.
 // Losing the Nano link counts as switching off, so the next start begins ON.
 struct AbsLamp {
-  bool checked = false;  // Has been above 10 km/h since switch-on.
+  bool checked = false;  // Has reached 10 km/h since switch-on.
   bool on = true;
   void reset() { checked = false; on = true; }
   void update(float rearKmh) {
     if (!checked) {
-      if (rearKmh > ABS_CHECK_KMH) { checked = true; on = false; }
+      if (rearKmh >= ABS_CHECK_KMH) { checked = true; on = false; }
       else on = true;
       return;
     }
     if (rearKmh < 0.5f) on = false;                 // Shows as 0 km/h.
     else if (rearKmh < ABS_CHECK_KMH) on = true;
-    else if (rearKmh > ABS_CHECK_KMH) on = false;   // Exactly 10: unchanged.
+    else on = false;                                // 10 km/h and above.
   }
 };
 
@@ -136,7 +138,7 @@ constexpr uint16_t NEEDLE_CORE = rgb(0xff, 0xb4, 0xb4);
 Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_RST);
 
 // ---- Layout ----
-// Header (both pages): REF1 | BAT.
+// Header (both pages): SEN VCC (REF1) | BAT.
 constexpr int TOP_Y = 3, TOP_H = 30;
 constexpr int TOP_X[2] = {4, 162}, TOP_W = 154;
 // Pages 1-3: one big gauge and a bar panel below (page 1: FRONT gauge,
@@ -154,9 +156,14 @@ const char* const PAGE_NAMES[PAGE_COUNT] = {"SPEED", "SENSOR", "DECLOG"};
 // Page 3 (placeholder for now).
 constexpr int P3X = 4, P3Y = 37, P3W = 312, P3H = 182;
 
-const char* const TOP_LABELS[2] = {"REF1", "BAT"};
+const char* const TOP_LABELS[2] = {"SEN VCC", "BAT"};  // Left: REF1 (A3), shown as SEN VCC (sensor VCC).
 const uint16_t TOP_ACCENTS[2] = {ACCENT, AMBER};
 const char* const LAMP_LABELS[2] = {"ABS", "TCS"};
+const uint16_t LAMP_COLORS[2] = {AMBER, AMBER};
+// Page 2 footer: the speed sensor's logic level, LOW (0) yellow, HIGH (1) green.
+constexpr uint16_t YELLOW = rgb(0xff, 0xd8, 0x2a);
+const char* const LOGIC_LABELS[2] = {"LOW", "HIGH"};
+const uint16_t LOGIC_COLORS[2] = {YELLOW, GREEN};
 
 // Strips of the screen are drawn here, then pushed.
 constexpr int SCRATCH_PX = 320 * 28;
@@ -266,25 +273,62 @@ void drawTop(uint8_t i, float volts) {
   });
 }
 
-// Warning lights: a round light and its label ("(o) ABS"). Lit: an amber
+// Warning lights: a round light and its label ("(o) ABS"). Lit: a coloured
 // light with a soft glow and bright text; off: a dark ringed light, dim text.
-void drawLamps(const bool lit[2]) {
+// Page 1: ABS / TCS in amber; page 2: LOW (yellow) / HIGH (green) logic level.
+void drawLamps(const bool lit[2], const char* const labels[2] = LAMP_LABELS,
+               const uint16_t colors[2] = LAMP_COLORS) {
   for (uint8_t i = 0; i < 2; ++i) {
     const int x = LAMP_X[i];
     const float cx = x + 8, cy = LAMP_Y + LAMP_H / 2.0f;
+    const uint16_t c = colors[i];
     render(x - 1, LAMP_Y - 1, LAMP_W + 2, LAMP_H + 2, [&](aa::Buf& b) {
       aa::fill(b, BG);
       if (lit[i]) {
-        aa::circle(b, cx, cy, 8.5f, aa::mix(BG, AMBER, 70));  // Glow.
-        aa::circle(b, cx, cy, 6, AMBER);
-        aa::circle(b, cx - 1.8f, cy - 1.8f, 1.8f, aa::mix(AMBER, TEXT, 170));  // Highlight.
+        aa::circle(b, cx, cy, 8.5f, aa::mix(BG, c, 70));  // Glow.
+        aa::circle(b, cx, cy, 6, c);
+        aa::circle(b, cx - 1.8f, cy - 1.8f, 1.8f, aa::mix(c, TEXT, 170));  // Highlight.
       } else {
         aa::circle(b, cx, cy, 6, OFF_EDGE);
         aa::circle(b, cx, cy, 5, OFF_FILL);
       }
-      aa::text(b, aaLabel, LAMP_LABELS[i], x + 19, LAMP_Y + 13, lit[i] ? TEXT : OFF_TEXT, aa::LEFT, 1);
+      aa::text(b, aaLabel, labels[i], x + 19, LAMP_Y + 13, lit[i] ? TEXT : OFF_TEXT, aa::LEFT, 1);
     });
   }
+}
+
+// Page 2 logic lamps: the speed sensor's level shown at a visible rate.
+// The real signal (up to 120 Hz) is far too fast for the LCD, so the lamps
+// alternate at a display rate that rises with the input frequency, so faster
+// signals blink faster:
+//   up to 2 Hz:  the real rate (one LOW / HIGH cycle per input cycle);
+//   2-120 Hz:    2 Hz rising to 8 Hz (2 + (Hz - 2) x 6 / 118).
+// No pulses: stuck LOW (Nano D6 check 1) = LOW lamp steady, stuck HIGH (2) =
+// HIGH lamp steady, unknown or no live data = both off.
+inline float logicBlinkHz(float inHz) {
+  if (inHz <= 2) return inHz;
+  return 2 + (min(inHz, INPUT_MAX_HZ) - 2) * 6 / (INPUT_MAX_HZ - 2);
+}
+float logicPhase = 0;          // Display cycles, 0-1.
+uint32_t logicLastMs = 0;
+
+// level: -1 = both off, 0 = LOW (yellow), 1 = HIGH (green).
+void logicLamps(bool live, float inHz, uint8_t fault) {
+  const uint32_t now = millis();
+  const float dt = (now - logicLastMs) / 1000.0f;
+  logicLastMs = now;
+  int8_t level = -1;
+  if (live && inHz > 0) {
+    logicPhase += logicBlinkHz(inHz) * min(dt, 0.2f);
+    logicPhase -= floorf(logicPhase);
+    level = logicPhase < 0.5f ? 1 : 0;
+  } else if (live && fault == 1) level = 0;   // Stuck LOW.
+  else if (live && fault == 2) level = 1;     // Stuck HIGH.
+  char key[4];
+  snprintf(key, sizeof(key), "%d", level);
+  if (!changed(S_LAMPS, key)) return;
+  const bool lit[2] = {level == 0, level == 1};
+  drawLamps(lit, LOGIC_LABELS, LOGIC_COLORS);
 }
 
 // Page navigation in the footer: "PAGE 1/3" at the left, the page name at
@@ -346,10 +390,12 @@ void topRow(const AbsData& d, bool live, bool selfTest, bool lamps) {
 // Page 1: FRONT speedometer (D8, green needle, 0-250 km/h, lit arc cyan ->
 //         amber -> red, red from 210; "--" when the frame has no front
 //         sensor), REAR speed bar below (bar and value in km/h).
-// Page 2: SPEED SENSOR, the ESP32's own GPIO34 input, 0-2000 Hz shown as
-//         0-200 km/h (10 Hz per km/h, red from 180), SPEED bar in km/h below.
-//         No pulses for 2.5 s (FreqInput.h) = NO SIGNAL: the plate shows
-//         NO SIGNAL / --, the bar NO SPEED SENSOR READING in red.
+// Page 2: SPEED SENSOR (Nano D6, or the ESP32's own GPIO34), 0-120 Hz shown
+//         as 0-20 km/h (6 Hz per km/h, numbers 0 / 4 / 8 / 12 / 16 / 20, no
+//         red), the SPEED text in km/h below (no bar), and the LOW (yellow) /
+//         HIGH (green) logic lamps in the footer (logicLamps()).
+//         No pulses = NO SIGNAL: the plate shows NO SIGNAL / --, the panel
+//         below the error message in red.
 // Page 3: the 0-100 Hz DECLOG gauge (the sender's D2), DECLOG bar (0-100 %) below.
 // The LCD shows no pin names or raw input Hz (the serial log and web
 // dashboard still do).
@@ -361,7 +407,7 @@ struct BigGauge {
 };
 enum : uint8_t { G_INPUT, G_DECLOG, G_FRONT };  // Page 2, page 3, page 1.
 const BigGauge BIG_GAUGES[3] = {
-    {"SPEED SENSOR", "km/h", INPUT_MAX_KMH, 10, 50, INPUT_RED_KMH, "SPEED", false, RED, ACCENT},
+    {"SPEED SENSOR", "km/h", INPUT_MAX_KMH, 1, 4, INPUT_RED_KMH, "SPEED", false, RED, ACCENT},  // 0, 4, ... 20.
     {"DECLOG", "Hz", DECLOG_MAX_HZ, 5, 25, DECLOG_MAX_HZ + 1, "DECLOG", true, RED, ACCENT},
     {"FRONT", "km/h", ABS_SPEED_MAX, 10, 50, SPEED_RED, "REAR", false, GREEN, GREEN}};
 inline uint8_t pageOf(uint8_t which) { return which == G_FRONT ? 1 : which + 2; }
@@ -416,7 +462,8 @@ void renderGauge2(float v, uint8_t which, bool signal, bool adjust = false) {
 //   Page 1: REAR, bar (cyan -> amber -> red) and value in km/h.
 // adjust (page 1 REAR): the speed encoder sets this wheel: amber name with
 // ADJUST under it.
-void drawBigBar(uint8_t which, float v, bool have, bool adjust = false) {
+// fault (page 2, Nano D6 check): 1 OPEN OR SHORT SENSOR, 2 NO PULSE (STUCK HIGH).
+void drawBigBar(uint8_t which, float v, bool have, bool adjust = false, uint8_t fault = 0) {
   const BigGauge& g = BIG_GAUGES[which];
   const float frac = constrain(v / g.maxV, 0.0f, 1.0f);
   const char* unit = g.barPercent ? "%" : g.unit;
@@ -426,8 +473,10 @@ void drawBigBar(uint8_t which, float v, bool have, bool adjust = false) {
       aa::fill(b, BG);
       panel(b, P2X, DY, P2W, DH);
       aa::roundRect(b, P2X + 1, DY + 1, 4, DH - 2, 2, RED);
-      aa::text(b, aaLabel, "NO SPEED SENSOR READING", W / 2, DY + 16, RED, aa::CENTER, 1);
-      aa::text(b, aaSmall, "Check the sensor and its wire", W / 2, DY + 29, MUTED, aa::CENTER);
+      const char* msg = fault == 1 ? "OPEN OR SHORT SENSOR" : fault == 2 ? "NO PULSE (STUCK HIGH)" : "NO SPEED SENSOR READING";
+      aa::text(b, aaLabel, msg, W / 2, DY + 16, RED, aa::CENTER, 1);
+      aa::text(b, aaSmall, "Check the sensor and its wire",
+               W / 2, DY + 29, MUTED, aa::CENTER);
     });
     return;
   }
@@ -443,10 +492,12 @@ void drawBigBar(uint8_t which, float v, bool have, bool adjust = false) {
     char s[12];
     constexpr int X0 = P2X + 104, LEN = 128;
     const int cy = DY + DH / 2;
-    aa::roundRect(b, X0, cy - 5, LEN, 10, 5, TRACK);
-    const uint16_t fill = which == G_FRONT ? speedColor(v) : ACCENT;
-    if (have && frac > 0.005f) aa::roundRect(b, X0, cy - 5, max(10.0f, frac * LEN), 10, 5, fill);
-    if (have) snprintf(s, sizeof(s), "%.0f", g.barPercent ? frac * 100 : v);
+    if (which != G_INPUT) {  // Page 2: speed text only, no bar.
+      aa::roundRect(b, X0, cy - 5, LEN, 10, 5, TRACK);
+      const uint16_t fill = which == G_FRONT ? speedColor(v) : ACCENT;
+      if (have && frac > 0.005f) aa::roundRect(b, X0, cy - 5, max(10.0f, frac * LEN), 10, 5, fill);
+    }
+    if (have) snprintf(s, sizeof(s), which == G_INPUT ? "%.1f" : "%.0f", g.barPercent ? frac * 100 : v);
     else strlcpy(s, "--", sizeof(s));
     const int unitX = P2X + P2W - 10 - aa::textWidth(aaLabel, unit);
     aa::text(b, aaLabel, unit, unitX, cy + 7, MUTED);
@@ -657,7 +708,7 @@ void update(const AbsData& d, uint8_t page, uint8_t sel = 0, bool locked = false
         renderGauge2(front, G_FRONT, have, adjust);
       }
     } else if (mode == PAGE2) {
-      // Speed sensor: GPIO34 Hz / 10 = km/h; no pulses = NO SIGNAL.
+      // Speed sensor: Hz / 6 = km/h (0-20); no pulses = NO SIGNAL.
       const bool signal = d.inputHz > 0;
       const float kmh = ease(easeInput, constrain(d.inputHz / INPUT_HZ_PER_KMH, 0.0f, INPUT_MAX_KMH), 0.2f);
       const int32_t key = lroundf(kmh * 4) | int32_t(signal) << 16;
@@ -675,6 +726,8 @@ void update(const AbsData& d, uint8_t page, uint8_t sel = 0, bool locked = false
       }
     }
   }
+  // Page 2 logic lamps: checked every loop, so the blinking stays even.
+  if (mode == PAGE2) logicLamps(running, d.inputHz, d.d6State);
 
   if (now - lastTextMs < TEXT_REFRESH_MS) return;
   lastTextMs = now;
@@ -693,8 +746,8 @@ void update(const AbsData& d, uint8_t page, uint8_t sel = 0, bool locked = false
     const bool signal = d.inputHz > 0;
     const float kmh = constrain(d.inputHz / INPUT_HZ_PER_KMH, 0.0f, INPUT_MAX_KMH);
     char key[16];
-    snprintf(key, sizeof(key), "%d %.0f", signal, kmh);
-    if (changed(S_INPUT, key)) drawBigBar(G_INPUT, kmh, signal);
+    snprintf(key, sizeof(key), "%d %.1f %u", signal, kmh, unsigned(d.d6State));
+    if (changed(S_INPUT, key)) drawBigBar(G_INPUT, kmh, signal, false, d.d6State);
   } else {
     char key[16];
     snprintf(key, sizeof(key), "%d %.0f", running, d.declogHz);
