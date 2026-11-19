@@ -7,7 +7,7 @@
 //   * Generator out    A3/A4   -> D46/D45   (Timer5 OC5A/OC5B hardware toggle)
 //
 // Implements the hand-drawn "NANO" signal-module sketch:
-//   * Brake switch / abrupt deceleration -> D6 held 13 s, D7 pulse bursts (only at 30 km/h or more)
+//   * Brake switch / abrupt deceleration -> D6 held 13 s, D7 pulse bursts (only at 10 km/h or more)
 //   * Front FREQ >= 60 Hz (10 km/h)      -> LOCK output on D12, latched until power-off,
 //                                           and D6 turns on once for 1 s (no D7)
 //   * Front FREQ / 60 (RPM), / 6 (speed display)
@@ -17,7 +17,7 @@
 // v2 ARMING: two momentary buttons (D24, D25) must each be pressed once after
 // power-up. Each press latches its condition (LED on D26 / D27) until
 // power-off, in any order. Until BOTH are latched the WSIM is blocked: D4,
-// D6..D12 stay LOW (no D6/D7 even above 30 km/h, LOCK/ABS light D12 off) and
+// D6..D12 stay LOW (no D6/D7 even above 10 km/h, LOCK/ABS light D12 off) and
 // the display shows "----". The test generator keeps working.
 //
 // Everything marked "ASSUMPTION" is not in the drawing and can be changed in
@@ -40,6 +40,11 @@
 //   D22 OUT  4-digit display CLK (TM1637), shows front speed in km/h
 //   D23 I/O  4-digit display DIO (TM1637); display VCC -> 5V, GND -> GND
 //   D13      free (onboard LED, kept LOW)
+//   D20 I/O  0.96" OLED SDA (SSD1306 128x64 I2C, addr 0x3C or 0x3D)
+//   D21 OUT  0.96" OLED SCL; OLED VCC -> 5V, GND -> GND
+//            Shows FRONT and REAR speed in km/h (and Hz).
+//   D28 OUT  Relay (module IN or transistor): clicks like a motor, front
+//            speed 0..250 km/h -> 0..30 clicks/s. Silent when stopped or not armed.
 //
 //   Arming (both needed before the WSIM works):
 //   D24 IN   Condition 1 button      INPUT_PULLUP, momentary to GND
@@ -61,6 +66,10 @@
 //     press again -> back to NORMAL, REAR snaps back equal to FRONT
 // ----------------------------------------------------------------------------
 
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
 // =============================== CONFIG =====================================
 
 // --- Brake event (D6 / D7) -------------------------------------------------
@@ -68,14 +77,18 @@
 // Set to true to require BOTH (brake pressed AND abrupt decel) instead.
 const bool     BRAKE_REQUIRES_DECEL   = false;
 
-// ASSUMPTION: "abrupt decrease" = front frequency falling at least this fast.
-// 6 Hz = 1 km/h, so 130 Hz/s ~= 21.7 km/h/s ~= 6 m/s^2 (hard braking).
-const float    DECEL_TRIGGER_HZ_PER_S = 130.0;
-// ASSUMPTION: ignore decel detection below this speed (noise at low speed).
-const float    DECEL_MIN_FREQ_HZ      = 60.0;   // 10 km/h
+// "Sudden drop" = front speed falls by at least DECEL_DROP_KPH below the
+// highest speed of the last DECEL_WINDOW_MS. 5 km/h in 300 ms ~= 16.7 km/h/s
+// ~= 4.6 m/s^2. Checked every 100 ms, so it reacts within ~0.1 s.
+const float    DECEL_DROP_KPH    = 5.0;
+const uint16_t DECEL_WINDOW_MS   = 300;    // multiple of SAMPLE_MS (100 ms)
 
-// D6 / D7 only start when the front speed is at least this (30 km/h = 180 Hz).
-const float    EVENT_MIN_FREQ_HZ = 180.0;
+// D6 / D7 only start when the speed is >= this, in whole km/h as shown on the
+// displays (Hz / 6, rounded; the measured 60 Hz is often 59.99 Hz).
+//   * Sudden drop: the speed BEFORE the drop (peak of the window) must be
+//     >= 10, so a drop from 40 to 0 km/h still triggers.
+//   * Brake switch: the current speed must be >= 10.
+const int16_t  EVENT_MIN_KPH     = 10;
 const uint32_t D6_DELAY_MS       = 500;    // D6 turns on this long after the trigger
 const uint32_t D6_HOLD_MS        = 13000;  // drawing: logic 1 for 13 s
 const uint32_t D7_START_MS       = 2000;   // drawing text: starts after 2 s
@@ -87,7 +100,7 @@ const uint32_t D7_PULSE_HIGH_MS   = 50;    // ASSUMPTION: 50% duty
 const uint32_t BOOT_D7_ON_MS      = 1000;  // D7 on for 1 s at power-up, then off
 
 // --- LOCK (D12) ------------------------------------------------------------
-const float    LOCK_FREQ_HZ      = 60.0;   // drawing: 60 Hz (10 km/h)
+const int16_t  LOCK_KPH          = 10;     // drawing: 60 Hz; D12 + D6 pulse at >= 10 km/h shown
 const uint32_t LOCK_CONFIRM_MS   = 200;    // ASSUMPTION: must hold 200 ms
 const uint32_t LOCK_D6_PULSE_MS  = 1000;   // D6 on for 1 s when LOCK latches
 // D12 is LOW at power-up and goes HIGH only once LOCK is active.
@@ -115,6 +128,22 @@ const bool     ENC_REVERSE       = false;  // true if clockwise goes down
 // --- 4-digit display (TM1637 on D22 / D23) ---------------------------------
 const uint8_t  DISP_BRIGHTNESS   = 4;      // 0 (dim) .. 7 (bright)
 const uint16_t DISP_UPDATE_MS    = 200;    // speed refresh rate
+
+// --- 0.96" OLED (SSD1306 128x64 on I2C D20 / D21) ---------------------------
+const uint16_t OLED_UPDATE_MS    = 200;    // redraw rate
+const uint8_t  OLED_CHUNKS_PER_LOOP = 2;   // 16-byte I2C chunks sent per loop pass
+
+// --- Speed relay (D28) -----------------------------------------------------
+// Click rate maps linearly 0..250 km/h -> 0..30 clicks/s:
+//   clicks/s = front km/h / RELAY_FULL_KPH * RELAY_MAX_CLICK_HZ
+//   -> 50 km/h = 6/s, 125 km/h = 15/s, 250 km/h = 30/s
+const float    RELAY_FULL_KPH    = 250.0;  // speed that gives the max rate
+const float    RELAY_MAX_CLICK_HZ = 30.0;  // clicks/s at RELAY_FULL_KPH
+const float    RELAY_MIN_KPH     = 1.0;    // below this the relay is silent
+const uint8_t  RELAY_JITTER_PCT  = 8;      // random +/- per click (engine lope), 0 = exact
+const uint16_t RELAY_ON_MAX_MS   = 25;     // click ON time, 50 % duty ...
+const uint16_t RELAY_ON_MIN_MS   = 12;     // ... but never below relay pull-in
+const bool     RELAY_ACTIVE_LOW  = false;  // true for relay modules that switch on LOW
 
 // --- Arming buttons (D24 / D25) --------------------------------------------
 const uint16_t ARM_DEBOUNCE_MS   = 30;     // press must be stable this long
@@ -147,6 +176,7 @@ const uint8_t PIN_GEN_FRONT = 46; // PL3, OC5A
 const uint8_t PIN_GEN_REAR  = 45; // PL4, OC5B
 const uint8_t PIN_ARM_BTN[2] = { 24, 25 };  // condition 1 / 2 buttons
 const uint8_t PIN_ARM_LED[2] = { 26, 27 };  // condition 1 / 2 LEDs
+const uint8_t PIN_RELAY     = 28; // speed relay
 
 // Set once both arming conditions are latched; read by the capture ISRs.
 volatile bool armed = false;
@@ -355,12 +385,16 @@ struct FreqMeter {
 
 FreqMeter front, rear;
 
+// Front speed in whole km/h, rounded exactly like the TM1637 and OLED show it.
+int16_t frontKph() { return (int16_t)(front.hz / 6.0f + 0.5f); }
+
 // ================================ STATE =====================================
 const uint32_t SAMPLE_MS = 100;
-const uint8_t  DECEL_SAMPLES = 4;          // compare against 300 ms ago
+const uint8_t  DECEL_SAMPLES = DECEL_WINDOW_MS / SAMPLE_MS + 1;  // now + window
 float    frontHist[DECEL_SAMPLES] = {0};
 uint8_t  histIdx = 0;
-bool     abruptDecel = false;
+bool     abruptDecel = false;      // sudden drop from >= EVENT_MIN_KPH
+float    decelPeakKph = 0;         // speed before the drop, for serial
 
 bool     brakePressed = false, brakeRaw = false;
 uint32_t brakeChangeMs = 0;
@@ -389,6 +423,8 @@ void setup() {
     pinMode(PIN_ARM_BTN[i], INPUT_PULLUP);
     pinMode(PIN_ARM_LED[i], OUTPUT); digitalWrite(PIN_ARM_LED[i], LOW);
   }
+  digitalWrite(PIN_RELAY, RELAY_ACTIVE_LOW ? HIGH : LOW);   // relay off
+  pinMode(PIN_RELAY, OUTPUT);
 
   genBegin();
   encBegin();
@@ -401,6 +437,8 @@ void setup() {
   Serial.begin(115200);
   Serial.println(F("Wheel Speed Interface Module (WSIM) v2 Mega ready"));
 #endif
+  oledBegin();
+  randomSeed(analogRead(A15) ^ micros());   // A15 floating -> random engine lope
 }
 
 // ============================ SUB-FUNCTIONS =================================
@@ -440,13 +478,15 @@ void sampleFrequencies() {
   front.update(frontEdges, frontLastUs);
   rear.update(rearEdges, rearLastUs);
 
-  // Abrupt deceleration: drop over the last (DECEL_SAMPLES-1) samples.
+  // Sudden drop: current speed vs the highest speed in the window.
   frontHist[histIdx] = front.hz;
-  uint8_t oldest = (histIdx + 1) % DECEL_SAMPLES;
-  histIdx = oldest;
-  float old = frontHist[oldest];
-  float rate = (old - front.hz) / ((DECEL_SAMPLES - 1) * SAMPLE_MS / 1000.0f);
-  abruptDecel = old >= DECEL_MIN_FREQ_HZ && rate >= DECEL_TRIGGER_HZ_PER_S;
+  histIdx = (histIdx + 1) % DECEL_SAMPLES;
+  float peakHz = 0;
+  for (uint8_t i = 0; i < DECEL_SAMPLES; i++) peakHz = max(peakHz, frontHist[i]);
+  float peakKph = peakHz / 6.0f;
+  float dropKph = peakKph - front.hz / 6.0f;
+  abruptDecel = (int16_t)(peakKph + 0.5f) >= EVENT_MIN_KPH && dropKph >= DECEL_DROP_KPH;
+  if (abruptDecel) decelPeakKph = peakKph;
 }
 
 // D6 / D7 event. Triggers on the *start* of a condition so holding the brake
@@ -458,13 +498,23 @@ bool lockPulseActive = false;
 uint32_t lockPulseStartMs = 0;
 
 void updateBrakeEvent(uint32_t now) {
+  // abruptDecel already includes "speed before the drop >= 10 km/h"; the
+  // brake switch needs the current speed >= 10 km/h.
+  bool brakeOk = brakePressed && frontKph() >= EVENT_MIN_KPH;
   bool trigger = BRAKE_REQUIRES_DECEL ? (brakePressed && abruptDecel)
-                                      : (brakePressed || abruptDecel);
-  // Below 30 km/h a trigger is ignored. A running event finishes even if the
-  // speed then drops (it does when braking). Nothing starts until armed.
-  if (armed && trigger && !prevTrigger && !eventActive && front.hz >= EVENT_MIN_FREQ_HZ) {
+                                      : (brakeOk || abruptDecel);
+  // A running event finishes even if the speed then drops (it does when
+  // braking). Nothing starts until armed. Edge-triggered: a trigger that is
+  // still true when the event ends does not restart it.
+  if (armed && trigger && !prevTrigger && !eventActive) {
     eventActive = true;
     eventStartMs = now;
+#if DEBUG_SERIAL
+    Serial.print(F("# EVENT: "));
+    if (abruptDecel) { Serial.print(F("sudden drop from ")); Serial.print(decelPeakKph, 0);
+                       Serial.print(F(" to ")); Serial.print(front.hz / 6.0f, 0); Serial.println(F(" km/h")); }
+    else Serial.println(F("brake switch"));
+#endif
   }
   prevTrigger = trigger;
 
@@ -499,7 +549,7 @@ void updateBrakeEvent(uint32_t now) {
 
 void updateLock(uint32_t now) {
   if (!lockLatched) {
-    if (armed && front.hz >= LOCK_FREQ_HZ) {       // LOCK can't latch until armed
+    if (armed && frontKph() >= LOCK_KPH) {         // LOCK can't latch until armed
       if (lockAboveSinceMs == 0) lockAboveSinceMs = now ? now : 1;
       if (now - lockAboveSinceMs >= LOCK_CONFIRM_MS) {
         lockLatched = true;
@@ -533,6 +583,43 @@ void updateTcs(uint32_t now) {
   }
   bool on = tcsActive && ((now / TCS_BLINK_HALF_MS) % 2 == 0);
   digitalWrite(PIN_TCS, on);
+}
+
+// ============================ SPEED RELAY (D28) =============================
+// Speed relay (see CONFIG): 0..250 km/h -> 0..30 clicks/s. The click rate is
+// re-computed from the CURRENT speed on every loop pass, so it reacts at once.
+// Silent when stopped and until armed.
+bool     relayOn = false;
+bool     relayIdle = true;                 // true = next click starts at once
+uint32_t relayClickMs = 0;                 // start of the last click
+uint16_t relayOnMs = RELAY_ON_MAX_MS;      // ON time of the current click
+int8_t   relayJitter = 0;                  // % for the current gap
+float    relayHz = 0;                      // current click rate, for serial
+
+void relayWrite(bool on) {
+  relayOn = on;
+  digitalWrite(PIN_RELAY, (on != RELAY_ACTIVE_LOW) ? HIGH : LOW);
+}
+
+void updateRelay(uint32_t now) {
+  if (relayOn && now - relayClickMs >= relayOnMs) relayWrite(false);
+  float kph = front.hz / 6.0f;
+  if (!armed || kph < RELAY_MIN_KPH) { relayIdle = true; relayHz = 0; return; }
+
+  float hz = min(kph, RELAY_FULL_KPH) / RELAY_FULL_KPH * RELAY_MAX_CLICK_HZ;
+  relayHz = hz;
+  uint32_t periodMs = (uint32_t)(1000.0f / hz);
+  periodMs = periodMs * (100 + relayJitter) / 100;      // engine lope
+  uint16_t onMs = constrain(periodMs / 2, RELAY_ON_MIN_MS, RELAY_ON_MAX_MS);
+  if (periodMs < 2UL * onMs) periodMs = 2UL * onMs;
+
+  if (relayIdle || now - relayClickMs >= periodMs) {
+    relayIdle = false;
+    relayClickMs = now;
+    relayOnMs = onMs;
+    relayJitter = (int8_t)random(-RELAY_JITTER_PCT, RELAY_JITTER_PCT + 1);
+    relayWrite(true);
+  }
 }
 
 // ======================== 4-DIGIT DISPLAY (TM1637) ==========================
@@ -611,6 +698,140 @@ void updateDisplay(uint32_t now) {
   }
 }
 
+// ======================= 0.96" OLED (SSD1306, I2C) ==========================
+// Status bar on top, then FRONT and REAR rows:
+//   [COND1] [COND2]   ARMED     <- box filled once that button was pressed
+//   FRONT        20 km/h        <- big digits
+//   120Hz
+//   REAR         22 km/h
+//   132Hz
+// Shows "---" and "BLOCKED" until both conditions are met.
+//
+// The Adafruit library is used for init and drawing into its 1 KB buffer, but
+// the buffer is NOT sent with display() (that blocks ~25 ms and would distort
+// the 50 ms D7 pulses). Instead it is streamed in 16-byte chunks, a couple per
+// loop pass. If no OLED answers, it is re-probed every 2 s (hot-plug works).
+Adafruit_SSD1306 oled(128, 64, &Wire, -1, 400000UL, 400000UL);
+bool     oledOk = false;
+uint8_t  oledAddr = 0x3C;
+uint32_t oledLastMs = 0, oledProbeMs = 0;
+int16_t  oledPos = -1;                       // next buffer byte to send, -1 = idle
+int16_t  oledShownF = -1, oledShownR = -1;
+uint8_t  oledShownCond = 0xFF;
+uint8_t  oledRefresh = 0;
+
+bool oledProbe(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission() == 0;
+}
+
+void oledBegin() {
+  Wire.begin();
+  Wire.setClock(400000UL);
+  Wire.setWireTimeout(3000, true);          // never hang on a stuck bus
+  oledProbeMs = millis();
+  if (oledProbe(0x3C)) oledAddr = 0x3C;
+  else if (oledProbe(0x3D)) oledAddr = 0x3D;
+  else { oledOk = false; return; }
+  oledOk = oled.begin(SSD1306_SWITCHCAPVCC, oledAddr, true, false);
+  oledShownF = oledShownR = -1;             // force a redraw
+  oledPos = -1;
+#if DEBUG_SERIAL
+  if (oledOk) { Serial.print(F("# OLED found at 0x")); Serial.println(oledAddr, HEX); }
+#endif
+}
+
+// Condition box in the status bar: filled (inverse text) once met, outline only
+// while not met yet.
+// Two-color modules: rows 0..15 are yellow, 16..63 blue (fixed in the glass).
+// The status bar is centred in the yellow strip, the speed rows are all blue.
+const int16_t OLED_BAR_Y   = 3;            // status boxes, rows 3..11
+const int16_t OLED_FRONT_Y = 17;           // big digits rows 17..37
+const int16_t OLED_REAR_Y  = 41;           // big digits rows 41..61
+
+void oledCond(int16_t x, const __FlashStringHelper *label, bool met) {
+  oled.setTextSize(1);
+  if (met) {
+    oled.fillRect(x, OLED_BAR_Y, 34, 9, SSD1306_WHITE);
+    oled.setTextColor(SSD1306_BLACK);
+  } else {
+    oled.drawRect(x, OLED_BAR_Y, 34, 9, SSD1306_WHITE);
+    oled.setTextColor(SSD1306_WHITE);
+  }
+  oled.setCursor(x + 2, OLED_BAR_Y + 1);
+  oled.print(label);
+  oled.setTextColor(SSD1306_WHITE);
+}
+
+// One speed row: label and Hz on the left, big km/h digits on the right.
+void oledRow(int16_t y, const __FlashStringHelper *label, int16_t kph, float hz) {
+  char buf[12];
+  oled.setTextSize(1);
+  oled.setCursor(0, y);
+  oled.print(label);
+  if (armed) {
+    snprintf(buf, sizeof buf, "%uHz", (unsigned)(hz + 0.5f));
+    oled.setCursor(0, y + 11);
+    oled.print(buf);
+  }
+
+  if (armed) snprintf(buf, sizeof buf, "%d", kph); else strcpy(buf, "---");
+  oled.setTextSize(3);                       // 18 x 24 px per character
+  oled.setCursor(96 - 18 * strlen(buf), y);
+  oled.print(buf);
+  oled.setTextSize(1);
+  oled.setCursor(102, y + 13);
+  oled.print(F("km/h"));
+}
+
+void updateOled(uint32_t now) {
+  if (!oledOk) {
+    if (now - oledProbeMs >= 2000) oledBegin();
+    return;
+  }
+
+  if (oledPos >= 0) {                        // streaming a frame
+    uint8_t *b = oled.getBuffer();
+    for (uint8_t c = 0; c < OLED_CHUNKS_PER_LOOP && oledPos < 1024; c++) {
+      Wire.beginTransmission(oledAddr);
+      Wire.write(0x40);                      // data
+      Wire.write(b + oledPos, 16);
+      if (Wire.endTransmission() != 0) { oledOk = false; oledProbeMs = now; return; }
+      oledPos += 16;
+    }
+    if (oledPos >= 1024) oledPos = -1;
+    return;
+  }
+
+  if (now - oledLastMs < OLED_UPDATE_MS) return;
+  oledLastMs = now;
+  int16_t f = armed ? (int16_t)min(front.hz / 6.0f + 0.5f, 999.0f) : -2;
+  int16_t r = armed ? (int16_t)min(rear.hz  / 6.0f + 0.5f, 999.0f) : -2;
+  uint8_t cond = armCond[0] | (armCond[1] << 1);
+  // Redraw on change, and every 2 s anyway (Hz text, replugged module).
+  if (f == oledShownF && r == oledShownR && cond == oledShownCond &&
+      ++oledRefresh < 2000 / OLED_UPDATE_MS) return;
+  oledRefresh = 0;
+  oledShownF = f; oledShownR = r; oledShownCond = cond;
+
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+  oledCond(0,  F("COND1"), armCond[0]);
+  oledCond(38, F("COND2"), armCond[1]);
+  oled.setCursor(armed ? 98 : 80, OLED_BAR_Y + 1);
+  oled.print(armed ? F("ARMED") : F("BLOCKED"));
+  oledRow(OLED_FRONT_Y, F("FRONT"), f, front.hz);
+  oledRow(OLED_REAR_Y,  F("REAR"),  r, rear.hz);
+
+  // Frame window = whole screen, then stream the buffer from byte 0.
+  Wire.beginTransmission(oledAddr);
+  Wire.write(0x00);                          // commands
+  const uint8_t win[] = { 0x21, 0, 127, 0x22, 0, 7 };
+  Wire.write(win, sizeof win);
+  if (Wire.endTransmission() != 0) { oledOk = false; oledProbeMs = now; return; }
+  oledPos = 0;
+}
+
 #if DEBUG_SERIAL
 void printStatus() {
   Serial.print(F("ARM="));   Serial.print(armCond[0]); Serial.print(armCond[1]);
@@ -624,6 +845,7 @@ void printStatus() {
   Serial.print(F(" event=")); Serial.print(eventActive);
   Serial.print(F(" lock="));  Serial.print(lockLatched);
   Serial.print(F(" tcs="));   Serial.print(tcsActive);
+  Serial.print(F(" relay=")); Serial.print(relayHz, 1); Serial.print(F("/s"));
   Serial.print(F(" | GEN F=")); Serial.print(genFrontHz);
   Serial.print(F(" R="));      Serial.print(genRearHz);
   Serial.println(rearOnlyMode ? F(" [REAR only]") : F(" [NORMAL]"));
@@ -648,7 +870,9 @@ void loop() {
   updateBrakeEvent(now);
   updateLock(now);
   updateTcs(now);
+  updateRelay(now);
   updateDisplay(now);
+  updateOled(now);
 
 #if DEBUG_SERIAL
   if (now - lastPrintMs >= 500) {
