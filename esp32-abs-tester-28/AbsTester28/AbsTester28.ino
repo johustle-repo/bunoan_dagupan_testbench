@@ -26,7 +26,7 @@
 // as JSON at /api/live.
 // LCD pages: swipe left on the touchscreen for page 2, right for page 1 (REAR / FRONT speed);
 // page 2 (the 0-2000 Hz GPIO34 speed sensor gauge and SPEED bar, FreqInput.h; page 3 the DECLOG gauge and bar).
-const char* const AP_SSID = "ABS-Tester";
+const char* const AP_SSID = "Techroniks ABS Tester";
 const char* const AP_PASSWORD = "ABSdemo2026";  // At least 8 characters.
 constexpr uint8_t LINK_RX = 16, LINK_TX = 17;  // RX2, TX2 (TX unused).
 // The page on screen, to the Nano so it runs only that page's signals:
@@ -137,7 +137,7 @@ String liveJson() {
   const float inHz = sensorHz(fresh);
   const float percent = constrain(latest.declogHz / DECLOG_MAX_HZ * 100, 0.0f, 100.0f);
   String json;
-  json.reserve(480);
+  json.reserve(560);
   json = F("{\"link\":\"");
   json += !havePacket ? F("waiting") : !fresh ? F("stale") : F("live");
   json += F("\",\"key\":"); json += latest.keyOn ? F("true") : F("false");
@@ -154,7 +154,7 @@ String liveJson() {
   json += F(",\"ref1_v\":"); json += String(latest.ref1V, 3);
   json += F(",\"battery_v\":"); json += String(latest.batteryV, 3);
   json += F(",\"input_hz\":"); json += String(inHz, 1);
-  // Page 2 speed sensor: Hz / 10 = km/h (0-200); null = NO SIGNAL.
+  // Page 2 speed sensor: Hz / 6 = km/h (0-20); null = NO SIGNAL.
   // input_source: "nano_d6" (Nano D6) or "gpio34" (the ESP32's own input).
   json += F(",\"input_kmh\":");
   json += inHz > 0 ? String(min(inHz / INPUT_HZ_PER_KMH, INPUT_MAX_KMH), 1) : String("null");
@@ -182,6 +182,9 @@ String liveJson() {
   json += F("\",\"tcs_lamp\":\""); json += fresh && tcsBlinking(latest) ? "flash" : "off";
   json += F("\",\"sensor_lamp\":\""); json += fresh ? sensorState(latest) : "off";
   json += '"';
+  // ECU reset relay (GPIO13): on while it cuts the ECU power; resets since boot.
+  json += F(",\"ecu_reset\":"); json += ecuReset::on ? F("true") : F("false");
+  json += F(",\"ecu_resets\":"); json += ecuReset::pulses;
   json += F(",\"bad_frames\":"); json += badFrames;
   json += F(",\"uptime_ms\":"); json += millis();
   json += '}';

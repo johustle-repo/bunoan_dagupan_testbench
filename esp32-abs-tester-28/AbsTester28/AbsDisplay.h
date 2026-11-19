@@ -4,6 +4,7 @@
 #include <Adafruit_ILI9341.h>
 #include "AaGraphics.h"
 #include "FreqInput.h"  // freqInput::guard() around the touch panel's T_CS.
+#include "LogoBitmap.h"  // TRN TECHRONIKS power-up logo.
 
 // ABS tester on the 2.8" ILI9341 TFT (landscape 320 x 240). Everything is
 // drawn anti-aliased (AaGraphics.h) with the Barlow Semi Condensed fonts in
@@ -32,7 +33,7 @@
 constexpr uint8_t TFT_SCK = 18, TFT_MISO = 19, TFT_MOSI = 23;
 constexpr uint8_t TFT_CS = 27, TFT_DC = 25, TFT_RST = 26, TOUCH_CS = 33;
 constexpr uint32_t GAUGE_REFRESH_MS = 40, TEXT_REFRESH_MS = 100;
-constexpr uint32_t SPLASH_MS = 1800, SELF_TEST_MS = 1600;  // Power-on splash, switch-on sweep.
+constexpr uint32_t SELF_TEST_MS = 1600;  // Switch-on sweep.
 // Swipe: at least SWIPE_MIN raw touch units sideways (about 1/6 of the screen
 // width), twice as far sideways as up / down, finger lifted within 1.2 s.
 // If left and right come out swapped on a panel, set SWIPE_FLIP to true.
@@ -551,32 +552,105 @@ void lockedText(const AbsData& d) {
     aa::text(b, aaLabel, hint, W / 2, 166, MUTED, aa::CENTER);
     aa::text(b, aaSmall, d.pagePot ? "Encoder, swipe or page pot A5: change page" : "Encoder or swipe: change page",
              W / 2, 186, DIM, aa::CENTER, 1);
-    aa::text(b, aaSmall, "Wi-Fi ABS-Tester  |  192.168.4.1", W / 2, 201, DIM, aa::CENTER, 1);
+    aa::text(b, aaSmall, "Wi-Fi Techroniks ABS Tester  |  192.168.4.1", W / 2, 201, DIM, aa::CENTER, 1);
   });
 }
 
-// Power-on splash: the ABS lamp ring sweeps round, the title fades in and a
-// loading bar fills.
-void splash() {
-  constexpr int BAR_X = 100, BAR_Y = 186, BAR_W = 120;
-  for (uint32_t start = millis(), t = 0; t <= SPLASH_MS; t = millis() - start) {
-    const float p = float(t) / SPLASH_MS, fade = constrain((p - 0.15f) / 0.45f, 0.0f, 1.0f);
-    render(0, 0, W, H, [&](aa::Buf& b) {
-      aa::fill(b, BG);
-      const float cx = W / 2, cy = 90, r = 30;
-      aa::arc(b, cx, cy, r - 4, r, HALF_PI, HALF_PI + TWO_PI, [](float) { return TRACK; });
-      const float sweep = 3 * HALF_PI + TWO_PI * min(1.0f, p / 0.6f);
-      aa::arc(b, cx, cy, r - 4, r, 3 * HALF_PI, sweep, [](float) { return ACCENT; });
-      const uint16_t amber = aa::mix(BG, AMBER, fade * 255);
-      aa::arc(b, cx, cy, r + 6, r + 10, PI - 0.6f, PI + 0.6f, [amber](float) { return amber; });
-      aa::arc(b, cx, cy, r + 6, r + 10, TWO_PI - 0.6f, TWO_PI + 0.6f, [amber](float) { return amber; });
-      aa::textMid(b, aaPill, "ABS", cx, cy, amber, 1);
-      aa::text(b, aaValue, "ABS TESTER", cx, 164, aa::mix(BG, TEXT, fade * 255), aa::CENTER, 3);
-      aa::roundRect(b, BAR_X, BAR_Y, BAR_W, 6, 3, TRACK);
-      aa::roundRect(b, BAR_X, BAR_Y, max(6.0f, BAR_W * min(1.0f, p)), 6, 3, ACCENT);
+// Power-on intro, the only start-up animation (LOGO_MS in all): the TRN
+// TECHRONIKS logo (LogoBitmap.h, 240 x 111, centred on black) with a glitch
+// effect:
+//   0.0-1.0 s  glitch in: the logo flickers in with shifted horizontal
+//              slices, a red / blue colour split and noise lines, settling
+//              down to a clean logo;
+//   1.0-1.8 s  shine: a light band sweeps diagonally across the letters;
+//   1.8-2.6 s  hold, with two short glitch bursts;
+//   2.6-3.2 s  glitch out while fading to black.
+// Glitch strength 0-1 per frame: slice shifts up to GLITCH_SHIFT px, colour
+// split up to GLITCH_SPLIT px. The glitch is random, so every start looks a
+// little different.
+constexpr uint32_t LOGO_MS = 3200;
+constexpr int LOGO_X = (W - LOGO_W) / 2, LOGO_Y = (H - LOGO_H) / 2;
+constexpr int GLITCH_MARGIN = 16, GLITCH_SHIFT = 14, GLITCH_SPLIT = 6;
+
+// Logo pixel, black outside the bitmap.
+inline uint16_t logoPx(int x, int y) {
+  if (x < 0 || x >= LOGO_W || y < 0 || y >= LOGO_H) return 0;
+  return pgm_read_word(LOGO_PX + y * LOGO_W + x);
+}
+
+// Glitch strength at time p (seconds).
+float glitchAt(float p) {
+  if (p < 1.0f) return 1.0f - p;                                   // In: strong -> none.
+  if (p >= 1.95f && p < 2.03f) return 0.6f;                         // Burst 1.
+  if (p >= 2.30f && p < 2.36f) return 0.45f;                        // Burst 2.
+  if (p >= 2.6f) return constrain((p - 2.6f) / 0.6f, 0.0f, 1.0f);  // Out: none -> strong.
+  return 0;
+}
+
+void logoIntro() {
+  constexpr uint16_t BLACK = 0x0000, WHITE = rgb(0xff, 0xff, 0xff);
+  constexpr uint16_t NOISE[3] = {rgb(0x1e, 0x88, 0xff), rgb(0xe8, 0xf0, 0xff), rgb(0x6c, 0xc8, 0xff)};
+  constexpr int RX = LOGO_X - GLITCH_MARGIN, RW = LOGO_W + 2 * GLITCH_MARGIN;
+  static int8_t rowShift[LOGO_H];
+  static uint8_t rowNoise[LOGO_H];  // 0 = none, 1-3 = noise line colour.
+  render(0, 0, W, H, [](aa::Buf& b) { aa::fill(b, BLACK); });
+  for (uint32_t start = millis(), t = 0; t <= LOGO_MS; t = millis() - start) {
+    const float p = float(t) / LOGO_MS * 3.2f;  // Seconds.
+    const float g = glitchAt(p);
+    const float fade = p > 2.6f ? constrain((3.2f - p) / 0.6f, 0.0f, 1.0f) : 1.0f;
+    const float shine = p >= 1.0f && p < 1.8f ? (p - 1.0f) / 0.8f * (LOGO_W + LOGO_H + 60) - 40 : -1000;
+    // This frame's glitch: random bands of rows shifted sideways, a few noise
+    // lines, a colour split, and flicker (some frames dimmed or blanked).
+    const int split = int(g * GLITCH_SPLIT + 0.5f);
+    float level = fade;
+    if (g > 0) {
+      for (int y = 0; y < LOGO_H;) {
+        const int band = 2 + random(10);
+        const int8_t dx = random(100) < g * 70 ? int8_t((random(2 * GLITCH_SHIFT + 1) - GLITCH_SHIFT) * g) : 0;
+        for (int i = 0; i < band && y < LOGO_H; ++i, ++y) {
+          rowShift[y] = dx;
+          rowNoise[y] = random(1000) < g * 25 ? 1 + random(3) : 0;
+        }
+      }
+      const long f = random(100);
+      if (f < g * 18) level *= 0.0f;         // Blank frame.
+      else if (f < g * 40) level *= 0.45f;   // Dim frame.
+    } else {
+      memset(rowShift, 0, sizeof(rowShift));
+      memset(rowNoise, 0, sizeof(rowNoise));
+    }
+    render(RX, LOGO_Y, RW, LOGO_H, [&](aa::Buf& b) {
+      for (int row = 0; row < b.h; ++row) {
+        const int y = b.oy - LOGO_Y + row;
+        uint16_t* out = b.px + row * b.w;
+        const int shift = rowShift[y];
+        for (int i = 0; i < RW; ++i) {
+          const int x = i - GLITCH_MARGIN - shift;  // Logo x for this screen pixel.
+          uint16_t c;
+          if (rowNoise[y]) {
+            // Noise line: a bright streak across part of the row.
+            c = (i * 7 + y * 13 + int(p * 1000)) % 5 ? NOISE[rowNoise[y] - 1] : BLACK;
+          } else if (split) {
+            // Colour split: red from the right, blue from the left, green in place.
+            c = (logoPx(x + split, y) & 0xF800) | (logoPx(x, y) & 0x07E0) | (logoPx(x - split, y) & 0x001F);
+          } else {
+            c = logoPx(x, y);
+          }
+          if (shine > -1000 && c) {
+            const float s = fabsf(x + y * 0.6f - shine);
+            if (s < 14) {
+              // Only the letters shine (bright pixels), not the black background.
+              const uint8_t lum = ((c >> 11) << 3) / 3 + (((c >> 5) & 0x3F) << 2) / 3 + ((c & 0x1F) << 3) / 3;
+              if (lum > 40) c = aa::mix(c, WHITE, uint8_t((1 - s / 14) * 170));
+            }
+          }
+          if (level < 1) c = aa::mix(BLACK, c, uint8_t(level * 255));
+          out[i] = c;
+        }
+      }
     });
-    delay(10);
   }
+  render(0, 0, W, H, [](aa::Buf& b) { aa::fill(b, BLACK); });
 }
 
 void begin() {
@@ -588,7 +662,8 @@ void begin() {
   tft.setRotation(1);  // Landscape 320 x 240.
   dialBg = static_cast<uint16_t*>(malloc(P2W * P2H * 2));  // Big enough for either page.
   if (!dialBg) Serial.println(F("# Gauge: no heap for the dial cache, redrawing it each frame."));
-  splash();
+  randomSeed(esp_random());  // A different glitch every start.
+  logoIntro();  // TRN TECHRONIKS logo with a glitch effect, 3.2 s (the only start-up animation).
   clearScreen();
 }
 
