@@ -465,8 +465,8 @@ void ecuLight(aa::Buf& b, float cx, float cy, uint16_t c, bool lit) {
 }
 
 // Knob lamp (page 1, under the top-right lamp while the ECU check fails):
-// D9 / D10 are cut (no output), so this amber lamp and the Hz beside it show
-// the "isolated" frequency the knob is set to. 6-1500 Hz is far too fast to
+// D9 / D10 are cut (no output), so this amber lamp and the kph beside it show
+// the "isolated" speed the knob is set to (knob Hz / 6). 6-1500 Hz is far too fast to
 // see, so it blinks at a scaled rate: 1 Hz at 6 Hz (1 km/h) rising to 8 Hz at
 // 1500 Hz (250 km/h); knob at 0 = lamp off. knobHz < 0 = not shown.
 constexpr float KNOB_BLINK_MIN = 1, KNOB_BLINK_MAX = 8, KNOB_MAX_HZ = 1500;
@@ -496,11 +496,12 @@ void ecuBadge(aa::Buf& b, int8_t ecu, bool lit, int knobHz = -1, bool knobLit = 
   // Same font and baseline as the FRONT title.
   if (*LABELS[ecu]) aa::text(b, aaLabel, LABELS[ecu], cx - 13, P2Y + 18, lit ? c : aa::mix(PANEL, c, 120), aa::RIGHT, 1);
   if (knobHz < 0) return;
-  // Knob lamp and Hz, one row below, lined up with the lamp and text above.
-  char hz[12];
-  snprintf(hz, sizeof(hz), "%d Hz", knobHz);
+  // Knob lamp and speed (knob Hz / 6, whole km/h), one row below, lined up
+  // with the lamp and text above.
+  char kph[12];
+  snprintf(kph, sizeof(kph), "%dkph", knobHz / (int)HZ_PER_KMH);
   ecuLight(b, cx, cy + 20, AMBER, knobLit);
-  aa::text(b, aaLabel, hz, cx - 13, P2Y + 38, knobHz ? AMBER : DIM, aa::RIGHT, 1);
+  aa::text(b, aaLabel, kph, cx - 13, P2Y + 38, knobHz ? AMBER : DIM, aa::RIGHT, 1);
 }
 
 // REAR bar panel while the ECU check fails (page 1): red stripe and the
