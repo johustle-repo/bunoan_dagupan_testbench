@@ -47,6 +47,27 @@ Nav nav = Nav::FREE;
 uint8_t selPage = 1;  // Page the encoder points at while selecting.
 uint32_t frameCount = 0;  // Good frames so far (the page pot is read once per frame).
 AbsLamp absLamp;   // ABS light (switch-on check from the rear speed), LCD and JSON.
+// Real ABS ECU check from the Nano (26-field frames): its code, and the white
+// CHECKING lamp for 3 s after each knob turn (the turn counter changed).
+AbsData::Ecu nanoEcu = AbsData::ECU_UNKNOWN;
+struct EcuCheck {
+  static constexpr uint32_t SHOW_MS = 3000;
+  bool synced = false;
+  uint8_t lastTurns = 0;
+  uint32_t untilMs = 0;
+  bool active = false;
+  void resync() { synced = false; active = false; }
+  void onTurns(uint8_t turns) {
+    const bool turned = synced && turns != lastTurns;
+    synced = true;
+    lastTurns = turns;
+    if (turned) { active = true; untilMs = millis() + SHOW_MS; }
+  }
+  bool on() {
+    if (active && int32_t(millis() - untilMs) >= 0) active = false;
+    return active;
+  }
+} ecuCheck;
 
 bool parseFrame(char* text) {
   char* star = strchr(text, '*');
@@ -65,12 +86,15 @@ bool parseFrame(char* text) {
   // 21 (Nano with the D6 speed sensor: the 20-field layout, then the D6 Hz x100 for page 2)
   // 22 (+ the Nano's D13 ABS light input: 1 = light on, 0 = off)
   // 23 (+ the Nano's D6 sensor state: 0 pulses OK, 1 open / short (stuck LOW), 2 stuck HIGH)
-  // or 24 (+ the Nano's knob-click reset counter 0-255: a +1 step fires the GPIO13 ECU relay).
+  // 24 (+ the Nano's knob-click reset counter 0-255: a +1 step fires the GPIO13 ECU relay)
+  // 26 (+ the Nano's ECU check code 0-4 and its knob turn counter 0-255, see AbsData::Ecu)
+  // or 27 (+ the knob setting in whole Hz, 0-1500, sent even while D9 / D10 are cut).
   constexpr uint8_t MIN_FIELDS = 8, FRONT_FIELDS = 10, LAMP_FIELDS = 13, DECLOG_FIELDS = 14, GEN_FIELDS = 17,
-                    NANO_ENC_FIELDS = 18, POT_FIELDS = 19, ENC_FIELDS = 20, SENSOR_FIELDS = 21, ABS_PIN_FIELDS = 22, D6_FIELDS = 23, MAX_FIELDS = 24;
+                    NANO_ENC_FIELDS = 18, POT_FIELDS = 19, ENC_FIELDS = 20, SENSOR_FIELDS = 21, ABS_PIN_FIELDS = 22, D6_FIELDS = 23,
+                    RESET_FIELDS = 24, ECU_FIELDS = 26, MAX_FIELDS = 27;
   // REF1 and battery: up to 30 V (0-30 V dividers, as on the ECU testbench).
   constexpr unsigned long maximum[MAX_FIELDS] = {1, 1, 100000000UL, 25000, 31000, 5500, 10500, 31000, 100000000UL, 25000,
-                                                 15000, 1, 1, 100000000UL, 250000, 250000, 25000, 1023, 3, 2, 1000000UL, 1, 2, 255};
+                                                 15000, 1, 1, 100000000UL, 250000, 250000, 25000, 1023, 3, 2, 1000000UL, 1, 2, 255, 4, 255, 1500};
   unsigned long values[MAX_FIELDS];
   uint8_t parsed = 0;
   char* p = text + 3;
@@ -82,7 +106,7 @@ bool parseFrame(char* text) {
     if (!*end && (parsed == MIN_FIELDS || parsed == FRONT_FIELDS || parsed == LAMP_FIELDS ||
                     parsed == DECLOG_FIELDS || parsed == GEN_FIELDS || parsed == NANO_ENC_FIELDS ||
                     parsed == POT_FIELDS || parsed == ENC_FIELDS || parsed == SENSOR_FIELDS ||
-                    parsed == ABS_PIN_FIELDS || parsed == D6_FIELDS || parsed == MAX_FIELDS)) break;
+                    parsed == ABS_PIN_FIELDS || parsed == D6_FIELDS || parsed == RESET_FIELDS || parsed == ECU_FIELDS || parsed == MAX_FIELDS)) break;
     if (*end != ',' || parsed == MAX_FIELDS) return false;
     p = end + 1;
   }
@@ -107,7 +131,11 @@ bool parseFrame(char* text) {
   latest.absPinOn = latest.absPin && values[21] == 1;
   latest.sensorHz = latest.nanoSensor ? values[20] / 100.0f : 0;
   latest.d6State = parsed >= D6_FIELDS ? values[22] : 0;  // 0 also for older Nano firmware.
-  if (parsed == MAX_FIELDS) ecuReset::onCounter(uint8_t(values[23]));  // Knob click -> GPIO13 relay.
+  if (parsed >= RESET_FIELDS) ecuReset::onCounter(uint8_t(values[23]));  // Knob click -> GPIO13 relay.
+  latest.ecuField = parsed >= ECU_FIELDS;  // Nano ECU check (D9 / D10 -> testbench -> ECU -> D7 / D8).
+  nanoEcu = latest.ecuField ? AbsData::Ecu(values[24]) : AbsData::ECU_UNKNOWN;
+  if (latest.ecuField) ecuCheck.onTurns(uint8_t(values[25]));  // Knob turned -> white CHECKING lamp.
+  latest.knobHz = parsed >= MAX_FIELDS ? values[26] : 0;  // Blinking knob lamp while the outputs are cut.
   latest.gens = parsed >= GEN_FIELDS;
   for (uint8_t i = 0; i < 3; ++i) latest.genHz[i] = latest.gens ? values[14 + i] / 100.0f : 0;
   latest.pagePot = parsed >= POT_FIELDS && values[18] >= 1;  // The encoder Mega sends page 0: no pot.
@@ -122,7 +150,19 @@ bool parseFrame(char* text) {
 
 // ABS light: the Nano's D13 input (HIGH = on) while live Nano frames carry it,
 // otherwise the switch-on check from the rear speed (AbsLamp).
-inline bool absLampOn(bool fresh) { return fresh && (latest.absPin ? latest.absPinOn : absLamp.on); }
+// With the real ECU unplugged (or its power cut by the reset relay) the D13
+// lamp wire is dead and reads as "on": the light is shown off instead.
+inline AbsData::Ecu ecuState() {
+  return ecuReset::on ? AbsData::ECU_RESET : nanoEcu;
+}
+inline const char* ecuText(AbsData::Ecu e) {
+  static const char* const TEXT[6] = {"NOT CHECKED (turn the knob)", "OK", "REAR NO RETURN (D9 -> D7)",
+                                      "FRONT NO RETURN (D10 -> D8)", "DISCONNECTED (no D7 / D8 return)", "RESET (GPIO13 relay)"};
+  return TEXT[e];
+}
+inline bool absLampOn(bool fresh) {
+  return fresh && ecuState() != AbsData::ECU_LOST && ecuState() != AbsData::ECU_RESET && (latest.absPin ? latest.absPinOn : absLamp.on);
+}
 
 // Page 2 speed sensor: the Nano's D6 while live Nano frames carry it,
 // otherwise the ESP32's own GPIO34 input.
@@ -185,6 +225,15 @@ String liveJson() {
   // ECU reset relay (GPIO13): on while it cuts the ECU power; resets since boot.
   json += F(",\"ecu_reset\":"); json += ecuReset::on ? F("true") : F("false");
   json += F(",\"ecu_resets\":"); json += ecuReset::pulses;
+  // Real ABS ECU check (Nano D9 / D10 -> testbench -> ECU -> D7 / D8): "unknown" (not checked yet),
+  // "ok", "rear_no_return", "front_no_return", "disconnected", "reset" (relay); null without live
+  // data or with older Nano firmware. ecu_checking: knob turned in the last 3 s (white lamp).
+  static const char* const ECU_KEYS[6] = {"\"unknown\"", "\"ok\"", "\"rear_no_return\"", "\"front_no_return\"",
+                                          "\"disconnected\"", "\"reset\""};
+  json += F(",\"ecu\":");
+  json += fresh && latest.ecuField ? ECU_KEYS[ecuState()] : "null";
+  json += F(",\"ecu_checking\":"); json += fresh && ecuCheck.on() ? F("true") : F("false");
+  json += F(",\"knob_hz\":"); json += latest.knobHz;  // Knob setting (Hz), also while the outputs are cut.
   json += F(",\"bad_frames\":"); json += badFrames;
   json += F(",\"uptime_ms\":"); json += millis();
   json += '}';
@@ -295,7 +344,8 @@ void loop() {
       } else Serial.print(F("n/a (old sender firmware)"));
       Serial.print(F(" | DECLOG D2 ")); Serial.print(latest.declogHz, 1);
       Serial.print(F(" Hz | REF1 ")); Serial.print(latest.ref1V, 2);
-      Serial.print(F(" V | BATTERY ")); Serial.print(latest.batteryV, 2);
+      Serial.print(F(" V | ECU ")); Serial.print(latest.ecuField ? ecuText(ecuState()) : "n/a (old Nano firmware)");
+      Serial.print(F(" | BATTERY ")); Serial.print(latest.batteryV, 2);
       if (latest.gens) {
         const bool mega = latest.sender == AbsData::MEGA;
         const bool enc = latest.speedSel != 0;  // Sender with the speed encoder.
@@ -348,6 +398,16 @@ void loop() {
   // ABS light: follows the rear speed while live; losing the link resets it
   // (the next start begins with it on).
   if (fresh) absLamp.update(d.speedKmh); else absLamp.reset();
+  // Real ECU check from the Nano; the reset relay (GPIO13) overrides it while on.
+  if (fresh) {
+    static AbsData::Ecu logged = AbsData::ECU_UNKNOWN;
+    if (ecuState() != logged) {
+      logged = ecuState();
+      Serial.print(F("# ECU ")); Serial.println(ecuText(logged));
+    }
+  } else { ecuCheck.resync(); nanoEcu = AbsData::ECU_UNKNOWN; }
+  d.ecu = ecuState();
+  d.ecuChecking = fresh && ecuCheck.on();
   d.absLamp = absLampOn(fresh);
   encoderNav();
   pagePotFollow.update(fresh, nav == Nav::FREE);

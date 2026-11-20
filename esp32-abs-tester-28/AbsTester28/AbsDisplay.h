@@ -80,6 +80,17 @@ struct AbsData {
   uint8_t potPage;               // Page picked by the pot, 1-3.
   uint8_t speedSel;              // Wheel the sender's speed encoder adjusts: 1 rear, 2 front, 0 none / older firmware.
   bool absLamp;                  // ABS light: Nano D13 input, or AbsLamp (rear speed).
+  // Real ABS ECU check, from the Nano (25th / 26th A1 fields): its D9 / D10
+  // outputs go through the testbench and the ECU and come back on D7 / D8.
+  //   ECU_UNKNOWN  not checked yet (knob at 0 since start-up)
+  //   ECU_OK       pulses come back on both wheels
+  //   ECU_REAR / ECU_FRONT  that wheel's pulses don't come back (REAR / FRONT NO RETURN)
+  //   ECU_LOST     neither comes back (ECU DISCONNECTED)
+  //   ECU_RESET    the GPIO13 relay is cutting the ECU power (ESP32 side)
+  enum Ecu : uint8_t { ECU_UNKNOWN, ECU_OK, ECU_REAR, ECU_FRONT, ECU_LOST, ECU_RESET } ecu;
+  bool ecuField;                 // Frame carries the ECU check (26 fields).
+  bool ecuChecking;              // Knob turned in the last 3 s: white CHECKING lamp.
+  uint16_t knobHz;               // Nano knob setting in Hz (27 fields), also while D9 / D10 are cut.
 };
 
 inline const char* senderName(AbsData::Sender s) {
@@ -180,6 +191,7 @@ char shown[SLOT_COUNT][40];
 uint32_t lastGaugeMs = 0, lastTextMs = 0, selfTestStartMs = 0;
 bool selfTestActive = false;
 int32_t shownGaugeKey[2] = {-1, -1};
+int shownKnobHz = -2;  // Knob Hz in the page 1 gauge (-1 = no knob lamp).
 float easeFront = 0, easeInput = 0, easeDeclog = 0;  // Needle positions, eased toward the readings.
 
 // True (and remembered) when a slot's content key differs from what is shown.
@@ -426,7 +438,121 @@ void drawDial2(aa::Buf& b, uint8_t which) {
 // v: the reading in the gauge's unit; signal false = NO SIGNAL on the plate.
 // adjust (page 1): the Mega's speed encoder sets this wheel, shown by an
 // amber title dot and ADJUST after the title.
-void renderGauge2(float v, uint8_t which, bool signal, bool adjust = false) {
+// ecu (page 1): the real ABS ECU lamp at the top right of the gauge panel
+// (EcuLamp below). Faults: red lamp + Offline here, the reason in the REAR bar panel (ecuOffline).
+//   green lamp + Online (ECU OK), white + Checking (knob turned), amber +
+//   Reset (GPIO13 relay), grey lamp alone (not checked yet), red + Offline for
+//   ECU DISCONNECTED / REAR or FRONT NO RETURN.
+//   -1 = no lamp (self-test, older Nano firmware). lit false = the dark
+//   phase of a blink.
+constexpr int8_t ECU_CHECK = 6;  // View only: the white CHECKING lamp.
+constexpr uint16_t WHITE = rgb(0xff, 0xff, 0xff);
+const uint16_t ECU_COLORS[7] = {MUTED, GREEN, RED, RED, RED, AMBER, WHITE};
+inline bool ecuFault(int8_t ecu) {
+  return ecu == AbsData::ECU_REAR || ecu == AbsData::ECU_FRONT || ecu == AbsData::ECU_LOST;
+}
+
+// Round warning light (as the ABS / TCS lights): lit with glow, or dark.
+void ecuLight(aa::Buf& b, float cx, float cy, uint16_t c, bool lit) {
+  if (lit) {
+    aa::circle(b, cx, cy, 8.5f, aa::mix(PANEL, c, 70));  // Glow.
+    aa::circle(b, cx, cy, 6, c);
+    aa::circle(b, cx - 1.8f, cy - 1.8f, 1.8f, aa::mix(c, TEXT, 170));  // Highlight.
+  } else {
+    aa::circle(b, cx, cy, 6, OFF_EDGE);
+    aa::circle(b, cx, cy, 5, OFF_FILL);
+  }
+}
+
+// Knob lamp (page 1, under the top-right lamp while the ECU check fails):
+// D9 / D10 are cut (no output), so this amber lamp and the Hz beside it show
+// the "isolated" frequency the knob is set to. 6-1500 Hz is far too fast to
+// see, so it blinks at a scaled rate: 1 Hz at 6 Hz (1 km/h) rising to 8 Hz at
+// 1500 Hz (250 km/h); knob at 0 = lamp off. knobHz < 0 = not shown.
+constexpr float KNOB_BLINK_MIN = 1, KNOB_BLINK_MAX = 8, KNOB_MAX_HZ = 1500;
+inline float knobBlinkHz(float hz) {
+  if (hz <= 0) return 0;
+  return KNOB_BLINK_MIN + (min(hz, KNOB_MAX_HZ) - 6) * (KNOB_BLINK_MAX - KNOB_BLINK_MIN) / (KNOB_MAX_HZ - 6);
+}
+float knobPhase = 0;      // Blink cycles, 0-1.
+uint32_t knobLastMs = 0;
+// Call every loop: true while the knob lamp is in its lit half.
+bool knobBlink(uint16_t knobHz) {
+  const uint32_t now = millis();
+  const float dt = min((now - knobLastMs) / 1000.0f, 0.2f);
+  knobLastMs = now;
+  if (!knobHz) { knobPhase = 0; return false; }
+  knobPhase += knobBlinkHz(knobHz) * dt;
+  knobPhase -= floorf(knobPhase);
+  return knobPhase < 0.5f;
+}
+
+void ecuBadge(aa::Buf& b, int8_t ecu, bool lit, int knobHz = -1, bool knobLit = false) {
+  if (ecu < 0) return;
+  static const char* const LABELS[7] = {"", "Online", "Offline", "Offline", "Offline", "Reset", "Checking"};
+  const uint16_t c = ECU_COLORS[ecu];
+  const float cx = P2X + P2W - 16, cy = P2Y + 13;  // Level with the gauge title dot.
+  ecuLight(b, cx, cy, c, lit);
+  // Same font and baseline as the FRONT title.
+  if (*LABELS[ecu]) aa::text(b, aaLabel, LABELS[ecu], cx - 13, P2Y + 18, lit ? c : aa::mix(PANEL, c, 120), aa::RIGHT, 1);
+  if (knobHz < 0) return;
+  // Knob lamp and Hz, one row below, lined up with the lamp and text above.
+  char hz[12];
+  snprintf(hz, sizeof(hz), "%d Hz", knobHz);
+  ecuLight(b, cx, cy + 20, AMBER, knobLit);
+  aa::text(b, aaLabel, hz, cx - 13, P2Y + 38, knobHz ? AMBER : DIM, aa::RIGHT, 1);
+}
+
+// REAR bar panel while the ECU check fails (page 1): red stripe and the
+// reason, centred in the panel (the red lamp, Offline and the knob lamp are
+// at the top right of the gauge panel).
+void ecuOffline(int8_t ecu) {
+  const char* reason = ecu == AbsData::ECU_REAR ? "No REAR return signal"
+                     : ecu == AbsData::ECU_FRONT ? "No FRONT return signal" : "ABS Disconnected";
+  constexpr int MID = P2X + P2W / 2;
+  render(P2X, DY, P2W, DH, [&](aa::Buf& b) {
+    aa::fill(b, BG);
+    panel(b, P2X, DY, P2W, DH);
+    aa::roundRect(b, P2X + 1, DY + 1, 4, DH - 2, 2, RED);
+    aa::text(b, aaLabel, reason, MID, DY + 16, RED, aa::CENTER, 1);
+    aa::text(b, aaSmall, "Turn the knob to check again", MID, DY + 29, MUTED, aa::CENTER);
+  });
+}
+
+// ECU lamp state, run every loop (on every page, so coming back to page 1
+// never blinks by itself): each status change blinks the lamp 5 times
+// (200 ms off / 200 ms on), then it stays on. A knob turn shows the white
+// CHECKING lamp for 3 s (steady); then the current status comes back,
+// blinking 5 times if it differs from the one shown before.
+constexpr uint32_t ECU_BLINK_MS = 200;
+constexpr uint8_t ECU_BLINKS = 5;
+struct EcuView { int8_t status; bool lit; };
+uint8_t ecuShown = AbsData::ECU_UNKNOWN;
+uint32_t ecuBlinkStartMs = 0;
+bool ecuBlinking = false;
+EcuView ecuLamp(const AbsData& d, uint32_t now) {
+  if (d.link != AbsData::LIVE || !d.ecuField) {
+    ecuShown = AbsData::ECU_UNKNOWN;  // Link back: starts from "not checked", no blink.
+    ecuBlinking = false;
+    return {-1, false};
+  }
+  if (d.ecuChecking && d.ecu != AbsData::ECU_RESET) return {ECU_CHECK, true};
+  if (d.ecu != ecuShown) {
+    ecuShown = d.ecu;
+    ecuBlinking = true;
+    ecuBlinkStartMs = now;
+  }
+  bool lit = true;
+  if (ecuBlinking) {
+    const uint32_t phase = (now - ecuBlinkStartMs) / ECU_BLINK_MS;  // Even = off, odd = on.
+    if (phase >= 2u * ECU_BLINKS) ecuBlinking = false;
+    else lit = phase % 2;
+  }
+  return {int8_t(ecuShown), lit};
+}
+
+void renderGauge2(float v, uint8_t which, bool signal, bool adjust = false, int8_t ecu = -1, bool ecuLit = true,
+                  int knobHz = -1, bool knobLit = false) {
   const BigGauge& g = BIG_GAUGES[which];
   const uint8_t dialPage = pageOf(which);  // dialBg holds this page's face.
   char digits[6];
@@ -440,6 +566,7 @@ void renderGauge2(float v, uint8_t which, bool signal, bool adjust = false) {
       aa::circle(b, 16, P2Y + 13, 3.5f, AMBER);
       aa::text(b, aaSmall, "ADJUST", 24 + aa::textWidth(aaLabel, g.title) + 6, P2Y + 18, AMBER, aa::LEFT, 1);
     }
+    ecuBadge(b, ecu, ecuLit, knobHz, knobLit);
     const float a = angleOf(signal ? v : 0, g.maxV);
     const float redA = angleOf(g.redFrom, g.maxV);
     if (which == G_FRONT) {
@@ -766,6 +893,8 @@ void update(const AbsData& d, uint8_t page, uint8_t sel = 0, bool locked = false
     lastGaugeMs = lastTextMs = 0;
   }
   const uint32_t testMs = now - selfTestStartMs;
+  const EcuView ev = ecuLamp(d, now);  // Every loop, so the blink timing holds on any page.
+  const bool knobLit = knobBlink(d.knobHz);  // Knob lamp blink, every loop so it stays even.
   if (selfTestActive && (!running || testMs >= SELF_TEST_MS)) selfTestActive = false;
   const bool selfTest = selfTestActive;
 
@@ -777,10 +906,14 @@ void update(const AbsData& d, uint8_t page, uint8_t sel = 0, bool locked = false
       const float front = selfTest ? sweep : ease(easeFront, constrain(d.frontKmh, 0.0f, ABS_SPEED_MAX), 0.2f);
       const bool have = selfTest || d.front;
       const bool adjust = !selfTest && d.speedSel == 2;  // Speed encoder on FRONT.
-      const int32_t key = lroundf(front * 4) | int32_t(have) << 16 | int32_t(adjust) << 17;
-      if (key != shownGaugeKey[0]) {
+      const int8_t ecu = selfTest ? -1 : ev.status;  // Real ECU lamp, top right.
+      // Knob lamp under it while the ECU check fails (-1 = not shown).
+      const int knob = ecu >= 0 && ecuFault(d.ecu) ? int(d.knobHz) : -1;
+      const int32_t key = lroundf(front * 4) | int32_t(have) << 16 | int32_t(adjust) << 17 | int32_t(ecu + 1) << 18 | int32_t(ev.lit) << 22 | int32_t(knob >= 0 && knobLit) << 23;
+      if (key != shownGaugeKey[0] || knob != shownKnobHz) {
         shownGaugeKey[0] = key;
-        renderGauge2(front, G_FRONT, have, adjust);
+        shownKnobHz = knob;
+        renderGauge2(front, G_FRONT, have, adjust, ecu, ev.lit, knob, knobLit);
       }
     } else if (mode == PAGE2) {
       // Speed sensor: Hz / 6 = km/h (0-20); no pulses = NO SIGNAL.
@@ -815,8 +948,15 @@ void update(const AbsData& d, uint8_t page, uint8_t sel = 0, bool locked = false
                                 : constrain(d.speedKmh, 0.0f, ABS_SPEED_MAX);
     const bool adjust = !selfTest && d.speedSel == 1;  // Speed encoder on REAR.
     char key[16];
-    snprintf(key, sizeof(key), "%.0f %d", rear, adjust);
-    if (changed(S_BAR0, key)) drawBigBar(G_FRONT, rear, true, adjust);
+    if (!selfTest && d.ecuField && ecuFault(d.ecu)) {
+      // No return signal: the REAR panel shows the reason instead of the bar
+      // (also while the white Checking lamp is on).
+      snprintf(key, sizeof(key), "E%d", int(d.ecu));
+      if (changed(S_BAR0, key)) ecuOffline(d.ecu);
+    } else {
+      snprintf(key, sizeof(key), "%.0f %d", rear, adjust);
+      if (changed(S_BAR0, key)) drawBigBar(G_FRONT, rear, true, adjust);
+    }
   } else if (mode == PAGE2) {
     const bool signal = d.inputHz > 0;
     const float kmh = constrain(d.inputHz / INPUT_HZ_PER_KMH, 0.0f, INPUT_MAX_KMH);

@@ -124,7 +124,7 @@ constexpr uint8_t SAMPLES = 20;
 const uint8_t inputPins[2] = {A3, A4};          // REF1 A3, battery A4.
 
 SoftwareSerial esp(6, 5);  // TX D5 -> ESP32 GPIO16. RX D6 is never listened on (stopListening), so D6 is the speed sensor input.
-char linkBuffer[128];
+char linkBuffer[144];
 
 // D7: Speed 1 and RPM, D8: Speed 2, D2: Declog, D6: page 2 speed sensor.
 // Rising edges, sampled at 20 kHz: Timer2 runs free at 500 kHz, so each sample
@@ -174,7 +174,10 @@ float readInput(uint8_t i) {
 // single wheel the speed encoder adjusts (always 0: the knob drives both),
 // the D6 speed sensor Hz x100, the D13 ABS light button (1 = light on, button released),
 // the D6 sensor state (0 pulses OK, 1 open / short = stuck LOW, 2 stuck HIGH),
-// the knob-click ECU reset counter (0-255, ESP32 GPIO13 relay; 24 fields, the ESP32's MAX_FIELDS frame), then
+// the knob-click ECU reset counter (0-255, ESP32 GPIO13 relay), the ECU check code (0 not checked,
+// 1 OK, 2 rear no return, 3 front no return, 4 both = ECU disconnected) and the knob turn counter
+// (0-255, ESP32 white CHECKING lamp), the knob setting in whole Hz (0-1500, sent even while D9 / D10
+// are cut, for the ESP32's blinking knob lamp; 27 fields, the ESP32's MAX_FIELDS frame), then
 // an XOR checksum of everything before '*'. The ESP32 shows
 // these values as they are.
 // Wheel Hz -> km/h, Hz / 6 with a low-speed band matching the knob output
@@ -198,7 +201,7 @@ void readVolts() {
 
 void sendFrame() {
   const unsigned int* mv = voltsMv;
-  const int count = snprintf(linkBuffer, sizeof(linkBuffer), "A1,1,%u,%lu,%u,%u,0,0,%u,%lu,%u,%u,%u,%u,%lu,%lu,%lu,%lu,0,0,%u,%lu,%u,%u,%u",
+  const int count = snprintf(linkBuffer, sizeof(linkBuffer), "A1,1,%u,%lu,%u,%u,0,0,%u,%lu,%u,%u,%u,%u,%lu,%lu,%lu,%lu,0,0,%u,%lu,%u,%u,%u,%u,%u,%u",
     unsigned(speedEnc::braking),
     (unsigned long)(frequencyHz1 * 100 + 0.5), unsigned(speed1 * 100 + 0.5), mv[0], mv[1],
     (unsigned long)(frequencyHz2 * 100 + 0.5), unsigned(speed2 * 100 + 0.5),
@@ -206,7 +209,9 @@ void sendFrame() {
     (unsigned long)(declogHz * 100 + 0.5), (unsigned long)(potgen::outHz(0) * 100 + 0.5),
     (unsigned long)(potgen::outHz(1) * 100 + 0.5), (unsigned long)(potgen::outHz(2) * 100 + 0.5),
     0u, (unsigned long)(min(sensorHz, 10000.0f) * 100 + 0.5),  // ESP32 limit: 10 kHz.
-    unsigned(absInputOn), unsigned(sensorState), unsigned(ecuResetCount));
+    unsigned(absInputOn), unsigned(sensorState), unsigned(ecuResetCount),
+    unsigned(speedEnc::ecuCode()), unsigned(speedEnc::turnCount),
+    unsigned(speedEnc::frontHz()));  // Knob setting in Hz (also while the outputs are cut).
   if (count < 0 || count > int(sizeof(linkBuffer) - 5)) return;
   uint8_t checksum = 0;
   for (int i = 0; i < count; i++) checksum ^= uint8_t(linkBuffer[i]);
@@ -428,6 +433,14 @@ void loop() {
     if (speedEnc::cut[0]) Serial.print(" | D9 REAR CUT (no D7 input)");
     if (speedEnc::cut[1]) Serial.print(" | D10 FRONT CUT (no D8 input)");
     Serial.println();
+    Serial.print(F("ECU: "));
+    switch (speedEnc::ecuCode()) {
+      case 1: Serial.println(F("OK")); break;
+      case 2: Serial.println(F("REAR NO RETURN (D9 -> D7)")); break;
+      case 3: Serial.println(F("FRONT NO RETURN (D10 -> D8)")); break;
+      case 4: Serial.println(F("DISCONNECTED (no D7 / D8 return)")); break;
+      default: Serial.println(F("NOT CHECKED (turn the knob)"));
+    }
     speedEnc::printStatus(Serial);
     Serial.print("Declog pot A2 -> D3: ");
     Serial.print(potgen::outHz(2), 0);

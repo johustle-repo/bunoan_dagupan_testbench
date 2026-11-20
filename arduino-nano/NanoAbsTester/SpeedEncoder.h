@@ -124,11 +124,29 @@ bool active = true;  // false: another ESP32 page is shown, D9 / D10 (and D4 / D
 // at least every INPUT_WAIT_MS (also the start-up window after the output
 // starts); otherwise that output is cut (stopped LOW, D4 / D11 with it).
 // A cut output comes back by itself as soon as its input shows pulses again,
-// or for a new 1 s try on a short knob click. Turning the knob only sets the
-// speed it comes back at; it never restarts a cut output.
+// or for a new 1 s try on a short knob click or a knob turn (ECU check; the
+// ESP32 shows CHECKING). Turning also sets the speed it comes back at.
 constexpr unsigned long INPUT_WAIT_MS = 1000;
 bool cut[2] = {false, false};                // [0] rear D9, [1] front D10.
 unsigned long lastInputMs[2] = {0, 0};       // Last edge seen (or window start).
+
+// Real ABS ECU check from the same loop (knob -> D9 / D10 -> testbench -> ECU
+// -> D7 / D8): per wheel, RET_OK once its output runs and pulses come back,
+// RET_FAIL once it is cut (nothing came back). The last result is kept (also
+// at 0 km/h, when nothing can be checked) until a new one. Sent to the ESP32
+// as one code (ecuCode(), 25th A1 field).
+enum : uint8_t { RET_UNKNOWN, RET_OK, RET_FAIL };
+uint8_t ret[2] = {RET_UNKNOWN, RET_UNKNOWN};
+// 0 not checked yet, 1 ECU OK, 2 REAR NO RETURN, 3 FRONT NO RETURN, 4 both = ECU DISCONNECTED.
+inline uint8_t ecuCode() {
+  if (ret[0] == RET_FAIL && ret[1] == RET_FAIL) return 4;
+  if (ret[0] == RET_FAIL) return 2;
+  if (ret[1] == RET_FAIL) return 3;
+  return ret[0] == RET_OK || ret[1] == RET_OK ? 1 : 0;
+}
+// Knob turns on page 1 (0-255, wraps), 26th A1 field: the ESP32 lights its
+// white CHECKING lamp for 3 s on each change.
+uint8_t turnCount = 0;
 
 void apply() {
   potgen::setWheel(0, active && !cut[0] ? rearHz() : 0);   // D9 rear.
@@ -151,15 +169,21 @@ void checkInputs(unsigned long now, bool rearEdge, bool frontEdge) {
     if (cut[c]) {
       if (!edge[c]) continue;
       cut[c] = false;  // Input is back (pulses from elsewhere): output back on.
+      ret[c] = RET_OK;
       lastInputMs[c] = now;
       apply();
       Serial.println(c ? F("# INPUT CHECK: D8 input back -> D10 FRONT output on")
                        : F("# INPUT CHECK: D7 input back -> D9 REAR output on"));
       continue;
     }
-    if (!active || hz[c] == 0 || edge[c]) { lastInputMs[c] = now; continue; }  // Not running or input OK.
+    if (!active || hz[c] == 0 || edge[c]) {  // Not running, or input OK.
+      if (active && hz[c] && edge[c]) ret[c] = RET_OK;  // Output running and coming back.
+      lastInputMs[c] = now;
+      continue;
+    }
     if (now - lastInputMs[c] >= INPUT_WAIT_MS) {
       cut[c] = true;
+      ret[c] = RET_FAIL;
       apply();
       Serial.println(c ? F("# INPUT CHECK: no D8 input -> D10 FRONT output cut (back when D8 pulses return or on a knob click)")
                        : F("# INPUT CHECK: no D7 input -> D9 REAR output cut (back when D7 pulses return or on a knob click)"));
@@ -221,6 +245,14 @@ void update(unsigned long now) {
     lastClickMs = now;
     kmh = constrain(kmh + clicks * (fast ? FAST_STEP_KMH : 1), 0, MAX_STEPS);
     if (!braking && !recovering) outKmh = kmh;  // Braking: kmh is where the wheels climb back to.
+    ++turnCount;  // ESP32: white CHECKING lamp for 3 s.
+    // ECU check: a cut output gets a new 1 s try at the knob speed (pulses
+    // back within 1 s = ECU OK again, otherwise cut again).
+    if (cut[0] || cut[1]) {
+      cut[0] = cut[1] = false;
+      lastInputMs[0] = lastInputMs[1] = now;
+      Serial.println(F("# ECU CHECK: knob turned -> outputs on for a 1 s try"));
+    }
     apply();
     log();
   }
