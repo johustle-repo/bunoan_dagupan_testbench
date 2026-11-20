@@ -3,7 +3,7 @@
 
 // Wi-Fi dashboard for the ABS tester, served from flash at http://192.168.4.1/.
 // Shows everything the three LCD pages show, on one screen:
-//   header: SEN VCC (REF1) | ABS TESTER + link pill | BAT;
+//   header: SEN VCC (REF1) | BAT;
 //   row 1 (LCD page 1): the FRONT 0-250 km/h speedometer (green) with the
 //     REAR speed bar below it and the real ABS ECU lamp (Online / Offline /
 //     Reset / Checking) at its top right; while the ECU check fails, the
@@ -37,13 +37,7 @@ main{max-width:1000px;margin:0 auto;padding:max(14px,env(safe-area-inset-top)) 1
 .panel{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--edge);border-radius:14px;
 box-shadow:0 8px 24px rgba(0,0,0,.35),inset 0 1px 0 rgba(255,255,255,.03);transition:opacity .3s,filter .3s,border-color .3s}
 .num{font-variant-numeric:tabular-nums}
-header{display:grid;grid-template-columns:1fr auto 1fr;gap:12px;align-items:stretch}
-.brand{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;padding:8px 16px}
-.brand h1{margin:0;font-size:20px;font-weight:800;letter-spacing:1.5px;white-space:nowrap}
-.brand h1 b{color:var(--accent)}
-.pill{padding:3px 12px;border-radius:999px;font-weight:800;font-size:12px;letter-spacing:1px;color:var(--bg);
-background:var(--red);transition:background .3s}
-.pill.live{background:var(--green);box-shadow:0 0 14px rgba(61,220,132,.45)}.pill.off{background:var(--amber)}
+header{display:grid;grid-template-columns:1fr 1fr;gap:12px;align-items:stretch}
 .tile{position:relative;padding:10px 16px 10px 26px;display:flex;align-items:center;justify-content:space-between;gap:10px}
 .tile:before{content:'';position:absolute;left:12px;top:50%;margin-top:-7px;height:14px;width:4px;border-radius:2px;background:var(--c)}
 .tile span{color:var(--c);font-size:15px;font-weight:700;letter-spacing:1px}
@@ -127,7 +121,7 @@ footer{display:flex;flex-wrap:wrap;align-items:center;gap:10px 20px;padding:10px
    laptop >= 1100  : FRONT on the left, SPEED SENSOR / DECLOG stacked on the
                      right, dials sized to fit the screen height (no scrolling);
    PC     >= 1600  : the same, wider, with bigger text. */
-@media(max-width:640px){header{grid-template-columns:1fr 1fr}.brand{grid-column:1/-1;grid-row:1;flex-direction:row;justify-content:space-between}
+@media(max-width:640px){
 .tile strong{font-size:28px}.row{grid-template-columns:1fr}.bar-row{grid-template-columns:auto minmax(0,1fr) 88px}
 main{padding-left:max(10px,env(safe-area-inset-left));padding-right:max(10px,env(safe-area-inset-right));gap:10px}
 footer{gap:10px 14px;font-size:14px}.lamp{font-size:15px}.gauge h2{font-size:14px}}
@@ -143,12 +137,12 @@ footer{gap:10px 14px;font-size:14px}.lamp{font-size:15px}.gauge h2{font-size:14p
  .gauge{display:flex;flex-direction:column;min-height:0}
  .gauge>*{flex:none}
  .gauge svg{flex:1 1 0;min-height:80px;width:100%;height:100%;max-width:none}
- .tile strong{font-size:40px}.tile span{font-size:16px}.brand h1{font-size:24px}
+ .tile strong{font-size:40px}.tile span{font-size:16px}
  .gauge h2{font-size:17px}.bar-row strong{font-size:24px}.bar-row b{font-size:17px}
  .lamp{font-size:18px}.lamp i{width:20px;height:20px}footer{font-size:16px}}
 @media(min-width:1600px){
  main{max-width:1840px;padding:24px 32px 26px;gap:18px}
- .tile strong{font-size:48px}.tile span{font-size:18px}.brand h1{font-size:28px}.pill{font-size:14px}
+ .tile strong{font-size:48px}.tile span{font-size:18px}
  .gauge h2{font-size:20px}.bar-row strong{font-size:28px}.bar-row b{font-size:19px}
  .lamp{font-size:20px}.lamp i{width:22px;height:22px}footer{font-size:18px;padding:12px 20px}}
 /* Laptop / PC tall enough: the whole dashboard fits the screen (no scrolling). */
@@ -157,7 +151,6 @@ footer{gap:10px 14px;font-size:14px}.lamp{font-size:15px}.gauge h2{font-size:14p
 </style></head><body><main>
 <header>
  <div class="panel tile" style="--c:var(--accent)" id="ref1Tile"><span>SEN VCC</span><strong class="num" id="ref1">—</strong></div>
- <div class="panel brand"><h1><b>ABS</b> TESTER</h1><span class="pill" id="pill">WAITING</span></div>
  <div class="panel tile" style="--c:var(--amber)" id="batTile"><span>BAT</span><strong class="num" id="battery">—</strong></div>
 </header>
 <div class="panel banner" id="banner" style="--c:var(--red)">
@@ -223,7 +216,7 @@ function card(p,o){
  <text x="130" y="113" text-anchor="middle" font-size="8" fill="var(--muted)" letter-spacing=".5" id="${p}Unit">${o.unit}</text>
  <text x="130" y="138" text-anchor="middle" font-size="26" font-weight="800" fill="var(--text)" class="num" id="${p}Val">--</text>
 </svg><div class="bar-row" id="${p}Row"><b id="${p}BarName">${o.bar}</b>${o.noBar?'<span></span>':`<div class="track"><div class="fill" id="${p}Bar"></div></div>`}<strong class="num"><span id="${p}Text">--</span><small>${o.pct?'%':o.unit}</small></strong></div>
- <div class="err" id="${p}Err" hidden><span id="${p}ErrTitle">NO SPEED SENSOR READING</span><small>Check the sensor and its wire</small></div>
+ <div class="err" id="${p}Err" hidden><span id="${p}ErrTitle">NO SPEED SENSOR READING</span><small id="${p}ErrText">Check the sensor and its wire</small></div>
  ${o.logic?'<div class="logic"><span class="lamp y" id="loLamp"><i></i>LOW</span><span class="lamp g" id="hiLamp"><i></i>HIGH</span></div>':''}`;}
 for(const p in D)card(p,D[p]);
 // v: reading in the dial's unit; have false: needle parked, "--".
@@ -268,8 +261,6 @@ function volts(id,v){if(typeof v!=='number'){$(id).textContent='—';return;}
 const PAGES=['SPEED','SENSOR','DECLOG'];
 function show(d){
  const live=d.link==='live',on=live&&d.key;
- $('pill').textContent=!live?(d.link==='stale'?'NO LINK':'WAITING'):d.key?'LIVE':'KEY OFF';
- $('pill').className='pill'+(on?' live':live?' off':'');
  // Banner: why the sender's readings are missing (the speed sensor keeps going).
  const mega=d.sender==='mega',name=mega?'Mega':'Nano';
  $('banner').hidden=on;
@@ -309,10 +300,14 @@ function show(d){
  const EC={unknown:['','var(--muted)'],ok:['Online','var(--green)'],rear_no_return:['Offline','var(--red)'],
   front_no_return:['Offline','var(--red)'],disconnected:['Offline','var(--red)'],reset:['Reset','var(--amber)'],checking:['Checking','#fff']}[ecu];
  $('ecuBadge').hidden=!EC;
- const kOn=!!EC&&/no_return|disconnected/.test(ecu)&&typeof d.knob_hz==='number';
+ const fail=!!EC&&/no_return|disconnected/.test(ecu),kOn=fail&&typeof d.knob_hz==='number';
  knob=kOn?d.knob_hz:0;$('knobRow').hidden=!kOn;
  if(EC){$('ecuState').style.setProperty('--c',EC[1]);$('ecuText').textContent=EC[0];$('ecuDot').classList.toggle('dark',ecu==='unknown');
   $('knobText').textContent=Math.floor(knob/6)+'kph';$('knobRow').style.setProperty('--c',knob>0?'var(--amber)':'var(--dim)');}
+ // The reason replaces the REAR bar row while the check fails (as on the LCD).
+ $('frontErrTitle').textContent=ecu==='rear_no_return'?'NO REAR RETURN SIGNAL':ecu==='front_no_return'?'NO FRONT RETURN SIGNAL':'ABS DISCONNECTED';
+ $('frontErrText').textContent='Turn the knob to check again';
+ $('frontErr').hidden=!fail;$('frontRow').hidden=fail;$('frontCard').classList.toggle('fault',fail);
  // Speed sensor (Nano D6, or GPIO34 on the ESP32): always shown.
  // (Unreachable ESP32: the card dims instead of claiming a sensor fault.)
  const esp=d.uptime_ms!==undefined,sig=esp&&typeof d.input_kmh==='number';
