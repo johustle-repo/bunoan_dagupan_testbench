@@ -5,7 +5,9 @@
 // Shows everything the three LCD pages show, on one screen:
 //   header: SEN VCC (REF1) | ABS TESTER + link pill | BAT;
 //   row 1 (LCD page 1): the FRONT 0-250 km/h speedometer (green) with the
-//     REAR speed bar below it;
+//     REAR speed bar below it and the real ABS ECU lamp (Online / Offline /
+//     Reset / Checking) at its top right; while the ECU check fails, the
+//     blinking knob lamp and the isolated knob speed in kph sit below it;
 //   row 2: SPEED SENSOR (LCD page 2: 0-120 Hz = 0-20 km/h, numbers every 4,
 //     the speed text without a bar, the LOW (yellow) / HIGH (green) logic
 //     lamps, and the sensor fault messages) and DECLOG (LCD page 3: 0-100 Hz
@@ -82,7 +84,14 @@ footer{display:flex;flex-wrap:wrap;align-items:center;gap:10px 20px;padding:10px
 .chip.sel{color:var(--amber);border-color:var(--amber)}.chip.lock{color:var(--accent);border-color:var(--accent)}
 .gens{display:flex;flex-wrap:wrap;gap:6px 16px;font-weight:600;color:var(--muted)}
 .gens b{color:var(--accent);font-weight:700}.gens .adj,.gens .adj b{color:var(--amber)}
-.gauge h2 .adjTag{color:var(--amber);font-weight:800;letter-spacing:1px}
+.gauge h2 .adjTag{color:var(--amber);font-weight:800;letter-spacing:1px;margin-right:auto}
+/* Real ABS ECU lamp, top right of the FRONT card (as on LCD page 1); the knob
+   lamp and its kph hang below it while the ECU check fails. */
+.ecu{position:relative;display:flex;flex-direction:column;align-items:flex-end}
+.ecu>span{display:inline-flex;align-items:center;gap:8px;font-size:14px;font-weight:800;letter-spacing:1px;color:var(--c)}
+.ecu i{width:14px;height:14px;border-radius:50%;background:var(--c);box-shadow:0 0 10px var(--c);transition:background .1s,box-shadow .1s}
+.ecu i.dark{background:var(--off);border:2px solid var(--offEdge);box-shadow:none}
+.ecu .knob{position:absolute;right:0;top:100%;margin-top:6px;white-space:nowrap}
 .stamp{margin-left:auto;font-weight:500;font-size:12px;color:var(--muted);letter-spacing:.5px}
 .lamp.y.lit i{background:radial-gradient(circle at 35% 35%,#fff6b3 0,#ffd82a 55%);box-shadow:0 0 14px rgba(255,216,42,.75)}
 .lamp.g.lit i{background:radial-gradient(circle at 35% 35%,#c9ffe0 0,var(--green) 55%);box-shadow:0 0 14px rgba(61,220,132,.75)}
@@ -182,7 +191,7 @@ const $=id=>document.getElementById(id),CX=130,CY=140;
 // HIGH logic lamps), Declog 0-100 Hz. bar: the name on the bar row (the
 // FRONT card's bar shows the REAR speed, as on LCD page 1).
 const D={
- front:{label:'FRONT',bar:'REAR',max:250,minor:10,major:50,red:210,unit:'km/h',needle:'var(--green)',speed:true},
+ front:{label:'FRONT',bar:'REAR',max:250,minor:10,major:50,red:210,unit:'km/h',needle:'var(--green)',speed:true,ecu:true},
  sensor:{label:'SPEED SENSOR',bar:'SPEED',max:20,minor:1,major:4,red:21,unit:'km/h',needle:'var(--red)',noBar:true,logic:true,dec:1},
  declog:{label:'DECLOG',bar:'DECLOG',max:100,minor:5,major:25,red:1e9,unit:'Hz',needle:'var(--red)',pct:true}};
 const clamp=(v,m)=>Math.min(Math.max(+v||0,0),m);
@@ -201,7 +210,7 @@ function card(p,o){
   if(major){const a=v==0?-.17:v==o.max?.17:0,[tx,ty]=pt(v-a*o.max/Math.PI,77);
    t+=`<text x="${tx}" y="${ty+4}" text-anchor="middle" fill="${c}" font-size="11" font-weight="600">${v}</text>`;}}
  const n=o.needle;
- $(p+'Card').innerHTML=`<h2>${o.label}<small class="adjTag" id="${p}Adj"></small></h2><svg viewBox="0 0 260 150" aria-label="${o.label}">
+ $(p+'Card').innerHTML=`<h2>${o.label}<small class="adjTag" id="${p}Adj"></small>${o.ecu?'<span class="ecu" id="ecuBadge" hidden><span id="ecuState"><b id="ecuText"></b><i id="ecuDot"></i></span><span class="knob num" id="knobRow"><b id="knobText"></b><i id="knobDot"></i></span></span>':''}</h2><svg viewBox="0 0 260 150" aria-label="${o.label}">
  <path d="M14 140A116 116 0 0 1 246 140Z" fill="var(--face)"/>
  <path d="M10 140A120 120 0 0 1 250 140" fill="none" stroke="var(--edge)" stroke-width="1.2"/>
  <path d="M22 140A108 108 0 0 1 238 140" fill="none" stroke="var(--track)" stroke-width="9"/>
@@ -243,12 +252,15 @@ setInterval(lamps,125);
 // (green, logic 1) alternate at a visible rate that rises with the input:
 // the real rate up to 2 Hz, then 2 Hz rising to 8 Hz at 120 Hz. No pulses:
 // stuck LOW (open / short) = LOW steady, stuck HIGH = HIGH steady.
-let logic={hz:0,fault:null,live:false},phase=0,lastT=0;
+let logic={hz:0,fault:null,live:false},phase=0,lastT=0,knob=0,knobPhase=0;
 function logicFrame(t){const dt=Math.min((t-lastT)/1000,.2);lastT=t;
  let lvl=-1;const f=logic.hz;
  if(logic.live&&f>0){const r=f<=2?f:2+(Math.min(f,120)-2)*6/118;phase=(phase+r*dt)%1;lvl=phase<.5?1:0;}
  else if(logic.live&&logic.fault==='open_short')lvl=0;else if(logic.live&&logic.fault==='stuck_high')lvl=1;
  $('loLamp').classList.toggle('lit',lvl===0);$('hiLamp').classList.toggle('lit',lvl===1);
+ // Knob lamp, as on the LCD: 1 Hz at 6 Hz (1 km/h) rising to 8 Hz at 1500 Hz; knob at 0 = dark.
+ if(knob>0)knobPhase=(knobPhase+(1+(Math.min(knob,1500)-6)*7/1494)*dt)%1;else knobPhase=0;
+ $('knobDot').classList.toggle('dark',!(knob>0&&knobPhase<.5));
  requestAnimationFrame(logicFrame);}
 requestAnimationFrame(logicFrame);
 function volts(id,v){if(typeof v!=='number'){$(id).textContent='—';return;}
@@ -288,6 +300,19 @@ function show(d){
  // relay is cutting the ABS ECU's power (2 s after a knob click).
  lampStates=on?{absLamp:d.abs_lamp,tcsLamp:d.tcs_lamp,brakeLamp:d.brake?'on':'off',ecuLamp:d.ecu_reset?'on':'off'}
   :{ecuLamp:d.ecu_reset?'on':'off'};lamps();
+ // Real ABS ECU check (as on LCD page 1): green Online, red Offline (no
+ // return signal / disconnected), amber Reset (GPIO13 relay), white Checking
+ // (knob turned), grey lamp alone (not checked yet); hidden without live data
+ // or with older Nano firmware. While it fails, the knob lamp and the
+ // isolated knob speed (knob Hz / 6, whole kph) show below it.
+ const ecu=live&&d.ecu?(d.ecu_checking&&d.ecu!=='reset'?'checking':d.ecu):null;
+ const EC={unknown:['','var(--muted)'],ok:['Online','var(--green)'],rear_no_return:['Offline','var(--red)'],
+  front_no_return:['Offline','var(--red)'],disconnected:['Offline','var(--red)'],reset:['Reset','var(--amber)'],checking:['Checking','#fff']}[ecu];
+ $('ecuBadge').hidden=!EC;
+ const kOn=!!EC&&/no_return|disconnected/.test(ecu)&&typeof d.knob_hz==='number';
+ knob=kOn?d.knob_hz:0;$('knobRow').hidden=!kOn;
+ if(EC){$('ecuState').style.setProperty('--c',EC[1]);$('ecuText').textContent=EC[0];$('ecuDot').classList.toggle('dark',ecu==='unknown');
+  $('knobText').textContent=Math.floor(knob/6)+'kph';$('knobRow').style.setProperty('--c',knob>0?'var(--amber)':'var(--dim)');}
  // Speed sensor (Nano D6, or GPIO34 on the ESP32): always shown.
  // (Unreachable ESP32: the card dims instead of claiming a sensor fault.)
  const esp=d.uptime_ms!==undefined,sig=esp&&typeof d.input_kmh==='number';
