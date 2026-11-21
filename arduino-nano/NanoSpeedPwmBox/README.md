@@ -19,8 +19,8 @@ One Nano, three sections (from the hand drawing and pin list, 2026-11-21):
 | **D6** | OUT | **Freq 1 output in pot**, 0–1500 Hz square wave (encoder km/h × 6), 50 % duty, 0–5 V |
 | **D5** | OUT | **Freq 2 output in pot**, the same frequency as D6, in phase |
 | **D12** | OUT | **60 Hz logic 1, LOCKED**: LOW at power-up, HIGH once Freq 1 input reaches 60 Hz (10 km/h), then stays HIGH whatever the input does. Only a power restart or the Nano RESET button makes it LOW again |
-| **D3** | OUT | **Fade**: 15 kHz PWM (15.04 kHz), duty **100 % → 0 % in 3 s** (linear), then LOW. LOW until the first encoder long press |
-| **A2 / A1 / A0** | IN | **EC11 encoder** A → A2, B → A1, C (button) → A0, + → 5V, GND → GND. **Turn:** speed 0–250 km/h (D6 / D5 = km/h × 6 Hz), 1 km/h per click, 5 when spun fast. **Long press (1 s):** start the D3 fade (again) |
+| **D3** | OUT | **Fade**: 15 kHz PWM (15.04 kHz), duty **100 % → 0 % in 3 s** (linear), then LOW. **Or, knob on D3:** a 0–15000 Hz square wave, 50 % duty, set with the encoder (within ~0.4 %) |
+| **A2 / A1 / A0** | IN | **EC11 encoder** A → A2, B → A1, C (button) → A0, + → 5V, GND → GND. **Short press:** switch the knob between **SPEED** and **D3**. **Turn (SPEED):** 0–250 km/h (D6 / D5 = km/h × 6 Hz), 1 km/h per click, 5 spun fast. **Turn (D3):** 0–15000 Hz, 100 Hz per click, 500 spun fast; D3 keeps it when the knob goes back to SPEED. **Long press (1 s):** start the D3 fade (again) |
 | **D4 / D2** | 2-wire | **TM1637** CLK → D4, DIO → D2, VCC → 5V, GND → GND. Auto-detected |
 | **A4 / A5** | I2C | **OLED** SDA → A4, SCL → A5, VCC → 5V, GND → GND (SSD1306 128×64, 0x3C or 0x3D). Auto-detected |
 | GND | | Common ground with whatever drives D8 / D7 |
@@ -49,6 +49,7 @@ How: the TM1637 is sent a command and its acknowledge bit is read; the OLED is a
 |---|---|
 | ` 120` | speed in km/h (= Freq output in pot ÷ 6) |
 | `F 73` | `F` + fade duty % while the D3 fade runs (`F100` → `F  0`), then back to the speed |
+| `15:00` | knob on D3: the D3 frequency in kHz, the colon is the point (`15:00` = 15.00 kHz, ` 2:50` = 2.50 kHz) |
 
 **OLED** (SSD1306 128×64): speedometer 0–250 kph.
 
@@ -59,6 +60,8 @@ F73%                     [LOCK]      <- fade duty while fading / D12 locked
 720Hz      120 kph                   <- Freq output in pot, speed = Hz / 6
 IN1 120         IN2 120              <- Freq 1 / 2 input in km/h
 ```
+
+With the knob on **D3** the same gauge shows the **D3 frequency, 0–15000 Hz** (scale ends `0` / `15k`, ticks every 1500 Hz): the big number is the D3 Hz, `D3` at the top left, and the bottom row turns white with `KNOB: D3  0-15000 Hz`. No speed is shown in D3 mode.
 
 A 1.3" SH1106 OLED is not supported by this library (it would show a shifted picture).
 

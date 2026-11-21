@@ -20,9 +20,11 @@
 //   D5   OUT  Freq 2 output in pot, the same frequency as D6, in phase
 //   D12  OUT  60 Hz logic 1: HIGH (LOCKED) once Freq 1 input >= 60 Hz (10 km/h);
 //             only a power restart or the RESET button makes it LOW again
-//   D3   OUT  Fade: 15 kHz PWM, 100 % -> 0 % duty in 3 s on an encoder long press, then LOW (Timer2 OC2B)
+//   D3   OUT  Fade: 15 kHz PWM, 100 % -> 0 % duty in 3 s on an encoder long press, then LOW;
+//             or, knob on D3, a 0-15000 Hz square wave set by hand, 50 % duty (Timer2 OC2B)
 //   Encoder (EC11) A -> A2, B -> A1, C (button) -> A0, + -> 5V, GND -> GND
-//        turn: speed 0-250 km/h, 1 km/h per click (5 when spun fast)
+//        turn: speed 0-250 km/h, 1 km/h per click (5 when spun fast), or D3 Hz
+//        short press: knob on speed <-> knob on D3 (0-15000 Hz, 100 Hz per click, 500 fast)
 //        long press (1 s): start the D3 fade (again)
 //   D4 / D2   TM1637 CLK / DIO (4 digits), auto-detected
 //   A4 / A5   OLED SDA / SCL (SSD1306 128x64 I2C, 0x3C or 0x3D), auto-detected
@@ -121,9 +123,47 @@ void fadeBegin() {
   setFadeDuty(0);
 }
 
+// ============ D3: 0-15000 Hz by hand (Timer2, short press = knob) ===========
+// Same fast PWM mode, but TOP (OCR2A) and the prescaler set the frequency:
+// f = F_CPU / (N x (TOP+1)), the smallest N that fits TOP in 8 bits, 50 %
+// duty (OCR2B = half). 15000 Hz -> /8, TOP 132 (15.04 kHz); 100 Hz -> /1024,
+// TOP 155. Within about 0.4 % of the set value. 0 Hz = LOW.
+constexpr uint16_t D3_MAX_HZ = 15000, D3_STEP_HZ = 100, D3_FAST_STEP_HZ = 500;
+uint16_t d3Hz = 0;  // Set by hand (0 while the fade runs).
+
+void setD3Hz(uint16_t hz) {
+  d3Hz = hz;
+  fadeDuty = 0;
+  struct Pre { uint16_t n; uint8_t cs; };
+  static const Pre PRE[] = {{1, 1}, {8, 2}, {32, 3}, {64, 4}, {128, 5}, {256, 6}, {1024, 7}};
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    if (hz == 0) {
+      TCCR2A &= ~_BV(COM2B1);
+      PORTD &= ~_BV(PD3);
+      return;
+    }
+    for (const Pre& p : PRE) {
+      const uint32_t top = (F_CPU / p.n + hz / 2) / hz - 1;
+      if (top > 255) continue;
+      OCR2A = top;
+      OCR2B = (top + 1) / 2 - 1;  // 50 %.
+      TCCR2B = _BV(WGM22) | p.cs;
+      if (TCNT2 > top) TCNT2 = 0;
+      TCCR2A |= _BV(COM2B1);
+      return;
+    }
+  }
+}
+
 void startFade(uint32_t now) {
   fading = true;
   fadeStartMs = now;
+  d3Hz = 0;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {  // Back to 15 kHz (the knob may have changed it).
+    OCR2A = PWM_TOP;
+    TCCR2B = _BV(WGM22) | _BV(CS21);
+    if (TCNT2 > PWM_TOP) TCNT2 = 0;
+  }
   setFadeDuty(1);
   Serial.println(F("# FADE start: D3 15 kHz, 100 % -> 0 % in 3 s"));
 }
@@ -145,7 +185,8 @@ void updateFade(uint32_t now) {
 
 // ========================= Fade LEDs: bar graph =============================
 // LEDs lit = D3 duty x 3, rounded up: all 3 at 100 %, the top one goes out
-// below 66.7 %, ... LED 1 goes out at 0 %.
+// below 66.7 %, ... LED 1 goes out at 0 %. With D3 set by hand: its
+// frequency / 15000 Hz x 3 instead.
 void ledsBegin() {
   for (uint8_t pin : PIN_LED) { pinMode(pin, OUTPUT); digitalWrite(pin, LOW); }
 }
@@ -153,7 +194,8 @@ void ledsBegin() {
 uint8_t ledsLit = 0;
 
 void updateLeds() {
-  uint8_t lit = fadeDuty <= 0 ? 0 : uint8_t(ceilf(fadeDuty * LED_COUNT - 0.001f));
+  const float level = fading ? fadeDuty : float(d3Hz) / D3_MAX_HZ;
+  uint8_t lit = level <= 0 ? 0 : uint8_t(ceilf(level * LED_COUNT - 0.001f));
   if (lit > LED_COUNT) lit = LED_COUNT;
   if (lit == ledsLit) return;
   ledsLit = lit;
@@ -259,8 +301,11 @@ void encoderBegin() {
 }
 
 int kmh = 0;  // Speed set by the encoder.
+bool knobD3 = false;  // Short press toggles: false = knob sets the speed, true = D3 Hz.
 
-// Turns: 1 km/h per click, 5 when spun fast; D6 / D5 = km/h x 6 Hz.
+// Turns: speed (1 km/h per click, 5 when spun fast; D6 / D5 = km/h x 6 Hz),
+// or, with the knob on D3, D3 0-15000 Hz (100 Hz per click, 500 fast).
+// Turning on D3 during a fade stops the fade and carries on from 0 Hz.
 void updateEncoder(uint32_t now) {
   static uint32_t lastClickMs = 0;
   int8_t clicks;
@@ -269,6 +314,13 @@ void updateEncoder(uint32_t now) {
   if (ENC_REVERSE) clicks = -clicks;
   const bool fast = clicks > 1 || clicks < -1 || now - lastClickMs < FAST_MS;
   lastClickMs = now;
+  if (knobD3) {
+    fading = false;
+    const long hz = constrain(long(d3Hz) + clicks * long(fast ? D3_FAST_STEP_HZ : D3_STEP_HZ), 0L, long(D3_MAX_HZ));
+    setD3Hz(hz);
+    Serial.print(F("# D3 ")); Serial.print(hz); Serial.println(F(" Hz"));
+    return;
+  }
   kmh = constrain(kmh + clicks * (fast ? FAST_STEP_KMH : 1), 0, MAX_KMH);
   setOutHz(uint16_t(kmh) * HZ_PER_KMH);
   Serial.print(F("# SPEED ")); Serial.print(kmh); Serial.print(F(" km/h = "));
@@ -400,11 +452,14 @@ void gaugePoint(float v, float r, int16_t& x, int16_t& y) {
 
 bool locked = false;  // D12, set in loop().
 
+// The gauge shows the speed (0-250 kph), or, with the knob on D3, the D3
+// frequency (0-15000 Hz on the same arc: ticks every 1500 Hz, long every 3000).
 void drawOled() {
   oled.clearDisplay();
   oled.setTextColor(SSD1306_WHITE);
   oled.setTextSize(1);
-  // Gauge: arc, ticks every 25 km/h (long every 50), needle.
+  const float gaugeV = knobD3 ? float(d3Hz) * MAX_KMH / D3_MAX_HZ : kmh;  // Needle, in arc units.
+  // Gauge: arc, ticks every 1/10 of the scale (long every 1/5), needle.
   for (int d = 0; d <= 180; d += 3) {
     int16_t x, y;
     gaugePoint(d * MAX_KMH / 180.0f, GR, x, y);
@@ -417,7 +472,7 @@ void drawOled() {
     oled.drawLine(x1, y1, x2, y2, SSD1306_WHITE);
   }
   int16_t nx, ny;
-  gaugePoint(kmh, GR - 8, nx, ny);
+  gaugePoint(gaugeV, GR - 8, nx, ny);
   oled.drawLine(GX, GY, nx, ny, SSD1306_WHITE);
   oled.fillCircle(GX, GY, 2, SSD1306_WHITE);
   // Top corners: fade duty, LOCK.
@@ -431,18 +486,28 @@ void drawOled() {
     oled.setCursor(104, 1); oled.print(F("LOCK"));
     oled.setTextColor(SSD1306_WHITE);
   }
-  // Speed (Freq / 6), big, with the output in pot Hz on the left.
+  // Big value under the gauge, the scale ends outside the arc.
   char s[8];
   oled.setTextSize(2);
-  snprintf(s, sizeof s, "%d", kmh);
+  snprintf(s, sizeof s, "%u", knobD3 ? d3Hz : unsigned(kmh));
   const int16_t w = strlen(s) * 12;
   oled.setCursor(GX - w / 2, 40); oled.print(s);
   oled.setTextSize(1);
-  oled.setCursor(GX + w / 2 + 3, 47); oled.print(F("kph"));
-  oled.setCursor(GX - GR - 8, GY - 7); oled.print(F("0"));     // Scale ends, outside the arc.
-  oled.setCursor(GX + GR + 3, GY - 7); oled.print(F("250"));
+  oled.setCursor(GX + w / 2 + 3, 47); oled.print(knobD3 ? F("Hz") : F("kph"));
+  oled.setCursor(GX - GR - 8, GY - 7); oled.print(F("0"));
+  oled.setCursor(GX + GR + 3, GY - 7); oled.print(knobD3 ? F("15k") : F("250"));
+  // Bottom row, knob on D3 (inverted): "KNOB: D3", Hz only; else the D6 Hz
+  // beside the speed and the inputs in km/h.
+  if (knobD3) {
+    if (!fading) { oled.setCursor(0, 0); oled.print(F("D3")); }  // Top left (the fade % goes there while fading).
+    oled.fillRect(0, 56, 128, 8, SSD1306_WHITE);
+    oled.setTextColor(SSD1306_BLACK);
+    oled.setCursor(2, 57); oled.print(F("KNOB: D3  0-15000 Hz"));
+    oled.setTextColor(SSD1306_WHITE);
+    oled.display();
+    return;
+  }
   oled.setCursor(0, 47); oled.print(outHz); oled.print(F("Hz"));
-  // Inputs, km/h.
   snprintf(s, sizeof s, "%3d", int(in1.hz / HZ_PER_KMH + 0.5f));
   oled.setCursor(0, 57); oled.print(F("IN1 ")); oled.print(s);
   snprintf(s, sizeof s, "%3d", int(in2.hz / HZ_PER_KMH + 0.5f));
@@ -450,13 +515,22 @@ void drawOled() {
   oled.display();  // ~25 ms; the outputs run on timers / interrupts meanwhile.
 }
 
-// TM1637: speed, or F + fade % while fading. Sent only when it changes (and
-// once a second, which also checks it is still there).
+// TM1637: F + fade % while fading; with the knob on D3, the D3 frequency in
+// kHz with the colon as the point ("15:00" = 15.00 kHz, " 2:50" = 2.50 kHz);
+// else the speed. Sent only when it changes (and once a second, which also
+// checks it is still there).
 void drawTm(uint32_t now) {
   static uint8_t shown[4] = {0xFF, 0xFF, 0xFF, 0xFF};
   static uint32_t sentMs = 0;
   uint8_t seg[4];
   if (fading) tmNumber(seg, TM_F, int(fadeDuty * 100 + 0.5f));
+  else if (knobD3) {
+    const uint16_t v = d3Hz / 10;  // 10 Hz units: 1500 = 15.00 kHz.
+    seg[0] = v >= 1000 ? TM_DIGITS[v / 1000] : 0;
+    seg[1] = TM_DIGITS[v / 100 % 10] | 0x80;  // Colon.
+    seg[2] = TM_DIGITS[v / 10 % 10];
+    seg[3] = TM_DIGITS[v % 10];
+  }
   else tmNumber(seg, 0, kmh);
   if (!memcmp(seg, shown, 4) && now - sentMs < 1000) return;
   sentMs = now;
@@ -527,6 +601,10 @@ void loop() {
   if (now - swChangeMs >= 30 && raw != swStable) {
     swStable = raw;
     if (swStable == LOW) { swDownMs = now; longDone = false; }
+    else if (!longDone) {  // Short press (released before 1 s): switch the knob.
+      knobD3 = !knobD3;
+      Serial.println(knobD3 ? F("# KNOB: D3 frequency 0-15000 Hz") : F("# KNOB: speed (D6 / D5)"));
+    }
   }
   if (swStable == LOW && !longDone && now - swDownMs >= 1000) {
     longDone = true;  // Once per press: release and hold again to restart.
@@ -562,7 +640,9 @@ void loop() {
     Serial.print(F(" Hz | IN1 D8 ")); Serial.print(in1.hz, 1); Serial.print(F(" Hz -> D10"));
     Serial.print(F(" | IN2 D7 ")); Serial.print(in2.hz, 1); Serial.print(F(" Hz -> D9"));
     Serial.print(F(" | D12 ")); Serial.print(locked ? F("LOCKED") : F("LOW"));
-    Serial.print(F(" | FADE D3 ")); Serial.print(int(fadeDuty * 100 + 0.5f)); Serial.print(F(" %"));
+    if (fading) { Serial.print(F(" | D3 FADE ")); Serial.print(int(fadeDuty * 100 + 0.5f)); Serial.print(F(" %")); }
+    else { Serial.print(F(" | D3 ")); Serial.print(d3Hz); Serial.print(F(" Hz")); }
+    Serial.print(knobD3 ? F(" | KNOB D3") : F(" | KNOB SPEED"));
     Serial.print(F(" | EC11 A(A2) ")); Serial.print(digitalRead(PIN_ENC_A)); Serial.print(F(" B(A1) ")); Serial.print(digitalRead(PIN_ENC_B)); Serial.print(F(" C(A0) ")); Serial.println(swStable == LOW ? F("pressed") : F("up"));
   }
 }
