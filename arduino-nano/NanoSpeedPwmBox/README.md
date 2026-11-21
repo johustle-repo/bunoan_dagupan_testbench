@@ -1,78 +1,92 @@
 # Nano Speed / PWM Box
 
-Arduino Nano (ATmega328P). Board **Arduino Nano**, processor **ATmega328P (Old Bootloader)** for the bench Nano. Library: **LiquidCrystal I2C** by Frank de Brabander (Library Manager; 1.1.4 tested). USB Serial Monitor: 115200 baud.
+Arduino Nano (ATmega328P). Board **Arduino Nano**, processor **ATmega328P (Old Bootloader)** for the bench Nano. Libraries (Library Manager): **Adafruit SSD1306** and **Adafruit GFX Library**. USB Serial Monitor: 115200 baud.
 
-A rotary encoder sets a speed; two outputs give the matching wheel-speed frequency (**km/h × 6 Hz**, 0–1500 Hz = 0–250 km/h), D5 gives the speed itself (Hz = km/h), two inputs are measured, D12 goes HIGH from 10 km/h, and D6 sweeps from **10 kHz down to 0 Hz in 3 s** on an encoder long press, shown as a bar graph on **7 LEDs**. A 16×2 I2C LCD shows one page at a time.
+One Nano, three sections (from the hand drawing and pin list, 2026-11-21):
 
-## Connector (4 outputs, 2 inputs)
+1. **Fade:** an encoder long press (1 s) starts a **15 kHz PWM** on D3 that fades from **100 % to 0 % duty in 3 s**, shown on **3 LEDs**.
+2. **Inputs:** Freq 1 / Freq 2 input are copied to **Freq 1 / Freq 2 output**. **D12 (60 Hz logic 1)** goes HIGH when Freq 1 input reaches 60 Hz (10 km/h) and stays HIGH (**LOCKED**) until the power is restarted or the Nano RESET button is pressed.
+3. **Speed:** the **EC11 encoder** sets 0–250 km/h. **Freq 1 / Freq 2 output in pot** give km/h × 6 Hz (0–1500 Hz). A **TM1637** (4 digits) shows the speed and the fade; a 0.96" I2C **OLED**, if connected, shows the speed (Freq ÷ 6) on a 0–250 kph speedometer. The display type is **auto-detected**.
+
+## Pins
 
 | Nano | Dir | Function |
 |---|---|---|
-| **D10** | OUT | Freq Out, 0–1500 Hz square wave (speed × 6), 50 % duty, 0–5 V |
-| **D9** | — | **Not used.** On this board D9 is wired to A5 (LCD SCL), so the sketch leaves it as an input. Use D10 for Freq Out |
-| **D6** | OUT | **Fade:** on an encoder long press, a 50 % square wave sliding linearly from **10 kHz to 0 Hz in 3 s**, then LOW. A new long press starts it again |
-| **D5** | OUT | **Speed:** D10 ÷ 6, so its Hz = km/h (0–250 Hz), 50 % duty |
-| **D8** | IN | Freq In 1, 0–5 V square wave, km/h = Hz ÷ 6. **Internal pull-up on**: unconnected it reads 0 Hz (no mains hum), and open-collector Hall sensors work |
-| **A6** | IN | Freq In 2, 0–5 V square wave, km/h = Hz ÷ 6. A6 is an analog-only pin, so the ADC samples it 19 200 times a second: an edge counts when it rises above **3.5 V**, and it must drop below **1.5 V** before the next one. **No pull-up**: for an open-collector Hall sensor add a 10 kΩ resistor from A6 to 5V |
-| GND | | Common ground with whatever drives D8 / A6 |
-
-## Extra pins
-
-| Part | Nano | Use |
-|---|---|---|
-| 10 km/h logic out | **D12** | HIGH while Freq In 1 (D8) ≥ 10 km/h (60 Hz), LOW again below 9.5 km/h |
-| Rotary encoder (DFRobot EC11) | A → **A2**, B → **A1**, C (button) → **A0**, + → 5V, GND → GND | Turn: depends on the page (see below). Short press: next display page. **Long press (1 s): start the D6 fade** |
-| 16×2 LCD, I2C backpack (PCF8574) | SDA → **A4**, SCL → **A5**, VCC → 5V, GND → GND | One page at a time, via the LiquidCrystal_I2C library. Address set by `LCD_ADDR` (0x27; change to 0x3F if nothing shows). Shows "Arduino Nano / Speed/PWM Box" for 1 s at start-up. If the screen is lit but blank, turn the contrast screw on the back |
-| 7 fade LEDs | LED 1 → **D3**, 2 → **D11**, 3 → **A3**, 4 → **D2**, 5 → **D4**, 6 → **D7**, 7 → **D13** | Bar graph of the D6 frequency (see below) |
+| **D10** | OUT | **Freq 1 output**: copy of Freq 1 input (D8), follows every edge a few µs later |
+| **D9** | OUT | **Freq 2 output**: copy of Freq 2 input (D7). ⚠ On the earlier perfboard D9 was bridged to A5 (SCL); if the display stays blank, the start-up check on the Serial Monitor prints `!! pin 9 pulls SCL(A5) LOW` |
+| **D8** | IN | **Freq 1 input**, 0–5 V square wave. Internal pull-up on: unconnected = 0 Hz, open-collector Hall sensors work |
+| **D7** | IN | **Freq 2 input**, 0–5 V square wave. Internal pull-up on, as D8 |
+| **D6** | OUT | **Freq 1 output in pot**, 0–1500 Hz square wave (encoder km/h × 6), 50 % duty, 0–5 V |
+| **D5** | OUT | **Freq 2 output in pot**, the same frequency as D6, in phase |
+| **D12** | OUT | **60 Hz logic 1, LOCKED**: LOW at power-up, HIGH once Freq 1 input reaches 60 Hz (10 km/h), then stays HIGH whatever the input does. Only a power restart or the Nano RESET button makes it LOW again |
+| **D3** | OUT | **Fade**: 15 kHz PWM (15.04 kHz), duty **100 % → 0 % in 3 s** (linear), then LOW. LOW until the first encoder long press |
+| **A2 / A1 / A0** | IN | **EC11 encoder** A → A2, B → A1, C (button) → A0, + → 5V, GND → GND. **Turn:** speed 0–250 km/h (D6 / D5 = km/h × 6 Hz), 1 km/h per click, 5 when spun fast. **Long press (1 s):** start the D3 fade (again) |
+| **D4 / D2** | 2-wire | **TM1637** CLK → D4, DIO → D2, VCC → 5V, GND → GND. Auto-detected |
+| **A4 / A5** | I2C | **OLED** SDA → A4, SCL → A5, VCC → 5V, GND → GND (SSD1306 128×64, 0x3C or 0x3D). Auto-detected |
+| GND | | Common ground with whatever drives D8 / D7 |
 
 ### Fade LEDs
 
-Wire each LED as: Nano pin → **220–330 Ω resistor** → LED long leg (+), LED short leg (−) → GND. Put them in a row, LED 1 at the bottom, LED 7 at the top.
+| LED | 1 (bottom) | 2 | 3 (top) |
+|---|---|---|---|
+| Nano | **A3** | D11 | D13 |
 
-LEDs lit = D6 frequency ÷ 10 kHz × 7, rounded up: all 7 at 10 kHz, then one goes out about every 1430 Hz (every 0.43 s of the 3 s sweep), top first. All are off when D6 stops.
+Only 3 LEDs: D6 / D7 are Freq 1 output in pot / Freq 2 input, A1 / A2 are the encoder and D2 / D4 are the TM1637.
 
-| D6 | LEDs |
+Wire each LED as: Nano pin → **220–330 Ω resistor** → LED long leg (+), LED short leg (−) → GND.
+
+LEDs lit = D3 duty × 3, rounded up: all 3 at 100 %, then one goes out every 1 s of the 3 s fade, top first. All are off at 0 %. LED 3 (D13) is in parallel with the Nano's onboard L LED, so both blink briefly on reset.
+
+### Display (auto-detected)
+
+Each display is looked for at start-up and then every 2 s while it is missing, so it can be plugged in while the box runs; a TM1637 that stops answering is looked for again. Either one, or both at once, can be connected. The Serial Monitor prints `# TM1637 found (CLK D4, DIO D2)` / `# OLED found at 0x3C`, or `... not found`.
+
+How: the TM1637 is sent a command and its acknowledge bit is read; the OLED is an I2C probe of 0x3C, then 0x3D.
+
+**TM1637** (4 digits): shows `----` for 0.5 s at start-up.
+
+| Shows | When |
 |---|---|
-| 10 000 Hz | ●●●●●●● |
-| 7 000 Hz | ●●●●●○○ |
-| 4 000 Hz | ●●●○○○○ |
-| 1 000 Hz | ●○○○○○○ |
-| 0 Hz | ○○○○○○○ |
+| ` 120` | speed in km/h (= Freq output in pot ÷ 6) |
+| `F 73` | `F` + fade duty % while the D3 fade runs (`F100` → `F  0`), then back to the speed |
 
-LED 7 (D13) is in parallel with the Nano's onboard L LED, so both blink briefly on reset (the bootloader blinks D13).
-
-### LCD pages
-
-Short press: next page. A long press jumps to **FADE**. `█` = a lit LED.
+**OLED** (SSD1306 128×64): speedometer 0–250 kph.
 
 ```
-OUT 120 km/h        IN1 D8 120.0km/h    IN2 A6 120.0km/h    FADE D6  7000 Hz
-D10    720 Hz       720.0Hz  10k:ON     720.0Hz             [█████  ] RUN
+F73%                     [LOCK]      <- fade duty while fading / D12 locked
+          ,--''''--.
+ 0      /     \     \    250         <- gauge 0-250 kph, ticks every 25
+720Hz      120 kph                   <- Freq output in pot, speed = Hz / 6
+IN1 120         IN2 120              <- Freq 1 / 2 input in km/h
 ```
 
-The IN1 page also shows the D12 10 km/h output (`ON` / `--`). On the FADE page, `RUN` = the 3 s fade is running, `KNOB` = D6 is set by hand.
+A 1.3" SH1106 OLED is not supported by this library (it would show a shifted picture).
 
+## Changes from the previous version (rewire these)
 
-What turning the knob does (the page stays where it is):
+| Pin | Was | Now |
+|---|---|---|
+| D10 | Freq Out (encoder speed) | **Freq 1 output** = copy of Freq 1 input |
+| D9 | Not used (bridged to SCL) | **Freq 2 output** = copy of Freq 2 input |
+| D7 | Fade LED 6 | **Freq 2 input** (that LED is removed) |
+| A6 | Freq In 2 | Not used |
+| D6 | Fade, 10 kHz → 0 Hz sweep | **Freq 1 output in pot** |
+| D5 | Speed (D10 ÷ 6) | **Freq 2 output in pot** (same Hz as D6) |
+| D3 | Fade LED 1 | **Fade**: 15 kHz, duty 100 % → 0 % (that LED is removed; 3 LEDs left: A3, D11, D13) |
+| D12 | HIGH ≥ 10 km/h, LOW below 9.5 | **Latches** at 60 Hz until power restart or RESET |
+| A0 / A1 / A2 | EC11 encoder | EC11 encoder (unchanged); now sets the D6 / D5 speed, long press = fade |
+| A4 / A5 | 16×2 I2C LCD | 0.96" SSD1306 I2C OLED, auto-detected |
+| D2 / D4 | Fade LEDs 4 / 5 | **TM1637** DIO / CLK, auto-detected |
 
-| Page | Knob turns |
-|---|---|
-| **Out**, **In 1**, **In 2** | Speed 0–250 km/h, so D10 = km/h × 6 Hz and D5 = km/h. 1 km/h per click, 5 spun fast. On an In page you can loop an output back to the input and watch it |
-| **FADE** | D6 frequency by hand, 0–10 000 Hz, 100 Hz per click, 500 Hz spun fast. The 7 LEDs follow it. Turning during a running fade stops the fade and carries on from where it was |
+## How it works
 
-Free pins: A7 (analog input only). D0 / D1 are the USB serial port.
-
-Earlier versions had Freq In 2 on D7, an active buzzer on D13 and a TM1637 display on D2 / D4. D7, D13, D2 and D4 now drive LEDs, Freq In 2 moved to A6, and the 16×2 LCD replaced the TM1637 (its I2C pins A4 / A5 used to drive LEDs 4 and 5).
-
-## How the outputs are made
-
-- **D10:** Timer1 in CTC mode toggles it in hardware (exact frequency). D9 (OC1A) is left off because it is wired to A5 on this board.
-- **D5:** the Timer1 compare interrupt toggles D5 on every 6th D9 toggle, so D5 is exactly D9 ÷ 6.
-- **D6:** Timer2 in CTC mode; its interrupt toggles D6. The frequency is updated every 10 ms along the 3 s sweep, with the prescaler stepping /8 → /32 → … → /1024 as it drops. Below about 31 Hz the output stops LOW.
-- **LEDs:** updated from loop() whenever the number lit changes.
+- **D6 / D5:** Timer1 in CTC mode with no pins; its compare interrupt toggles D6 and D5 in one write, so they are always in phase. (D5 / D6 are Timer0's PWM pins, and Timer0 runs millis(), so they can't be driven by a timer in hardware.)
+- **D3:** Timer2 fast PWM, TOP 132, /8 = 15.04 kHz, 133 duty steps; the duty is updated every 5 ms. 100 % and 0 % hold the pin HIGH / LOW.
+- **D10 / D9:** the D8 / D7 pin-change interrupts write the input level straight to the output.
+- **Encoder:** decoded in the A2 / A1 pin-change interrupt (4 transitions per click).
 
 ## Settings (top of `NanoSpeedPwmBox.ino`)
 
-`MAX_KMH`, `HZ_PER_KMH` (6), `LOGIC_ON_KMH` / `LOGIC_OFF_KMH` (10 / 9.5), `FADE_START_HZ` (10000), `FADE_MS` (3000), `FADE_STEP_HZ` / `FADE_FAST_STEP_HZ` (100 / 500), `STEPS_PER_CLICK` (4), `ENC_REVERSE`, `PIN_LED` (LED order).
+`MAX_KMH` (250), `HZ_PER_KMH` (6), `LOCK_HZ` (59.5: 60 Hz with a little measuring margin), `FADE_MS` (3000), `FAST_STEP_KMH` (5), `STEPS_PER_CLICK` (4), `ENC_REVERSE`, `PIN_LED` (LED order).
 
-Timers: Timer0 = millis(), Timer1 = D9 / D10 / D5, Timer2 = D6 fade, so analogWrite(), tone() and Servo can't be used. The ADC runs free on A6, so analogRead() can't be used either.
+Timers: Timer0 = millis(), Timer1 = D6 / D5, Timer2 = D3 PWM, so analogWrite(), tone() and Servo can't be used.
