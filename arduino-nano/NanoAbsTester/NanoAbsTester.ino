@@ -7,6 +7,7 @@
 #include "SupplyVoltage.h"
 #include "SpeedEncoder.h"
 #include "PageSelect.h"
+#include "DeclogEncoder.h"
 
 #if !defined(__AVR_ATmega328P__)
 #error "Select Arduino Uno or Arduino Nano (ATmega328P)."
@@ -23,34 +24,38 @@
 //   the 21st frame field; the ESP32 uses it instead of its GPIO34. With no
 //   pulses the D6 level is the 23rd field: LOW = "OPEN OR SHORT SENSOR",
 //   HIGH = "NO PULSE (STUCK HIGH)" on the ESP32 page 2.
-//   D13 ABS light button for the ESP32 screen: wire a push button from D13
-//   to 5V (no resistor). The ABS light is ON while the button is released
-//   (the Nano's onboard LED and its resistor hold D13 LOW) and OFF while it
-//   is pressed (D13 HIGH; the onboard L LED lights too). Sent as the 22nd
-//   frame field (1 = light on). (The TCS LED that was on D13 is gone: no free pin. TCS is still
-//   worked out here and shown on the ESP32 screen and dashboard.)
-//   D12 ABS LED: on when D7 is at least 10 % and 5 km/h slower than D8
+//   A7 ABS light button for the ESP32 screen: A7 -> push button -> 5V, plus
+//   10 kOhm A7 -> GND (A7 is analog-only, read with analogRead). The ABS
+//   light is ON while the button is released (A7 LOW) and OFF while it is
+//   pressed (A7 HIGH). Sent as the 22nd frame field (1 = light on). (No TCS
+//   LED: no free pin. TCS is still worked out here and shown on the ESP32
+//   screen and dashboard.)
+//   D13 ABS LED (the onboard L LED lights with it): on when D7 is at least
+//   10 % and 5 km/h slower than D8
 //   A3 Reference 1, A4 battery: 0-5 V at the pin mapped to 0-30 V
 //   through the PCB calibration table (same formula as the ECU testbench).
 //   Frequency generators (PotGenerator.h), 50 % duty 0-5 V square waves:
 //   rear -> D9 0-1500 Hz and front -> D10 0-1500 Hz set by the DFRobot EC11 (SEN0235) speed
 //   encoder (SpeedEncoder.h: A -> A0, B -> A1, C -> A5; turn = both wheels
-//   together, click = fresh start of page 1 at 0 km/h, double click = TCS test, hold = brake), Declog pot
-//   A2 -> D3 0-100 Hz. Jumper D9 -> D7, D10 -> D8, D3 -> D2 to self-test.
+//   together, click = fresh start of page 1 at 0 km/h, double click = TCS test, hold = brake), and
+//   Declog -> D3 0-100 Hz set by the page / Declog encoder (DeclogEncoder.h:
+//   A -> A2, B -> D12, SW -> A6; press = next page, turn = Declog on page 3).
+//   Jumper D9 -> D7, D10 -> D8, D3 -> D2 to self-test.
 //   Divided outputs: D4 = D9 / 6 (0-250 Hz, Hz = km/h), D11 = D10 / 15 (0-100 Hz), 50 % duty.
 //   D5 (TX) -> ESP32 RX2 (GPIO16), common GND, 115200 8N1, one-way
 //   (SoftwareSerial; the USB Serial Monitor stays on the normal Serial port).
-//   ESP32 GPIO5 -> A6, GPIO14 -> A7: the page on the ESP32 screen
-//   (PageSelect.h). Only that page's signals run, the rest are off / read 0:
-//     page 1 SPEED:  D9 / D10 out, D4 (/6) / D11 (/15) out, D7 / D8 in, D12 ABS LED
+//   The page is chosen here (encoder press, PageSelect.h) and sent to the
+//   ESP32 as the 28th frame field; the ESP32 screen follows it. Only that
+//   page's signals run, the rest are off / read 0:
+//     page 1 SPEED:  D9 / D10 out, D4 (/6) / D11 (/15) out, D7 / D8 in, D13 ABS LED
 //     page 2 SENSOR: D6 in only, no outputs
 //     page 3 DECLOG: D3 out, D2 in
-//   With both wires LOW (or not connected and reading LOW) everything runs.
 // SoftwareSerial owns the pin-change interrupts, so Timer2 (compare A) samples
 // D2, D6, D7 and D8 at 20 kHz instead (up to about 10 kHz per input).
 
-const byte ABS_IN = 13;  // ABS light button to 5V: released (LOW) = light on, pressed (HIGH) = off.
-const byte ABS_LED = 12;
+const byte ABS_IN = A7;  // ABS light button to 5V, 10 kOhm to GND: released (LOW) = light on, pressed (HIGH) = off.
+const int ABS_PRESSED_ABOVE = 512;  // A7 reading (analog-only pin).
+const byte ABS_LED = 13;
 
 // Speeds and Declog are measured every 100 ms and sent to the ESP32 10 times
 // a second, so the gauges follow the pots without lag. REF1 / battery are
@@ -82,7 +87,7 @@ unsigned long lastPublish = 0, lastVoltsMs = 0, lastReportMs = 0;
 unsigned int voltsMv[2] = {0, 0};  // REF1, battery, as sent to the ESP32.
 
 bool speedsEqual = true;
-bool absInputOn = true;  // D13 ABS light button (on until pressed), read every 100 ms.
+bool absInputOn = true;  // A7 ABS light button (on until pressed), read every 100 ms.
 // ECU reset counter: +1 on every knob click (fresh start), sent as the 24th
 // A1 field. The ESP32 fires its GPIO13 relay on each +1 step, which cuts the
 // ABS ECU's power for 2 s so it boots fresh (latched error cleared).
@@ -150,6 +155,7 @@ ISR(TIMER2_COMPA_vect) {
   previousHigh3 = high3;
   previousHigh4 = high4;
   speedEnc::sample();
+  declogEnc::sample();
 }
 
 // Reads A3 / A4 exactly like the ECU testbench: averages 20 readings 1 ms
@@ -169,15 +175,17 @@ float readInput(uint8_t i) {
 // A1 frame: key (always 1), brake (1 while the EC11 knob is held: SpeedEncoder.h), D7 Hz x100, speed 1 x100,
 // REF1 mV, REF2 (unused, 0), current (unused, 0), battery mV, D8 Hz x100,
 // speed 2 x100, RPM, TCS (1 steady, 0 blinking), ABS (1 active), D2 Declog
-// Hz x100, the rear (D9) / front (D10) encoder and Declog (A2 pot -> D3)
+// Hz x100, the rear (D9) / front (D10) encoder and Declog (encoder -> D3)
 // generator outputs in Hz x100, 0,0 (the Mega's old page pot slots), the
 // single wheel the speed encoder adjusts (always 0: the knob drives both),
-// the D6 speed sensor Hz x100, the D13 ABS light button (1 = light on, button released),
+// the D6 speed sensor Hz x100, the A7 ABS light button (1 = light on, button released),
 // the D6 sensor state (0 pulses OK, 1 open / short = stuck LOW, 2 stuck HIGH),
 // the knob-click ECU reset counter (0-255, ESP32 GPIO13 relay), the ECU check code (0 not checked,
 // 1 OK, 2 rear no return, 3 front no return, 4 both = ECU disconnected) and the knob turn counter
 // (0-255, ESP32 white CHECKING lamp), the knob setting in whole Hz (0-1500, sent even while D9 / D10
-// are cut, for the ESP32's blinking knob lamp; 27 fields, the ESP32's MAX_FIELDS frame), then
+// are cut, for the ESP32's blinking knob lamp) and the page (1-3, chosen with the page / Declog
+// encoder; the ESP32 screen follows it), the encoder nav state (0 free, 1 selecting, 2 locked,
+// 3 Declog adjust) and the selected page (1-3 while selecting, else 0) (30 fields, the ESP32's MAX_FIELDS frame), then
 // an XOR checksum of everything before '*'. The ESP32 shows
 // these values as they are.
 // Wheel Hz -> km/h, Hz / 6 with a low-speed band matching the knob output
@@ -201,7 +209,7 @@ void readVolts() {
 
 void sendFrame() {
   const unsigned int* mv = voltsMv;
-  const int count = snprintf(linkBuffer, sizeof(linkBuffer), "A1,1,%u,%lu,%u,%u,0,0,%u,%lu,%u,%u,%u,%u,%lu,%lu,%lu,%lu,0,0,%u,%lu,%u,%u,%u,%u,%u,%u",
+  const int count = snprintf(linkBuffer, sizeof(linkBuffer), "A1,1,%u,%lu,%u,%u,0,0,%u,%lu,%u,%u,%u,%u,%lu,%lu,%lu,%lu,0,0,%u,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%u",
     unsigned(speedEnc::braking),
     (unsigned long)(frequencyHz1 * 100 + 0.5), unsigned(speed1 * 100 + 0.5), mv[0], mv[1],
     (unsigned long)(frequencyHz2 * 100 + 0.5), unsigned(speed2 * 100 + 0.5),
@@ -211,7 +219,9 @@ void sendFrame() {
     0u, (unsigned long)(min(sensorHz, 10000.0f) * 100 + 0.5),  // ESP32 limit: 10 kHz.
     unsigned(absInputOn), unsigned(sensorState), unsigned(ecuResetCount),
     unsigned(speedEnc::ecuCode()), unsigned(speedEnc::turnCount),
-    unsigned(speedEnc::frontHz()));  // Knob setting in Hz (also while the outputs are cut).
+    unsigned(speedEnc::frontHz()),   // Knob setting in Hz (also while the outputs are cut).
+    unsigned(pageSel::page),         // Page 1-3 (the ESP32 screen follows it).
+    unsigned(pageSel::nav), unsigned(pageSel::sel));  // Encoder nav (0 free, 1 select, 2 locked, 3 Declog adjust), selected page.
   if (count < 0 || count > int(sizeof(linkBuffer) - 5)) return;
   uint8_t checksum = 0;
   for (int i = 0; i < count; i++) checksum ^= uint8_t(linkBuffer[i]);
@@ -250,6 +260,12 @@ float measureHz(uint8_t i, unsigned long pulses, unsigned long edgeUs, unsigned 
   return lastHz[i];
 }
 
+// Switches the outputs to the page's signals.
+void applyPage() {
+  speedEnc::setActive(pageSel::speedOn());    // D9 / D10 / D4 / D11.
+  potgen::declogEnabled = pageSel::declogOn();  // D3.
+}
+
 void setup() {
   Serial.begin(115200);  // USB Serial Monitor.
   Serial.println(F("# NANO ABS TESTER start (a reset sets both speeds to 0)"));
@@ -262,8 +278,8 @@ void setup() {
   pinMode(2, INPUT);
   for (uint8_t pin : inputPins) pinMode(pin, INPUT);
 
-  pinMode(ABS_IN, INPUT);  // No pull-up: the onboard LED would hold it half-way.
-  pinMode(ABS_LED, OUTPUT);
+  pinMode(ABS_IN, INPUT);  // A7: analog-only, external 10 kOhm to GND.
+  pinMode(ABS_LED, OUTPUT);  // D13, with the onboard L LED.
 
   digitalWrite(ABS_LED, LOW);
 
@@ -284,18 +300,19 @@ void setup() {
     TIMSK2 |= _BV(OCIE2A);
     windowStartUs = micros();
   }
-  potgen::begin();    // Declog pot A2, outputs D9 / D10 / D3.
+  potgen::begin();    // Outputs D9 / D10 / D3.
   speedEnc::begin();  // Speed encoder on A0 / A1 / A5, both wheels at 0 km/h.
+  declogEnc::begin(); // Page / Declog encoder on A2 / D12 / A6, Declog 0 Hz.
+  applyPage();        // Power-up: page 1.
 
 }
 
 void loop() {
   unsigned long now = millis();
-  if (pageSel::update(now)) {  // ESP32 page changed: switch the outputs.
-    speedEnc::setActive(pageSel::speedOn());       // D9 / D10 / D4 / D11.
-    potgen::declogEnabled = pageSel::declogOn();   // D3 (applied on the next pot read).
+  if (declogEnc::update(now)) {  // Encoder lock / long press changed the page: switch the outputs.
+    applyPage();
   }
-  potgen::update(now);    // Declog pot, every 100 ms.
+  potgen::update(declogEnc::hz);  // D3 Declog (0 off page 3).
   speedEnc::update(now);  // Speed encoder turns and button.
 
   if (micros() - windowStartUs >= MEASURE_US) {
@@ -336,7 +353,7 @@ void loop() {
     if (!pageSel::sensorOn()) sensorHz = 0;
     // D6 check before using the reading: no pulses -> look at the level.
     sensorState = sensorHz > 0 ? SENSOR_OK : D6_HIGH() ? SENSOR_STUCK_HIGH : SENSOR_OPEN_SHORT;
-    absInputOn = digitalRead(ABS_IN) == LOW;  // D13 button: released = ABS light on, pressed = off.
+    absInputOn = analogRead(ABS_IN) <= ABS_PRESSED_ABOVE;  // A7 button: released = ABS light on, pressed = off.
 
     float rawSpeed1 = hzToKmh(frequencyHz1);
     float rawSpeed2 = hzToKmh(frequencyHz2);
@@ -375,11 +392,8 @@ void loop() {
   if (now - lastReportMs >= REPORT_MS) {
     lastReportMs = now;
 
-    Serial.print("ESP32 page (A6/A7): ");
-    if (pageSel::page) Serial.print(pageSel::page); else Serial.print("none = all signals on");
-    Serial.print(" | raw A6 "); Serial.print(analogRead(pageSel::PIN_BIT0));
-    Serial.print(" A7 "); Serial.print(analogRead(pageSel::PIN_BIT1));
-    Serial.println(" (HIGH above 400)");
+    Serial.print("Page (encoder press): ");
+    Serial.println(pageSel::page == 1 ? "1 SPEED" : pageSel::page == 2 ? "2 SENSOR" : "3 DECLOG");
 
     Serial.print("D7 Frequency: ");
     Serial.print(frequencyHz1, 1);
@@ -406,7 +420,9 @@ void loop() {
     Serial.print("ABS: ");
     Serial.println(absActive ? "ACTIVE" : "OFF");
 
-    Serial.print("ABS light button (D13): ");
+    Serial.print("ABS light button (A7 ");
+    Serial.print(analogRead(ABS_IN));
+    Serial.print("): ");
     Serial.println(absInputOn ? "released = light ON" : "PRESSED = light OFF");
 
     Serial.print("Declog (D2): ");
@@ -442,9 +458,10 @@ void loop() {
       default: Serial.println(F("NOT CHECKED (turn the knob)"));
     }
     speedEnc::printStatus(Serial);
-    Serial.print("Declog pot A2 -> D3: ");
+    declogEnc::printStatus(Serial);
+    Serial.print("Declog encoder -> D3: ");
     Serial.print(potgen::outHz(2), 0);
-    Serial.println(" Hz");
+    Serial.println(pageSel::declogOn() ? " Hz" : " Hz (off: not page 3)");
 
     Serial.print("Divided: D4 (D9 /"); Serial.print(potgen::DIVIDE[0]); Serial.print(") ");
     Serial.print(potgen::outHz(0) / potgen::DIVIDE[0], 1);

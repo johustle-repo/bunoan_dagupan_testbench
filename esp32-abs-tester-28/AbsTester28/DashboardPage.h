@@ -271,7 +271,7 @@ function show(d){
  $('banner').style.borderColor=live?'rgba(255,181,71,.45)':'rgba(255,75,75,.45)';
  for(const id of['frontCard','declogCard','ref1Tile','batTile'])$(id).classList.toggle('stale',!on);
  $('keyDot').className='dot'+(on?' on':'');$('keyText').textContent=on?'KEY ON':'KEY OFF';
- // LCD page chip: the page shown (the page push button on GPIO4 cycles them).
+ // LCD page chip: the page shown (the Nano page / Declog encoder press cycles them).
  const pg=d.page>=1&&d.page<=3?d.page:1;
  $('pageChip').textContent=`LCD ${pg}/3 ${PAGES[pg-1]}`;$('pageChip').className='chip';
  // Generator settings (no pin names, as on the LCD). With the KY-040 speed
@@ -287,7 +287,7 @@ function show(d){
  $('frontAdj').textContent=enc==='front'?' · ADJUST':'';
  $('frontBarName').textContent=enc==='rear'?'REAR · ADJUST':'REAR';
  $('frontBarName').style.color=enc==='rear'?'var(--amber)':'';
- // BRAKE: the Nano knob hold or the GPIO15 button; ECU RESET: the GPIO13
+ // BRAKE: the Nano speed encoder hold; ECU RESET: the GPIO13
  // relay is cutting the ABS ECU's power (2 s after a knob click).
  lampStates=on?{absLamp:d.abs_lamp,tcsLamp:d.tcs_lamp,brakeLamp:d.brake?'on':'off',ecuLamp:d.ecu_reset?'on':'off'}
   :{ecuLamp:d.ecu_reset?'on':'off'};lamps();

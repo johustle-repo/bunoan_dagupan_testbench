@@ -7,10 +7,10 @@
 // 0-5 V square waves:
 //   Rear:   speed encoder -> D9  (Timer1 OC1A), 0-1500 Hz (1500 Hz = 250 km/h)
 //   Front:  speed encoder -> D10 (Timer1 OC1B), 0-1500 Hz
-//   Declog: pot on A2     -> D3  (made in the 20 kHz Timer2 sampler), 0-100 Hz
-//   The KY-040 speed encoder (SpeedEncoder.h) sets rear / front with
-//   setWheel(). Declog pot (10 kOhm): one end -> GND, wiper -> A2, other end
-//   -> 5V (100 nF wiper-GND optional). At 0 Hz the output stops LOW.
+//   Declog: page / Declog encoder -> D3 (made in the 20 kHz Timer2 sampler), 0-100 Hz
+//   The speed encoder (SpeedEncoder.h) sets rear / front with setWheel();
+//   the page / Declog encoder (DeclogEncoder.h, turned on page 3) sets the
+//   Declog through update(). At 0 Hz the output stops LOW.
 // Jumper D9 -> D7, D10 -> D8 and D3 -> D2 to test the tester itself.
 //
 // The ATmega328P has only one free 16-bit timer, so D9 and D10 share Timer1
@@ -30,7 +30,6 @@
 
 namespace potgen {
 
-constexpr uint8_t DECLOG_POT = A2;  // A0 / A1 are the speed encoder's CLK / DT now.
 constexpr uint8_t REAR_OUT = 9, FRONT_OUT = 10, DECLOG_OUT = 3;
 // Divided outputs: D4 = D9 / 6 (1500 Hz -> 250 Hz), D11 = D10 / 15 (1500 Hz -> 100 Hz), 50 % duty.
 // D4 uses the same /6 as the speed formula, so its Hz equals the wheel's km/h
@@ -50,8 +49,6 @@ inline void divLow(uint8_t c) {
   if (c) PORTB &= ~_BV(PB3); else PORTD &= ~_BV(PD4);
 }
 constexpr uint16_t MAX_WHEEL_HZ = 1500, MAX_DECLOG_HZ = 100;
-constexpr uint8_t NUM_SAMPLES = 20;          // Pot readings averaged.
-constexpr uint16_t READ_INTERVAL_MS = 100;
 constexpr uint32_t T1_HZ = 2000000UL;        // Timer1 clock, 16 MHz / 8.
 constexpr uint32_t T2_HZ = 500000UL;         // Timer2 clock (sampler), 16 MHz / 32.
 constexpr uint16_t MAX_STEP = 60000;         // Longest single compare step, ticks.
@@ -161,7 +158,6 @@ void setDeclogHz(uint16_t hz) {
 
 // ---- Settings ----
 uint16_t setHz[3] = {0xFFFF, 0xFFFF, 0xFFFF};  // Rear, front, Declog, whole Hz.
-uint32_t lastReadMs = 0;
 bool declogEnabled = true;  // false: D3 held LOW (another ESP32 page is shown).
 
 // Frequency each output is set to (Hz), for the frame and the Serial Monitor.
@@ -176,7 +172,6 @@ void setWheel(uint8_t c, uint16_t hz) {
 }
 
 void begin() {
-  pinMode(DECLOG_POT, INPUT);
   digitalWrite(REAR_OUT, LOW);
   digitalWrite(FRONT_OUT, LOW);
   digitalWrite(DECLOG_OUT, LOW);
@@ -196,18 +191,11 @@ void begin() {
   }
 }
 
-// Call every loop: every 100 ms the Declog pot is read (20 analogReads 50 us
-// apart, averaged, about 3 ms) and mapped 0-1023 -> 0-100 Hz in whole Hz.
-void update(uint32_t nowMs) {
-  if (uint32_t(nowMs - lastReadMs) < READ_INTERVAL_MS) return;
-  lastReadMs = nowMs;
-  analogRead(DECLOG_POT);  // First reading after switching pins is discarded.
-  uint32_t sum = 0;
-  for (uint8_t n = 0; n < NUM_SAMPLES; ++n) {
-    sum += analogRead(DECLOG_POT);
-    delayMicroseconds(50);
-  }
-  const uint16_t hz = declogEnabled ? map(long(sum / NUM_SAMPLES), 0, 1023, 0, MAX_DECLOG_HZ) : 0;
+// Call every loop with the page / Declog encoder setting (whole Hz); D3
+// runs it while declogEnabled (page 3), otherwise stops LOW.
+void update(uint16_t declogHz) {
+  uint16_t hz = declogEnabled ? declogHz : 0;
+  if (hz > MAX_DECLOG_HZ) hz = MAX_DECLOG_HZ;
   if (hz == setHz[2]) return;
   setHz[2] = hz;
   setDeclogHz(hz);

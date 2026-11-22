@@ -4,8 +4,6 @@
 #include "AbsDisplay.h"
 #include "DashboardPage.h"
 #include "FreqInput.h"
-#include "Encoder.h"
-#include "BrakeButton.h"
 #include "EcuReset.h"
 
 // ABS tester: ESP32 + 2.8" ILI9341 (Adafruit libraries), fed by the Arduino
@@ -14,7 +12,7 @@
 //   key, brake, D7 rear frequency x100, rear speed x100, REF1 / REF2 mV,
 //   current mA, battery mV, D8 front frequency x100, front speed x100, RPM,
 //   TCS (1 steady, 0 blinking), ABS (1 active), D2 Declog Hz x100 and the
-//   rear / front / Declog pot generator settings in Hz x100 (17 fields: Nano),
+//   rear / front / Declog generator settings in Hz x100 (17 fields: Nano),
 //   plus the A5 page pot reading and page (19 fields: Mega). Older
 //   firmware stops after the battery, the front speed, ABS or Declog. REF2 and
 //   current are not wired (sent as 0) and are ignored.
@@ -29,12 +27,11 @@
 const char* const AP_SSID = "Techroniks ABS Tester";
 const char* const AP_PASSWORD = "ABSdemo2026";  // At least 8 characters.
 constexpr uint8_t LINK_RX = 16, LINK_TX = 17;  // RX2, TX2 (TX unused).
-// The page on screen, to the Nano so it runs only that page's signals:
-// GPIO5 -> Nano A6 (bit 0), GPIO14 -> Nano A7 (bit 1). Page 1 = 01, 2 = 10, 3 = 11.
-constexpr uint8_t PAGE_BIT0 = 5, PAGE_BIT1 = 14;  // Not GPIO32: the touch T_IRQ is wired there.
+// The page comes from the Nano (its page / Declog encoder press, 28th A1 field);
+// swipes change it only without a Nano page (Mega, older Nano firmware, no link).
 HardwareSerial& nano = Serial2;
 WebServer server(80);
-char frame[128], lastBadFrame[128] = "";
+char frame[160], lastBadFrame[160] = "";
 size_t frameLength = 0;
 bool discardFrame = false;
 bool havePacket = false;
@@ -84,17 +81,19 @@ bool parseFrame(char* text) {
   // 1 rear / 2 front), 19 (+ the older Mega's A5 page pot reading 0-1023 and page 1-3)
   // or 20 (Mega with the speed encoder: 0,0 for the page pot, then the wheel it adjusts),
   // 21 (Nano with the D6 speed sensor: the 20-field layout, then the D6 Hz x100 for page 2)
-  // 22 (+ the Nano's D13 ABS light input: 1 = light on, 0 = off)
+  // 22 (+ the Nano's ABS light input (A7): 1 = light on, 0 = off)
   // 23 (+ the Nano's D6 sensor state: 0 pulses OK, 1 open / short (stuck LOW), 2 stuck HIGH)
   // 24 (+ the Nano's knob-click reset counter 0-255: a +1 step fires the GPIO13 ECU relay)
   // 26 (+ the Nano's ECU check code 0-4 and its knob turn counter 0-255, see AbsData::Ecu)
-  // or 27 (+ the knob setting in whole Hz, 0-1500, sent even while D9 / D10 are cut).
+  // 27 (+ the knob setting in whole Hz, 0-1500, sent even while D9 / D10 are cut)
+  // 28 (+ the page 1-3 from the Nano's page / Declog encoder; the screen follows it)
+  // or 30 (+ the encoder nav state 0 free / 1 selecting / 2 locked / 3 Declog adjust, and the selected page).
   constexpr uint8_t MIN_FIELDS = 8, FRONT_FIELDS = 10, LAMP_FIELDS = 13, DECLOG_FIELDS = 14, GEN_FIELDS = 17,
                     NANO_ENC_FIELDS = 18, POT_FIELDS = 19, ENC_FIELDS = 20, SENSOR_FIELDS = 21, ABS_PIN_FIELDS = 22, D6_FIELDS = 23,
-                    RESET_FIELDS = 24, ECU_FIELDS = 26, MAX_FIELDS = 27;
+                    RESET_FIELDS = 24, ECU_FIELDS = 26, KNOB_FIELDS = 27, PAGE_FIELDS = 28, MAX_FIELDS = 30;
   // REF1 and battery: up to 30 V (0-30 V dividers, as on the ECU testbench).
   constexpr unsigned long maximum[MAX_FIELDS] = {1, 1, 100000000UL, 25000, 31000, 5500, 10500, 31000, 100000000UL, 25000,
-                                                 15000, 1, 1, 100000000UL, 250000, 250000, 25000, 1023, 3, 2, 1000000UL, 1, 2, 255, 4, 255, 1500};
+                                                 15000, 1, 1, 100000000UL, 250000, 250000, 25000, 1023, 3, 2, 1000000UL, 1, 2, 255, 4, 255, 1500, 3, 3, 3};
   unsigned long values[MAX_FIELDS];
   uint8_t parsed = 0;
   char* p = text + 3;
@@ -106,7 +105,7 @@ bool parseFrame(char* text) {
     if (!*end && (parsed == MIN_FIELDS || parsed == FRONT_FIELDS || parsed == LAMP_FIELDS ||
                     parsed == DECLOG_FIELDS || parsed == GEN_FIELDS || parsed == NANO_ENC_FIELDS ||
                     parsed == POT_FIELDS || parsed == ENC_FIELDS || parsed == SENSOR_FIELDS ||
-                    parsed == ABS_PIN_FIELDS || parsed == D6_FIELDS || parsed == RESET_FIELDS || parsed == ECU_FIELDS || parsed == MAX_FIELDS)) break;
+                    parsed == ABS_PIN_FIELDS || parsed == D6_FIELDS || parsed == RESET_FIELDS || parsed == ECU_FIELDS || parsed == KNOB_FIELDS || parsed == PAGE_FIELDS || parsed == MAX_FIELDS)) break;
     if (*end != ',' || parsed == MAX_FIELDS) return false;
     p = end + 1;
   }
@@ -127,7 +126,7 @@ bool parseFrame(char* text) {
   latest.declogHz = parsed >= DECLOG_FIELDS ? values[13] / 100.0f : 0;
   latest.sender = parsed == POT_FIELDS || parsed == ENC_FIELDS ? AbsData::MEGA : AbsData::NANO;
   latest.nanoSensor = parsed >= SENSOR_FIELDS;  // Nano D6 speed sensor (page 2).
-  latest.absPin = parsed >= ABS_PIN_FIELDS;     // Nano D13 ABS light input.
+  latest.absPin = parsed >= ABS_PIN_FIELDS;     // Nano ABS light input (A7).
   latest.absPinOn = latest.absPin && values[21] == 1;
   latest.sensorHz = latest.nanoSensor ? values[20] / 100.0f : 0;
   latest.d6State = parsed >= D6_FIELDS ? values[22] : 0;  // 0 also for older Nano firmware.
@@ -135,7 +134,10 @@ bool parseFrame(char* text) {
   latest.ecuField = parsed >= ECU_FIELDS;  // Nano ECU check (D9 / D10 -> testbench -> ECU -> D7 / D8).
   nanoEcu = latest.ecuField ? AbsData::Ecu(values[24]) : AbsData::ECU_UNKNOWN;
   if (latest.ecuField) ecuCheck.onTurns(uint8_t(values[25]));  // Knob turned -> white CHECKING lamp.
-  latest.knobHz = parsed >= MAX_FIELDS ? values[26] : 0;  // Blinking knob lamp while the outputs are cut.
+  latest.knobHz = parsed >= KNOB_FIELDS ? values[26] : 0;  // Blinking knob lamp while the outputs are cut.
+  latest.nanoPage = parsed >= PAGE_FIELDS ? uint8_t(values[27]) : 0;  // 0: no Nano page (swipes work).
+  latest.nanoNav = parsed >= MAX_FIELDS ? uint8_t(values[28]) : 0;    // 1 selecting, 2 locked, 3 Declog adjust.
+  latest.nanoSel = parsed >= MAX_FIELDS ? uint8_t(values[29]) : 0;    // Selected page while selecting.
   latest.gens = parsed >= GEN_FIELDS;
   for (uint8_t i = 0; i < 3; ++i) latest.genHz[i] = latest.gens ? values[14 + i] / 100.0f : 0;
   latest.pagePot = parsed >= POT_FIELDS && values[18] >= 1;  // The encoder Mega sends page 0: no pot.
@@ -148,7 +150,7 @@ bool parseFrame(char* text) {
   return true;
 }
 
-// ABS light: the Nano's D13 input (HIGH = on) while live Nano frames carry it,
+// ABS light: the Nano's A7 button input (1 = on) while live Nano frames carry it,
 // otherwise the switch-on check from the rear speed (AbsLamp).
 // With the real ECU unplugged (or its power cut by the reset relay) the D13
 // lamp wire is dead and reads as "on": the light is shown off instead.
@@ -181,12 +183,11 @@ String liveJson() {
   json = F("{\"link\":\"");
   json += !havePacket ? F("waiting") : !fresh ? F("stale") : F("live");
   json += F("\",\"key\":"); json += latest.keyOn ? F("true") : F("false");
-  json += F(",\"brake\":"); json += latest.brake || brakeButton::held ? F("true") : F("false");
-  json += F(",\"brake_button\":"); json += brakeButton::held ? F("true") : F("false");
-  json += F(",\"speed_kmh\":"); json += String(brakeButton::rearKmh(latest.speedKmh), 1);
+  json += F(",\"brake\":"); json += latest.brake ? F("true") : F("false");
+  json += F(",\"speed_kmh\":"); json += String(latest.speedKmh, 1);
   json += F(",\"frequency_hz\":"); json += String(latest.frequencyHz, 1);
   json += F(",\"front\":"); json += latest.front ? F("true") : F("false");
-  json += F(",\"front_speed_kmh\":"); json += String(brakeButton::frontKmh(latest.frontKmh), 1);
+  json += F(",\"front_speed_kmh\":"); json += String(latest.frontKmh, 1);
   json += F(",\"front_frequency_hz\":"); json += String(latest.frontHz, 1);
   json += F(",\"rpm\":"); json += latest.rpm;
   json += F(",\"declog_hz\":"); json += String(latest.declogHz, 1);
@@ -209,7 +210,7 @@ String liveJson() {
   json += F(",\"sender\":");
   json += latest.sender == AbsData::MEGA ? F("\"mega\"") : latest.sender == AbsData::NANO ? F("\"nano\"") : F("null");
   // Generator settings (null with older sender firmware).
-  // Nano: KY-040 speed encoder (A0 / A1 / A5) -> rear D9 / front D10, Declog pot A2 -> D3.
+  // Nano: KY-040 speed encoder (A0 / A1 / A5) -> rear D9 / front D10, page / Declog encoder (A2 / D12 / A6) -> D3.
   // Mega: KY-040 speed encoder (D22 / D23 / D24) -> rear D44 / front D3, Declog pot A2 -> D11.
   const char* const GEN_KEYS[3] = {",\"gen_rear_hz\":", ",\"gen_front_hz\":", ",\"gen_declog_hz\":"};
   for (uint8_t i = 0; i < 3; ++i) { json += GEN_KEYS[i]; json += latest.gens ? String(latest.genHz[i], 1) : String("null"); }
@@ -269,27 +270,29 @@ struct PagePotFollow {
   }
 } pagePotFollow;
 
-// Page push button (GPIO4 to GND, Encoder.h; replaces the KY-040 knob):
-// every press goes to the next page, 1 -> 2 -> 3 -> 1. Swipes still work
-// (nav stays FREE, nothing is locked).
-void encoderNav() {
-  encoder::poll();
-  encoder::takeSteps();  // No knob any more: rotation is not used.
-  if (encoder::pressed()) {
-    nav = Nav::FREE;
-    page = wrapPage(page + 1);
-    Serial.print(F("# PAGE BUTTON GPIO4 -> page ")); Serial.println(page);
+// Page from the Nano (28 / 30-field frames): its page / Declog encoder
+// picks the page and the Nano runs only that page's signals, so the screen
+// always shows the Nano's page, and its nav state for the footer:
+// SELECT n/3 (single press, turning), LOCKED n/3 (double tap), ADJUST 3/3
+// (long press, Declog). Returns true while it does (swipes ignored).
+bool declogAdjust = false;  // Nano encoder in Declog adjust: footer "ADJUST 3/3".
+bool followNanoPage(bool fresh) {
+  if (!fresh || !latest.nanoPage) { declogAdjust = false; return false; }
+  if (page != latest.nanoPage) {
+    page = latest.nanoPage;
+    Serial.print(F("# PAGE from the Nano encoder -> page ")); Serial.println(page);
   }
+  const uint8_t n = latest.nanoNav;
+  nav = n == 1 && latest.nanoSel ? Nav::SELECTING : n == 2 ? Nav::LOCKED : Nav::FREE;
+  if (nav == Nav::SELECTING) selPage = latest.nanoSel;
+  declogAdjust = n == 3;
+  return true;
 }
 
 void setup() {
   Serial.begin(115200);
-  pinMode(PAGE_BIT0, OUTPUT);
-  pinMode(PAGE_BIT1, OUTPUT);
   absDisplay::begin();
   freqInput::begin();
-  encoder::begin();
-  brakeButton::begin();
   ecuReset::begin();
   nano.setRxBufferSize(512);
   nano.begin(115200, SERIAL_8N1, LINK_RX, LINK_TX);
@@ -336,7 +339,7 @@ void loop() {
       Serial.print(F(" Hz = ")); Serial.print(latest.speedKmh, 1);
       Serial.print(F(" km/h | RPM ")); Serial.print(latest.rpm);
       Serial.print(F(" | TCS ")); Serial.print(tcsBlinking(latest) ? F("BLINKING") : F("OFF"));
-      Serial.print(latest.absPin ? F(" | ABS (NANO D13) ") : F(" | ABS ")); Serial.print(absLampOn(true) ? F("ON") : F("OFF"));
+      Serial.print(latest.absPin ? F(" | ABS (NANO A7) ") : F(" | ABS ")); Serial.print(absLampOn(true) ? F("ON") : F("OFF"));
       Serial.print(F(" | SPEED 2 D8 "));
       if (latest.front) {
         Serial.print(latest.frontHz, 1); Serial.print(F(" Hz = "));
@@ -355,7 +358,7 @@ void loop() {
         Serial.print(enc ? (mega ? F(" Hz, FRONT ->D3 ") : F(" Hz, FRONT ->D10 "))
                          : mega ? F(" Hz, FRONT A0->D3 ") : F(" Hz, FRONT A1->D10 "));
         Serial.print(latest.genHz[1], 0);
-        Serial.print(mega ? F(" Hz, DECLOG A2->D11 ") : F(" Hz, DECLOG A2->D3 "));
+        Serial.print(mega ? F(" Hz, DECLOG A2->D11 ") : F(" Hz, DECLOG ENC->D3 "));
         Serial.print(latest.genHz[2], 0); Serial.print(F(" Hz"));
         if (enc) Serial.print(latest.speedSel == 1 ? F(" (adjusting REAR)") : F(" (adjusting FRONT)"));
       } else Serial.print(F(" V"));
@@ -367,11 +370,11 @@ void loop() {
         Serial.print(min(inHz / INPUT_HZ_PER_KMH, INPUT_MAX_KMH), 1); Serial.print(F(" km/h"));
       } else Serial.print(latest.d6State == 1 && sensorOnNano(true) ? F("OPEN OR SHORT SENSOR")
                           : latest.d6State == 2 && sensorOnNano(true) ? F("NO PULSE (STUCK HIGH)") : F("NO SIGNAL"));
-      if (brakeButton::held) { Serial.print(F(" | BRAKE GPIO15 rear ")); Serial.print(brakeButton::rear, 0); Serial.print(F(" front ")); Serial.print(brakeButton::front, 0); Serial.print(F(" km/h")); }
       Serial.print(F(" | bad frames ")); Serial.print(badFrames);
       Serial.print(F(" | PAGE ")); Serial.print(page);
-      Serial.print(nav == Nav::LOCKED ? F(" locked") : nav == Nav::SELECTING ? F(" selecting") : F(""));
-      Serial.print(F(" | ")); encoder::printStatus(Serial); Serial.println();
+      Serial.print(declogAdjust ? F(" Declog adjust") : nav == Nav::LOCKED ? F(" locked") : nav == Nav::SELECTING ? F(" selecting ") : F(""));
+      if (nav == Nav::SELECTING) Serial.print(selPage);
+      Serial.println();
     } else {
       Serial.print(F("# NO DATA from the ")); Serial.print(senderName(latest.sender));
       Serial.print(F(": ")); Serial.print(bytesReceived);
@@ -379,7 +382,7 @@ void loop() {
       if (lastBadFrame[0]) { Serial.print(F(" | last line: ")); Serial.print(lastBadFrame); }
       Serial.print(bytesReceived ? F("") : F(" | check Nano D5 / Mega TX1 (D18) -> GPIO16 and GND"));
       Serial.print(F(" | SENSOR GPIO34 ")); Serial.print(freqInput::hz, 1); Serial.print(F(" Hz | "));
-      encoder::printStatus(Serial); Serial.println();
+      Serial.println();
     }
   }
   AbsData d = latest;
@@ -388,13 +391,11 @@ void loop() {
   freqInput::update();       // GPIO34, always measured (fallback for page 2).
   d.inputHz = sensorHz(fresh);  // Nano D6 while live Nano frames carry it.
   d.d6State = d6State(fresh);
-  // Brake button (GPIO15): shown rear / front speeds drop 10 km/h per 100 ms to 0 while held.
-  brakeButton::update(latest.speedKmh, latest.frontKmh);
   if (!fresh) ecuReset::resync();  // Link lost: next frame only resyncs the counter.
   ecuReset::update();             // GPIO13 relay pulse end.
-  d.speedKmh = brakeButton::rearKmh(latest.speedKmh);
-  d.frontKmh = brakeButton::frontKmh(latest.frontKmh);
-  d.brake = latest.brake || brakeButton::held;
+  d.speedKmh = latest.speedKmh;
+  d.frontKmh = latest.frontKmh;
+  d.brake = latest.brake;  // Nano: speed encoder held (page 1).
   // ABS light: follows the rear speed while live; losing the link resets it
   // (the next start begins with it on).
   if (fresh) absLamp.update(d.speedKmh); else absLamp.reset();
@@ -409,7 +410,7 @@ void loop() {
   d.ecu = ecuState();
   d.ecuChecking = fresh && ecuCheck.on();
   d.absLamp = absLampOn(fresh);
-  encoderNav();
+  const bool nanoPage = followNanoPage(fresh);
   pagePotFollow.update(fresh, nav == Nav::FREE);
   // Swipe left: next page, swipe right: previous page. While selecting a
   // swipe moves the selection instead; while locked swipes are ignored.
@@ -418,7 +419,8 @@ void loop() {
     Serial.print(F("# SWIPE ")); Serial.print(s < 0 ? F("left") : F("right"));
     Serial.print(F(" (raw dx ")); Serial.print(absDisplay::lastSwipeDx); Serial.print(F(", dy "));
     Serial.print(absDisplay::lastSwipeDy);
-    if (nav == Nav::LOCKED) Serial.println(F(") ignored, page locked"));
+    if (nanoPage) Serial.println(F(") ignored, the Nano encoder sets the page"));
+    else if (nav == Nav::LOCKED) Serial.println(F(") ignored, page locked"));
     else if (nav == Nav::SELECTING) {
       selPage = wrapPage(selPage - s);
       Serial.print(F(") -> select page ")); Serial.println(selPage);
@@ -427,10 +429,7 @@ void loop() {
       Serial.print(F(") -> page ")); Serial.println(page);
     }
   }
-  // Tell the Nano the page shown, so the other pages' signals are off.
-  digitalWrite(PAGE_BIT0, page & 1 ? HIGH : LOW);
-  digitalWrite(PAGE_BIT1, page & 2 ? HIGH : LOW);
-  absDisplay::update(d, page, nav == Nav::SELECTING ? selPage : 0, nav == Nav::LOCKED);
+  absDisplay::update(d, page, nav == Nav::SELECTING ? selPage : 0, nav == Nav::LOCKED, declogAdjust);
   server.handleClient();
   yield();
 }

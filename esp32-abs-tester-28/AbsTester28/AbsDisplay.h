@@ -73,13 +73,13 @@ struct AbsData {
   bool nanoSensor;               // Frame carries the Nano's D6 speed sensor (21 fields).
   float sensorHz;                // Nano D6 frequency, Hz.
   uint8_t d6State;               // Nano D6 check: 0 OK, 1 open / short (stuck LOW), 2 stuck HIGH (23 fields).
-  bool absPin;                   // Frame carries the Nano's D13 ABS light input (22 fields).
+  bool absPin;                   // Frame carries the Nano's ABS light input (A7) (22 fields).
   bool absPinOn;                 // D13 HIGH: ABS light on.
   bool pagePot;                  // Frame carries the Mega's A5 page pot.
   uint16_t potRaw;               // A5 reading, 0-1023.
   uint8_t potPage;               // Page picked by the pot, 1-3.
   uint8_t speedSel;              // Wheel the sender's speed encoder adjusts: 1 rear, 2 front, 0 none / older firmware.
-  bool absLamp;                  // ABS light: Nano D13 input, or AbsLamp (rear speed).
+  bool absLamp;                  // ABS light: Nano A7 input, or AbsLamp (rear speed).
   // Real ABS ECU check, from the Nano (25th / 26th A1 fields): its D9 / D10
   // outputs go through the testbench and the ECU and come back on D7 / D8.
   //   ECU_UNKNOWN  not checked yet (knob at 0 since start-up)
@@ -91,6 +91,9 @@ struct AbsData {
   bool ecuField;                 // Frame carries the ECU check (26 fields).
   bool ecuChecking;              // Knob turned in the last 3 s: white CHECKING lamp.
   uint16_t knobHz;               // Nano knob setting in Hz (27 fields), also while D9 / D10 are cut.
+  uint8_t nanoPage;              // Page from the Nano page / Declog encoder (28 fields), 0 = none.
+  uint8_t nanoNav;               // Nano encoder: 0 free, 1 selecting, 2 locked, 3 Declog adjust (30 fields).
+  uint8_t nanoSel;               // Nano encoder: page being selected (1-3), 0 when not selecting.
 };
 
 inline const char* senderName(AbsData::Sender s) {
@@ -348,19 +351,20 @@ void logicLamps(bool live, float inHz, uint8_t fault) {
 // the right and one dot per page (the shown page in cyan). While the knob is
 // selecting (sel 1-3), the left reads "SELECT 2/3" in amber, the right names
 // the page that a press will lock, and that page's dot blinks amber.
-// Locked by the encoder: the left reads "LOCKED 2/3" in cyan.
-void drawNav(uint8_t page, uint8_t sel, bool blinkOn, bool locked) {
+// Locked by the encoder: the left reads "LOCKED 2/3" in cyan. Declog adjust
+// (Nano encoder long press): "ADJUST 3/3" and DECLOG in amber.
+void drawNav(uint8_t page, uint8_t sel, bool blinkOn, bool locked, bool adjust = false) {
   const bool selecting = sel != 0;
   const uint8_t target = selecting ? sel : page;
   char s[16];
-  snprintf(s, sizeof(s), "%s %u/%u", selecting ? "SELECT" : locked ? "LOCKED" : "PAGE", target, PAGE_COUNT);
+  snprintf(s, sizeof(s), "%s %u/%u", selecting ? "SELECT" : adjust ? "ADJUST" : locked ? "LOCKED" : "PAGE", target, PAGE_COUNT);
   render(NAV_X, DOTS_Y, NAV_W, DOTS_H, [&](aa::Buf& b) {
     aa::fill(b, BG);
-    aa::text(b, aaSmall, s, NAV_X, DOTS_Y + 12, selecting ? AMBER : locked ? ACCENT : MUTED, aa::LEFT, 1);
+    aa::text(b, aaSmall, s, NAV_X, DOTS_Y + 12, selecting || adjust ? AMBER : locked ? ACCENT : MUTED, aa::LEFT, 1);
   });
   render(NAME_X, DOTS_Y, NAV_W, DOTS_H, [&](aa::Buf& b) {
     aa::fill(b, BG);
-    aa::text(b, aaSmall, PAGE_NAMES[target - 1], NAME_X + NAV_W, DOTS_Y + 12, selecting ? AMBER : MUTED, aa::RIGHT, 1);
+    aa::text(b, aaSmall, PAGE_NAMES[target - 1], NAME_X + NAV_W, DOTS_Y + 12, selecting || adjust ? AMBER : MUTED, aa::RIGHT, 1);
   });
   render(DOTS_X, DOTS_Y, DOTS_W, DOTS_H, [&](aa::Buf& b) {
     aa::fill(b, BG);
@@ -375,11 +379,11 @@ void drawNav(uint8_t page, uint8_t sel, bool blinkOn, bool locked) {
   });
 }
 
-void navFooter(uint8_t page, uint8_t sel, bool locked) {
+void navFooter(uint8_t page, uint8_t sel, bool locked, bool adjust) {
   const bool blinkOn = (millis() / 250) % 2;
   char key[16];
-  snprintf(key, sizeof(key), "%u %u %d %d", page, sel, sel && blinkOn, locked);
-  if (changed(S_DOTS, key)) drawNav(page, sel, blinkOn, locked);
+  snprintf(key, sizeof(key), "%u %u %d %d %d", page, sel, sel && blinkOn, locked, adjust);
+  if (changed(S_DOTS, key)) drawNav(page, sel, blinkOn, locked, adjust);
 }
 
 // REF1 / BAT and the ABS / TCS lights (TCS blinks at 2 Hz; the self-test
@@ -678,7 +682,7 @@ void lockedText(const AbsData& d) {
     absSymbol(b, W / 2, 84, 22, color, aaPill);
     aa::text(b, aaValue, line, W / 2, 144, color, aa::CENTER, 1);
     aa::text(b, aaLabel, hint, W / 2, 166, MUTED, aa::CENTER);
-    aa::text(b, aaSmall, d.pagePot ? "Encoder, swipe or page pot A5: change page" : "Encoder or swipe: change page",
+    aa::text(b, aaSmall, d.pagePot ? "Swipe or page pot A5: change page" : "Swipe: change page",
              W / 2, 186, DIM, aa::CENTER, 1);
     aa::text(b, aaSmall, "Wi-Fi Techroniks ABS Tester  |  192.168.4.1", W / 2, 201, DIM, aa::CENTER, 1);
   });
@@ -879,7 +883,7 @@ inline float ease(float& shownV, float target, float snap) {
 
 // Call every loop. page: 1-3; sel: the page the knob is pointing at while
 // selecting, 0 when not selecting; locked: the encoder holds the page.
-void update(const AbsData& d, uint8_t page, uint8_t sel = 0, bool locked = false) {
+void update(const AbsData& d, uint8_t page, uint8_t sel = 0, bool locked = false, bool declogAdj = false) {
   const uint32_t now = millis();
   const bool running = d.link == AbsData::LIVE && d.keyOn;
   const Mode want = page == 3 ? PAGE3 : page == 2 ? PAGE2 : running ? PAGE1 : LOCKED;
@@ -940,7 +944,7 @@ void update(const AbsData& d, uint8_t page, uint8_t sel = 0, bool locked = false
 
   if (now - lastTextMs < TEXT_REFRESH_MS) return;
   lastTextMs = now;
-  navFooter(page, sel, locked);
+  navFooter(page, sel, locked, declogAdj);
   if (mode == LOCKED) { lockedText(d); return; }
   topRow(d, running, selfTest, mode == PAGE1);  // ABS / TCS lights on page 1 only.
   if (mode == PAGE1) {
