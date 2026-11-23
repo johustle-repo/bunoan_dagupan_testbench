@@ -32,6 +32,7 @@
 // to GPIO34 (that is the frequency input).
 constexpr uint8_t TFT_SCK = 18, TFT_MISO = 19, TFT_MOSI = 23;
 constexpr uint8_t TFT_CS = 27, TFT_DC = 25, TFT_RST = 26, TOUCH_CS = 33;
+constexpr uint32_t TFT_SPI_HZ = 20000000;  // TFT SPI clock (see begin()); try 10 MHz if the screen still glitches.
 constexpr uint32_t GAUGE_REFRESH_MS = 40, TEXT_REFRESH_MS = 100;
 constexpr uint32_t SELF_TEST_MS = 1600;  // Switch-on sweep.
 // Swipe: at least SWIPE_MIN raw touch units sideways (about 1/6 of the screen
@@ -810,7 +811,9 @@ void begin() {
   pinMode(TFT_CS, OUTPUT);   digitalWrite(TFT_CS, HIGH);
   pinMode(TOUCH_CS, OUTPUT); digitalWrite(TOUCH_CS, HIGH);
   SPI.begin(TFT_SCK, TFT_MISO, TFT_MOSI);
-  tft.begin();
+  // 20 MHz SPI, not the library's 40 MHz ESP32 default: 40 MHz is the
+  // ILI9341's limit and over jumper wires it gave flicker / tearing / noise.
+  tft.begin(TFT_SPI_HZ);
   tft.setRotation(1);  // Landscape 320 x 240.
   dialBg = static_cast<uint16_t*>(malloc(P2W * P2H * 2));  // Big enough for either page.
   if (!dialBg) Serial.println(F("# Gauge: no heap for the dial cache, redrawing it each frame."));

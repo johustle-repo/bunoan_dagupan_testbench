@@ -123,9 +123,10 @@ bool active = true;  // false: another ESP32 page is shown, D9 / D10 (and D4 / D
 // While a wheel output should be running, its input must show a rising edge
 // at least every INPUT_WAIT_MS (also the start-up window after the output
 // starts); otherwise that output is cut (stopped LOW, D4 / D11 with it).
-// A cut output comes back by itself as soon as its input shows pulses again,
-// or for a new 1 s try on a short knob click or a knob turn (ECU check; the
-// ESP32 shows CHECKING). Turning also sets the speed it comes back at.
+// A cut output comes back for a new 1 s try on a short knob click or a knob
+// turn (ECU check; the ESP32 shows CHECKING). Turning also sets the speed it
+// comes back at. (D7 / D8 are ignored while their output is stopped, see
+// NanoAbsTester.ino, so stray pulses / mains hum can't bring it back.)
 constexpr unsigned long INPUT_WAIT_MS = 1000;
 bool cut[2] = {false, false};                // [0] rear D9, [1] front D10.
 unsigned long lastInputMs[2] = {0, 0};       // Last edge seen (or window start).
@@ -168,7 +169,7 @@ void checkInputs(unsigned long now, bool rearEdge, bool frontEdge) {
   for (uint8_t c = 0; c < 2; c++) {
     if (cut[c]) {
       if (!edge[c]) continue;
-      cut[c] = false;  // Input is back (pulses from elsewhere): output back on.
+      cut[c] = false;  // Input is back: output back on. (Unused now: a cut output's input is gated to 0.)
       ret[c] = RET_OK;
       lastInputMs[c] = now;
       apply();

@@ -126,8 +126,10 @@ float getTrueVoltage(float x) {
   return 0.0f;
 }
 // Same formula as the ECU testbench (arduino-mega/MegaTelemetry,
-// readDividerInput): 20 readings 1 ms apart, plain average, no extra filter.
+// readDividerInput): 20 readings, plain average; here spread over one 60 Hz
+// cycle and smoothed (smoothed() below) against mains hum.
 constexpr uint8_t SAMPLES = 20;
+constexpr unsigned long MAINS_CYCLE_US = 16667;  // One 60 Hz mains cycle.
 const uint8_t inputPins[2] = {A3, A4};          // REF1 A3, battery A4.
 
 SoftwareSerial esp(6, 5);  // TX D5 -> ESP32 GPIO16. RX D6 is never listened on (stopListening), so D6 is the speed sensor input.
@@ -165,13 +167,29 @@ ISR(TIMER2_COMPA_vect) {
 // the calibration table to 0-30 V.
 float readInput(uint8_t i) {
   analogRead(inputPins[i]);  // Discard: the ADC is switching channels (or back from the bandgap).
+  // 20 readings spread over exactly one 60 Hz mains cycle (16.67 ms), so the
+  // hum the wires pick up averages out (1 ms apart = 20 ms left part of a
+  // cycle in, and REF1 / BAT jumped about +-0.5 V).
   uint32_t sum = 0;
+  const unsigned long startUs = micros();
   for (uint8_t n = 0; n < SAMPLES; n++) {
+    while (micros() - startUs < n * MAINS_CYCLE_US / SAMPLES) {}
     sum += analogRead(inputPins[i]);
-    delay(1);
   }
   pinV[i] = float(sum) / SAMPLES * (supply::volts / 1023.0f);
   return getTrueVoltage(pinV[i]);
+}
+
+// Smoothing on top (4 reads a second): each new read moves the shown value
+// 1/4 of the way (about 1 s to settle), so leftover noise doesn't flicker on
+// the screen. A real change of more than 1.5 V jumps straight to the new
+// value (no lag when the supply is switched on / off).
+constexpr float SMOOTH = 0.25f, SNAP_V = 1.5f;
+float smoothV[2] = {-1, -1};  // -1 = no reading yet.
+float smoothed(uint8_t i, float v) {
+  if (smoothV[i] < 0 || fabsf(v - smoothV[i]) > SNAP_V) smoothV[i] = v;
+  else smoothV[i] += (v - smoothV[i]) * SMOOTH;
+  return smoothV[i];
 }
 
 // A1 frame: key (always 1), brake (1 while the EC11 knob is held: SpeedEncoder.h), D7 Hz x100, speed 1 x100,
@@ -204,7 +222,7 @@ float hzToKmh(float hz) {
 
 void readVolts() {
   supply::read();  // Measured 5 V rail for the pin volts (about 4 ms).
-  for (uint8_t i = 0; i < 2; i++) voltsMv[i] = unsigned(readInput(i) * 1000 + 0.5);
+  for (uint8_t i = 0; i < 2; i++) voltsMv[i] = unsigned(smoothed(i, readInput(i)) * 1000 + 0.5);
   ref1V = voltsMv[0] / 1000.0;
   batteryV = voltsMv[1] / 1000.0;
 }
@@ -342,6 +360,18 @@ void loop() {
       Serial.print(F("# ECU RESET request "));
       Serial.print(ecuResetCount);
       Serial.println(F(" -> ESP32 GPIO13 relay cuts the ABS ECU power for 2 s"));
+    }
+    // Return-loop gate: D7 / D8 only count while their own output (D9 / D10)
+    // is running. With the output stopped (knob 0, cut, brake at 0, not page 1)
+    // a floating D7 / D8 wire picks up mains hum (a steady ~60 Hz on D8,
+    // 0-10 Hz on D7), which showed as phantom speed / TCS on the screen and
+    // brought a cut output straight back (ECU never shown as disconnected).
+    for (uint8_t i = 0; i < 2; i++) {
+      if (potgen::outHz(i) == 0) {
+        prevValid[i] = false;
+        lastHz[i] = 0;
+        if (i == 0) pulses1 = 0; else pulses2 = 0;
+      }
     }
     frequencyHz1 = measureHz(0, pulses1, edge[0], nowUs, elapsedUs);
     frequencyHz2 = measureHz(1, pulses2, edge[1], nowUs, elapsedUs);
