@@ -11,14 +11,14 @@
 //   turn          -> both wheels' speed together, 1 km/h per click; spun
 //                    quickly (clicks under 40 ms apart) 5 km/h per click.
 //                    0-250 km/h, generator Hz = km/h x 6 (250 km/h = 1500 Hz).
-//   double click  -> TCS test (page 1 only): two short clicks, the second
-//                    pressed within 300 ms of the first release. REAR = FRONT
-//                    + 60 Hz (+10 km/h) for 1.5 s, then REAR goes back to the
-//                    same speed as FRONT, so TCS blinks on the ESP32 screen.
-//                    Double-clicking again during the pulse restarts it.
-//   single click  -> FRESH START of page 1 (pressed 30 ms - 600 ms, page 1
-//                    only; it runs 300 ms after the release, once no second
-//                    click came), as after power-up: knob speed 0,
+//   single click  -> TCS test (pressed 30 ms - 600 ms, page 1 only; it runs
+//                    300 ms after the release, once no second click came).
+//                    REAR = FRONT + 60 Hz (+10 km/h) for 1.5 s, then REAR
+//                    goes back to the same speed as FRONT, so TCS blinks on
+//                    the ESP32 screen. Clicking again during the pulse restarts it.
+//   double click  -> RESET of page 1 (two short clicks, the second pressed
+//                    within 300 ms of the first release; page 1 only), as
+//                    after power-up, plus the ECU reset relay: knob speed 0,
 //                    D9 / D10 (and D4 / D11) stop at once (no ramp), brake and
 //                    input cuts cleared, the D7 / D8 readings drop to 0 at once
 //                    (freshStart, NanoAbsTester.ino). With the wheels at 0 the
@@ -66,7 +66,7 @@ constexpr unsigned long PULSE_MS = 1500;
 int kmh = 0;                // Common speed, km/h (FRONT = this, REAR = this + offset).
 uint16_t rearOffsetHz = 0;  // Added to REAR: PRESS_HZ during the TCS pulse, else 0.
 unsigned long pulseStartMs = 0;  // When the TCS pulse started (millis).
-bool freshStart = false;    // Short click: the sketch clears the D7 / D8 readings, then resets this.
+bool freshStart = false;    // Double click: the sketch clears the D7 / D8 readings, then resets this.
 
 // Brake (long press): the wheel outputs run at outKmh, which follows kmh
 // except while braking (ramps to 0) or recovering (ramps back to kmh).
@@ -259,7 +259,7 @@ void update(unsigned long now) {
 
   // 2. Push button (terminal C): short clicks on release (held 30-600 ms),
   //    long press after 600 ms. A short click waits DOUBLE_MS for a second
-  //    one: two = double click (TCS), one = single click (fresh start).
+  //    one: two = double click (reset), one = single click (TCS).
   static bool lastButtonState = HIGH, longPressTriggered = false;
   static unsigned long pressStartTime = 0;
   static bool clickPending = false;        // One short click seen, waiting for a second.
@@ -290,13 +290,16 @@ void update(unsigned long now) {
   if (buttonState == HIGH && lastButtonState == LOW && active &&  // Short click released (page 1 only).
       !longPressTriggered && now - pressStartTime > CLICK_MIN_MS) {
     if (clickPending && pressStartTime - firstReleaseMs <= DOUBLE_MS) {
-      // Double click: TCS test.
+      // Double click: reset (fresh start of page 1, as after power-up, plus the ECU reset relay).
       clickPending = false;
       Serial.println(F("# Button: Double Click"));
-      pulseStartMs = now;
-      rearOffsetHz = PRESS_HZ;
+      kmh = outKmh = 0;
+      braking = recovering = false;
+      rearOffsetHz = 0;  // Drop a running TCS pulse.
+      clearCuts(now);
+      freshStart = true;  // NanoAbsTester.ino zeroes the D7 / D8 readings and fires the ECU reset.
       apply();
-      Serial.print(F("# SPEED ENC double click -> TCS pulse, REAR +")); Serial.print(PRESS_HZ); Serial.print(F(" Hz for 1.5 s: "));
+      Serial.print(F("# SPEED ENC double click -> RESET, speed 0: "));
       log();
     } else {
       clickPending = true;  // Wait for a possible second click.
@@ -304,18 +307,14 @@ void update(unsigned long now) {
     }
   }
   if (!active) clickPending = false;
-  // No second click in time (and the button is up): single click.
+  // No second click in time (and the button is up): single click = TCS test.
   if (clickPending && buttonState == HIGH && now - firstReleaseMs > DOUBLE_MS) {
     clickPending = false;
     Serial.println(F("# Button: Short Click"));
-    // Fresh start of page 1, as after power-up.
-    kmh = outKmh = 0;
-    braking = recovering = false;
-    rearOffsetHz = 0;  // Drop a running TCS pulse.
-    clearCuts(now);
-    freshStart = true;  // NanoAbsTester.ino zeroes the D7 / D8 readings.
+    pulseStartMs = now;
+    rearOffsetHz = PRESS_HZ;
     apply();
-    Serial.print(F("# SPEED ENC click -> FRESH START, speed 0: "));
+    Serial.print(F("# SPEED ENC click -> TCS pulse, REAR +")); Serial.print(PRESS_HZ); Serial.print(F(" Hz for 1.5 s: "));
     log();
   }
   lastButtonState = buttonState;

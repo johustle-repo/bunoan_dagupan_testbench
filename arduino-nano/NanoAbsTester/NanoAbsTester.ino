@@ -30,14 +30,16 @@
 //   pressed (A7 HIGH). Sent as the 22nd frame field (1 = light on). (No TCS
 //   LED: no free pin. TCS is still worked out here and shown on the ESP32
 //   screen and dashboard.)
-//   D13 ABS LED (the onboard L LED lights with it): on when D7 is at least
-//   10 % and 5 km/h slower than D8
+//   D13 ABS LED, active low (5V -> resistor -> LED -> D13): follows the A7
+//   ABS lamp, D13 LOW = LED on while A7 is LOW (the onboard L LED shows the
+//   opposite). The simulated ABS (D7 at least 10 % and 5 km/h
+//   slower than D8) is still sent to the ESP32
 //   A3 Reference 1, A4 battery: 0-5 V at the pin mapped to 0-30 V
 //   through the PCB calibration table (same formula as the ECU testbench).
 //   Frequency generators (PotGenerator.h), 50 % duty 0-5 V square waves:
 //   rear -> D9 0-1500 Hz and front -> D10 0-1500 Hz set by the DFRobot EC11 (SEN0235) speed
 //   encoder (SpeedEncoder.h: A -> A0, B -> A1, C -> A5; turn = both wheels
-//   together, click = fresh start of page 1 at 0 km/h, double click = TCS test, hold = brake), and
+//   together, click = TCS test, double click = reset of page 1 at 0 km/h + ECU reset, hold = brake), and
 //   Declog -> D3 0-100 Hz set by the page / Declog encoder (DeclogEncoder.h:
 //   A -> A2, B -> D12, SW -> A6; press = next page, turn = Declog on page 3).
 //   Jumper D9 -> D7, D10 -> D8, D3 -> D2 to self-test.
@@ -88,7 +90,7 @@ unsigned int voltsMv[2] = {0, 0};  // REF1, battery, as sent to the ESP32.
 
 bool speedsEqual = true;
 bool absInputOn = true;  // A7 ABS light button (on until pressed), read every 100 ms.
-// ECU reset counter: +1 on every knob click (fresh start), sent as the 24th
+// ECU reset counter: +1 on every knob double click (reset), sent as the 24th
 // A1 field. The ESP32 fires its GPIO13 relay on each +1 step, which cuts the
 // ABS ECU's power for 2 s so it boots fresh (latched error cleared).
 uint8_t ecuResetCount = 0;
@@ -380,7 +382,7 @@ void loop() {
       (rawSpeed1 <= rawSpeed2 * 0.90) &&
       ((rawSpeed2 - rawSpeed1) >= 5.0);
 
-    digitalWrite(ABS_LED, absActive ? HIGH : LOW);
+    digitalWrite(ABS_LED, absInputOn ? LOW : HIGH);  // D13 active-low LED (5V -> resistor -> LED -> D13) mirrors the A7 ABS lamp.
   }
 
   if (now - lastVoltsMs >= VOLTS_MS || lastVoltsMs == 0) {

@@ -195,6 +195,7 @@ uint32_t lastGaugeMs = 0, lastTextMs = 0, selfTestStartMs = 0;
 bool selfTestActive = false;
 int32_t shownGaugeKey[2] = {-1, -1};
 int shownKnobHz = -2;  // Knob Hz in the page 1 gauge (-1 = no knob lamp).
+int shownOutKmh = -1;  // "Speed out N kph" in the page 1 gauge (0 when not shown).
 float easeFront = 0, easeInput = 0, easeDeclog = 0;  // Needle positions, eased toward the readings.
 
 // True (and remembered) when a slot's content key differs from what is shown.
@@ -491,13 +492,22 @@ bool knobBlink(uint16_t knobHz) {
   return knobPhase < 0.5f;
 }
 
-void ecuBadge(aa::Buf& b, int8_t ecu, bool lit, int knobHz = -1, bool knobLit = false) {
+// outKmh: the knob's output speed, shown as "Speed out N kph" while the knob
+// was just turned (in place of the old "Checking").
+void ecuBadge(aa::Buf& b, int8_t ecu, bool lit, int knobHz = -1, bool knobLit = false, int outKmh = 0) {
   if (ecu < 0) return;
-  static const char* const LABELS[7] = {"", "Online", "Offline", "Offline", "Offline", "Reset", "Checking"};
+  static const char* const LABELS[7] = {"", "Online", "Offline", "Offline", "Offline", "Reset", ""};
   const uint16_t c = ECU_COLORS[ecu];
   const float cx = P2X + P2W - 16, cy = P2Y + 13;  // Level with the gauge title dot.
   ecuLight(b, cx, cy, c, lit);
   // Same font and baseline as the FRONT title.
+  if (ecu == ECU_CHECK) {  // Two lines: "Speed Out" beside the lamp, "100kph" under it.
+    char kph[12];
+    snprintf(kph, sizeof(kph), "%dkph", outKmh);
+    aa::text(b, aaLabel, "Speed Out", cx - 13, P2Y + 18, c, aa::RIGHT, 1);
+    aa::text(b, aaLabel, kph, cx - 13, P2Y + 38, c, aa::RIGHT, 1);
+    return;  // The second line takes the knob row.
+  }
   if (*LABELS[ecu]) aa::text(b, aaLabel, LABELS[ecu], cx - 13, P2Y + 18, lit ? c : aa::mix(PANEL, c, 120), aa::RIGHT, 1);
   if (knobHz < 0) return;
   // Knob lamp and speed (knob Hz / 6, whole km/h), one row below, lined up
@@ -531,6 +541,7 @@ void ecuOffline(int8_t ecu) {
 // blinking 5 times if it differs from the one shown before.
 constexpr uint32_t ECU_BLINK_MS = 200;
 constexpr uint8_t ECU_BLINKS = 5;
+constexpr uint32_t ABS_FLASH_MS = 400;  // Online lamp flash (400 ms on / 400 ms off) while the ABS light is on.
 struct EcuView { int8_t status; bool lit; };
 uint8_t ecuShown = AbsData::ECU_UNKNOWN;
 uint32_t ecuBlinkStartMs = 0;
@@ -541,7 +552,10 @@ EcuView ecuLamp(const AbsData& d, uint32_t now) {
     ecuBlinking = false;
     return {-1, false};
   }
-  if (d.ecuChecking && d.ecu != AbsData::ECU_RESET) return {ECU_CHECK, true};
+  // Speed Out (knob just turned) only while no frequency comes back from the
+  // testbench (D7 and D8 both 0); with a return signal the normal status shows.
+  const bool noReturn = d.frequencyHz <= 0 && d.frontHz <= 0;
+  if (d.ecuChecking && noReturn && d.ecu != AbsData::ECU_RESET) return {ECU_CHECK, true};
   if (d.ecu != ecuShown) {
     ecuShown = d.ecu;
     ecuBlinking = true;
@@ -553,11 +567,13 @@ EcuView ecuLamp(const AbsData& d, uint32_t now) {
     if (phase >= 2u * ECU_BLINKS) ecuBlinking = false;
     else lit = phase % 2;
   }
+  // Online while the ABS light is on: flash like hazards until the light goes off.
+  if (!ecuBlinking && ecuShown == AbsData::ECU_OK && d.absLamp) lit = (now / ABS_FLASH_MS) % 2 == 0;
   return {int8_t(ecuShown), lit};
 }
 
 void renderGauge2(float v, uint8_t which, bool signal, bool adjust = false, int8_t ecu = -1, bool ecuLit = true,
-                  int knobHz = -1, bool knobLit = false) {
+                  int knobHz = -1, bool knobLit = false, int outKmh = 0, bool braking = false) {
   const BigGauge& g = BIG_GAUGES[which];
   const uint8_t dialPage = pageOf(which);  // dialBg holds this page's face.
   char digits[6];
@@ -571,7 +587,11 @@ void renderGauge2(float v, uint8_t which, bool signal, bool adjust = false, int8
       aa::circle(b, 16, P2Y + 13, 3.5f, AMBER);
       aa::text(b, aaSmall, "ADJUST", 24 + aa::textWidth(aaLabel, g.title) + 6, P2Y + 18, AMBER, aa::LEFT, 1);
     }
-    ecuBadge(b, ecu, ecuLit, knobHz, knobLit);
+    ecuBadge(b, ecu, ecuLit, knobHz, knobLit, outKmh);
+    if (braking) {  // Speed encoder held (brake): red BRAKING under the gauge title.
+      aa::circle(b, 16, P2Y + 33, 3.5f, RED);
+      aa::text(b, aaLabel, "BRAKING", 24, P2Y + 38, RED, aa::LEFT, 1);
+    }
     const float a = angleOf(signal ? v : 0, g.maxV);
     const float redA = angleOf(g.redFrom, g.maxV);
     if (which == G_FRONT) {
@@ -914,11 +934,15 @@ void update(const AbsData& d, uint8_t page, uint8_t sel = 0, bool locked = false
       const int8_t ecu = selfTest ? -1 : ev.status;  // Real ECU lamp, top right.
       // Knob lamp under it while the ECU check fails (-1 = not shown).
       const int knob = ecu >= 0 && ecuFault(d.ecu) ? int(d.knobHz) : -1;
-      const int32_t key = lroundf(front * 4) | int32_t(have) << 16 | int32_t(adjust) << 17 | int32_t(ecu + 1) << 18 | int32_t(ev.lit) << 22 | int32_t(knob >= 0 && knobLit) << 23;
-      if (key != shownGaugeKey[0] || knob != shownKnobHz) {
+      const int outKmh = ecu == ECU_CHECK ? int(d.knobHz / HZ_PER_KMH) : 0;  // "Speed out N kph".
+      const bool braking = !selfTest && d.brake;
+      const int32_t key = lroundf(front * 4) | int32_t(have) << 16 | int32_t(adjust) << 17 | int32_t(ecu + 1) << 18 | int32_t(ev.lit) << 22 | int32_t(knob >= 0 && knobLit) << 23
+                          | int32_t(braking) << 24 | int32_t(outKmh & 0x3f) << 25;
+      if (key != shownGaugeKey[0] || knob != shownKnobHz || outKmh != shownOutKmh) {
         shownGaugeKey[0] = key;
         shownKnobHz = knob;
-        renderGauge2(front, G_FRONT, have, adjust, ecu, ev.lit, knob, knobLit);
+        shownOutKmh = outKmh;
+        renderGauge2(front, G_FRONT, have, adjust, ecu, ev.lit, knob, knobLit, outKmh, braking);
       }
     } else if (mode == PAGE2) {
       // Speed sensor: Hz / 6 = km/h (0-20); no pulses = NO SIGNAL.
