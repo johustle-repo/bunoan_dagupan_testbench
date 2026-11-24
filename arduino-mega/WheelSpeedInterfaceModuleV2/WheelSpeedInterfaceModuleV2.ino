@@ -7,7 +7,7 @@
 //   * Generator out    A3/A4   -> D46/D45   (Timer5 OC5A/OC5B hardware toggle)
 //
 // Implements the hand-drawn "NANO" signal-module sketch:
-//   * Brake switch / abrupt deceleration -> D6 held 13 s, D7 pulse bursts (only at 10 km/h or more)
+//   * Brake switch / abrupt deceleration -> D6 held 5 s, three 1 s D7 pulse bursts (only at 10 km/h or more)
 //   * Front FREQ >= 60 Hz (10 km/h)      -> LOCK output on D12, latched until power-off,
 //                                           and D6 turns on once for 1 s (no D7)
 //   * Front FREQ / 60 (RPM), / 6 (speed display)
@@ -28,9 +28,10 @@
 //   D3  IN   FREQ input #2 (rear)    INT5 (PE5)
 //   D4  OUT  TCS blinking output
 //   D5  IN   Brake switch            INPUT_PULLUP, switch to GND = pressed
-//   D6  OUT  Logic 1 for 13 s on brake event, starting 0.5 s after the trigger;
+//   D6  OUT  Logic 1 for 5 s on brake event, starting 0.5 s after the trigger;
 //            also a 1 s pulse once when LOCK latches at 10 km/h
-//   D7  OUT  10 pulses/s with 0.5 s interruption, 2 s .. 10 s of D6 time;
+//   D7  OUT  During D6: 0.5 s wait, then three 1 s bursts of 10 pulses/s with 0.5 s gaps,
+//            0.5 s idle (0.5 + 1 + 0.5 + 1 + 0.5 + 1 + 0.5 = 5 s);
 //            also ON for the first 1 s after power-up (before arming)
 //   D8  OUT  FREQ output #1 (1:1 of front)
 //   D9  OUT  FREQ output #2 (1:1 of rear)
@@ -90,11 +91,12 @@ const uint16_t DECEL_WINDOW_MS   = 300;    // multiple of SAMPLE_MS (100 ms)
 //   * Brake switch: the current speed must be >= 10.
 const int16_t  EVENT_MIN_KPH     = 10;
 const uint32_t D6_DELAY_MS       = 500;    // D6 turns on this long after the trigger
-const uint32_t D6_HOLD_MS        = 13000;  // drawing: logic 1 for 13 s
-const uint32_t D7_START_MS       = 2000;   // drawing text: starts after 2 s
-const uint32_t D7_END_MS         = 10000;  // drawing: ends at 10 s
+// Drawing: D6 HIGH 5 s = .5 wait + 1 s burst + .5 gap + 1 s burst + .5 gap + 1 s burst + .5 idle.
+const uint32_t D6_HOLD_MS        = 5000;   // logic 1 for 5 s
+const uint32_t D7_START_MS       = 500;    // first burst starts 0.5 s after D6 turns on
+const uint8_t  D7_BURSTS         = 3;      // three 1 s bursts
 const uint32_t D7_BURST_MS       = 1000;   // 10 pulses at 10 pulses/s
-const uint32_t D7_GAP_MS         = 500;    // drawing: interruption of .5 s
+const uint32_t D7_GAP_MS         = 500;    // 0.5 s between the bursts
 const uint32_t D7_PULSE_PERIOD_MS = 100;   // 10 pulses/s
 const uint32_t D7_PULSE_HIGH_MS   = 50;    // ASSUMPTION: 50% duty
 const uint32_t BOOT_D7_ON_MS      = 1000;  // D7 on for 1 s at power-up, then off
@@ -490,7 +492,7 @@ void sampleFrequencies() {
 }
 
 // D6 / D7 event. Triggers on the *start* of a condition so holding the brake
-// does not re-trigger forever; a new event can start once the 13 s are over.
+// does not re-trigger forever; a new event can start once the 5 s are over.
 // When LOCK latches (10 km/h) D6 alone turns on for 1 s, once per power-on.
 bool prevTrigger = false;
 bool lockEventPending = false;             // set by updateLock() on latch
@@ -533,8 +535,10 @@ void updateBrakeEvent(uint32_t now) {
       eventActive = false;
     } else {
       d6 = t >= D6_DELAY_MS;
-      if (t >= D7_START_MS && t < D7_END_MS) {
-        uint32_t c = (t - D7_START_MS) % (D7_BURST_MS + D7_GAP_MS);
+      // D7 timing counts from the moment D6 turns on.
+      const uint32_t d7End = D7_START_MS + D7_BURSTS * D7_BURST_MS + (D7_BURSTS - 1) * D7_GAP_MS;
+      if (d6 && t - D6_DELAY_MS >= D7_START_MS && t - D6_DELAY_MS < d7End) {
+        uint32_t c = (t - D6_DELAY_MS - D7_START_MS) % (D7_BURST_MS + D7_GAP_MS);
         d7 = c < D7_BURST_MS && (c % D7_PULSE_PERIOD_MS) < D7_PULSE_HIGH_MS;
       }
     }
@@ -700,7 +704,8 @@ void updateDisplay(uint32_t now) {
 
 // ======================= 0.96" OLED (SSD1306, I2C) ==========================
 // Status bar on top, then FRONT and REAR rows:
-//   [COND1] [COND2]   ARMED     <- box filled once that button was pressed
+//   [COND1] [COND2]   ARMED     <- box filled once that button was pressed;
+//                               [BRAKING] (inverse) replaces ARMED while the brake switch is pressed
 //   FRONT        20 km/h        <- big digits
 //   120Hz
 //   REAR         22 km/h
@@ -807,7 +812,7 @@ void updateOled(uint32_t now) {
   oledLastMs = now;
   int16_t f = armed ? (int16_t)min(front.hz / 6.0f + 0.5f, 999.0f) : -2;
   int16_t r = armed ? (int16_t)min(rear.hz  / 6.0f + 0.5f, 999.0f) : -2;
-  uint8_t cond = armCond[0] | (armCond[1] << 1);
+  uint8_t cond = armCond[0] | (armCond[1] << 1) | (brakePressed << 2);
   // Redraw on change, and every 2 s anyway (Hz text, replugged module).
   if (f == oledShownF && r == oledShownR && cond == oledShownCond &&
       ++oledRefresh < 2000 / OLED_UPDATE_MS) return;
@@ -818,8 +823,16 @@ void updateOled(uint32_t now) {
   oled.setTextColor(SSD1306_WHITE);
   oledCond(0,  F("COND1"), armCond[0]);
   oledCond(38, F("COND2"), armCond[1]);
-  oled.setCursor(armed ? 98 : 80, OLED_BAR_Y + 1);
-  oled.print(armed ? F("ARMED") : F("BLOCKED"));
+  if (brakePressed) {                       // brake switch pressed: inverse BRAKING
+    oled.fillRect(78, OLED_BAR_Y, 50, 9, SSD1306_WHITE);
+    oled.setTextColor(SSD1306_BLACK);
+    oled.setCursor(82, OLED_BAR_Y + 1);
+    oled.print(F("BRAKING"));
+    oled.setTextColor(SSD1306_WHITE);
+  } else {
+    oled.setCursor(armed ? 98 : 80, OLED_BAR_Y + 1);
+    oled.print(armed ? F("ARMED") : F("BLOCKED"));
+  }
   oledRow(OLED_FRONT_Y, F("FRONT"), f, front.hz);
   oledRow(OLED_REAR_Y,  F("REAR"),  r, rear.hz);
 

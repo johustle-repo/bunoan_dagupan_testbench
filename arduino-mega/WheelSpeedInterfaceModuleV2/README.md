@@ -19,8 +19,8 @@ Only the display, encoder and test-generator pins moved. v2 adds **arming**
 | D3  | IN  | FREQ input #2 (rear), INT5 |
 | D4  | OUT | TCS: blinks when rear is faster than front |
 | D5  | IN  | Brake switch, `INPUT_PULLUP`, to GND = pressed |
-| D6  | OUT | Logic 1 for 13 s on brake event, starting 0.5 s after the trigger (`D6_DELAY_MS`). Brake triggers only count at **10 km/h or more** as shown on the displays (`EVENT_MIN_KPH`). When LOCK latches at 10 km/h, D6 alone turns on for **1 s** and then off (`LOCK_D6_PULSE_MS`, once per power-on, D7 stays off) |
-| D7  | OUT | 10 pulses/s with 0.5 s interruptions, from 2 s to 10 s of D6 time. Also **on for 1 s at power-up** then off (`BOOT_D7_ON_MS`), even before arming |
+| D6  | OUT | Logic 1 for **5 s** on brake event, starting 0.5 s after the trigger (`D6_DELAY_MS`). Brake triggers only count at **10 km/h or more** as shown on the displays (`EVENT_MIN_KPH`). When LOCK latches at 10 km/h, D6 alone turns on for **1 s** and then off (`LOCK_D6_PULSE_MS`, once per power-on, D7 stays off) |
+| D7  | OUT | During D6: **0.5 s wait, three 1 s bursts of 10 pulses/s with 0.5 s gaps, 0.5 s idle** (0.5 + 1 + 0.5 + 1 + 0.5 + 1 + 0.5 = 5 s; `D7_START_MS`, `D7_BURSTS`, `D7_BURST_MS`, `D7_GAP_MS`). Also **on for 1 s at power-up** then off (`BOOT_D7_ON_MS`), even before arming |
 | D8  | OUT | FREQ output #1 (1:1 front) |
 | D9  | OUT | FREQ output #2 (1:1 rear) |
 | D10 | OUT | Front FREQ ÷ 60 (RPM) |
@@ -96,7 +96,8 @@ REAR         22 km/h
 ```
 
 Top bar: the COND1 / COND2 boxes are outlined until that button is pressed,
-then filled, plus `BLOCKED` / `ARMED`. Below: FRONT and REAR speed in km/h
+then filled, plus `BLOCKED` / `ARMED`. While the brake switch (D5) is pressed,
+an inverse **BRAKING** box replaces `ARMED` / `BLOCKED`. Below: FRONT and REAR speed in km/h
 (Hz ÷ 6) in big digits with the raw Hz. Speeds show `---` until armed. Refreshed every
 200 ms (`OLED_UPDATE_MS`).
 
