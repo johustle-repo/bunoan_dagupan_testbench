@@ -41,7 +41,7 @@
 //   encoder (SpeedEncoder.h: A -> A0, B -> A1, C -> A5; turn = both wheels
 //   together, click = TCS test, double click = reset of page 1 at 0 km/h + ECU reset, hold = brake), and
 //   Declog -> D3 0-100 Hz set by the page / Declog encoder (DeclogEncoder.h:
-//   A -> A2, B -> D12, SW -> A6; press = next page, turn = Declog on page 3).
+//   A -> A2, B -> D12, SW -> A6; turn on page 3 = set 0-100 Hz, long press = output it).
 //   Jumper D9 -> D7, D10 -> D8, D3 -> D2 to self-test.
 //   Divided outputs: D4 = D9 / 6 (0-250 Hz, Hz = km/h), D11 = D10 / 15 (0-100 Hz), 50 % duty.
 //   D5 (TX) -> ESP32 RX2 (GPIO16), common GND, 115200 8N1, one-way
@@ -133,7 +133,7 @@ constexpr unsigned long MAINS_CYCLE_US = 16667;  // One 60 Hz mains cycle.
 const uint8_t inputPins[2] = {A3, A4};          // REF1 A3, battery A4.
 
 SoftwareSerial esp(6, 5);  // TX D5 -> ESP32 GPIO16. RX D6 is never listened on (stopListening), so D6 is the speed sensor input.
-char linkBuffer[144];
+char linkBuffer[144];  // Longest 32-field frame (all fields at their maximum) is about 133 bytes.
 
 // D7: Speed 1 and RPM, D8: Speed 2, D2: Declog, D6: page 2 speed sensor.
 // Rising edges, sampled at 20 kHz: Timer2 runs free at 500 kHz, so each sample
@@ -205,7 +205,9 @@ float smoothed(uint8_t i, float v) {
 // (0-255, ESP32 white CHECKING lamp), the knob setting in whole Hz (0-1500, sent even while D9 / D10
 // are cut, for the ESP32's blinking knob lamp) and the page (1-3, chosen with the page / Declog
 // encoder; the ESP32 screen follows it), the encoder nav state (0 free, 1 selecting, 2 locked,
-// 3 Declog adjust) and the selected page (1-3 while selecting, else 0) (30 fields, the ESP32's MAX_FIELDS frame), then
+// 3 Declog adjust) and the selected page (1-3 while selecting, else 0), the Declog set value
+// (0-100 Hz, turned on page 3) and the Declog output state (0 D3 off, 1 long press held =
+// release to output, 2 D3 running) (32 fields, the ESP32's MAX_FIELDS frame), then
 // an XOR checksum of everything before '*'. The ESP32 shows
 // these values as they are.
 // Wheel Hz -> km/h, Hz / 6 with a low-speed band matching the knob output
@@ -229,7 +231,7 @@ void readVolts() {
 
 void sendFrame() {
   const unsigned int* mv = voltsMv;
-  const int count = snprintf(linkBuffer, sizeof(linkBuffer), "A1,1,%u,%lu,%u,%u,0,0,%u,%lu,%u,%u,%u,%u,%lu,%lu,%lu,%lu,0,0,%u,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%u",
+  const int count = snprintf(linkBuffer, sizeof(linkBuffer), "A1,1,%u,%lu,%u,%u,0,0,%u,%lu,%u,%u,%u,%u,%lu,%lu,%lu,%lu,0,0,%u,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u",
     unsigned(speedEnc::braking),
     (unsigned long)(frequencyHz1 * 100 + 0.5), unsigned(speed1 * 100 + 0.5), mv[0], mv[1],
     (unsigned long)(frequencyHz2 * 100 + 0.5), unsigned(speed2 * 100 + 0.5),
@@ -241,7 +243,8 @@ void sendFrame() {
     unsigned(speedEnc::ecuCode()), unsigned(speedEnc::turnCount),
     unsigned(speedEnc::frontHz()),   // Knob setting in Hz (also while the outputs are cut).
     unsigned(pageSel::page),         // Page 1-3 (the ESP32 screen follows it).
-    unsigned(pageSel::nav), unsigned(pageSel::sel));  // Encoder nav (0 free, 1 select, 2 locked, 3 Declog adjust), selected page.
+    unsigned(pageSel::nav), unsigned(pageSel::sel),  // Encoder nav (0 free, 1 select, 2 locked, 3 Declog adjust), selected page.
+    unsigned(declogEnc::hz), unsigned(declogEnc::outState()));  // Declog set Hz, output state (0 off, 1 release to output, 2 running).
   if (count < 0 || count > int(sizeof(linkBuffer) - 5)) return;
   uint8_t checksum = 0;
   for (int i = 0; i < count; i++) checksum ^= uint8_t(linkBuffer[i]);
@@ -332,7 +335,7 @@ void loop() {
   if (declogEnc::update(now)) {  // Encoder lock / long press changed the page: switch the outputs.
     applyPage();
   }
-  potgen::update(declogEnc::hz);  // D3 Declog (0 off page 3).
+  potgen::update(declogEnc::outHz);  // D3 Declog: the set value after a long press (0 off page 3).
   speedEnc::update(now);  // Speed encoder turns and button.
 
   if (micros() - windowStartUs >= MEASURE_US) {

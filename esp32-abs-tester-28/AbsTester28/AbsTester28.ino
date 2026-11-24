@@ -87,13 +87,15 @@ bool parseFrame(char* text) {
   // 26 (+ the Nano's ECU check code 0-4 and its knob turn counter 0-255, see AbsData::Ecu)
   // 27 (+ the knob setting in whole Hz, 0-1500, sent even while D9 / D10 are cut)
   // 28 (+ the page 1-3 from the Nano's page / Declog encoder; the screen follows it)
-  // or 30 (+ the encoder nav state 0 free / 1 selecting / 2 locked / 3 Declog adjust, and the selected page).
+  // 30 (+ the encoder nav state 0 free / 1 selecting / 2 locked / 3 Declog adjust, and the selected page)
+  // or 32 (+ the Declog set value 0-100 Hz and the Declog output state 0 off / 1 release to output / 2 running).
   constexpr uint8_t MIN_FIELDS = 8, FRONT_FIELDS = 10, LAMP_FIELDS = 13, DECLOG_FIELDS = 14, GEN_FIELDS = 17,
                     NANO_ENC_FIELDS = 18, POT_FIELDS = 19, ENC_FIELDS = 20, SENSOR_FIELDS = 21, ABS_PIN_FIELDS = 22, D6_FIELDS = 23,
-                    RESET_FIELDS = 24, ECU_FIELDS = 26, KNOB_FIELDS = 27, PAGE_FIELDS = 28, MAX_FIELDS = 30;
+                    RESET_FIELDS = 24, ECU_FIELDS = 26, KNOB_FIELDS = 27, PAGE_FIELDS = 28, NAV_FIELDS = 30, MAX_FIELDS = 32;
   // REF1 and battery: up to 30 V (0-30 V dividers, as on the ECU testbench).
   constexpr unsigned long maximum[MAX_FIELDS] = {1, 1, 100000000UL, 25000, 31000, 5500, 10500, 31000, 100000000UL, 25000,
-                                                 15000, 1, 1, 100000000UL, 250000, 250000, 25000, 1023, 3, 2, 1000000UL, 1, 2, 255, 4, 255, 1500, 3, 3, 3};
+                                                 15000, 1, 1, 100000000UL, 250000, 250000, 25000, 1023, 3, 2, 1000000UL, 1, 2, 255, 4, 255, 1500, 3, 3, 3,
+                                                 100, 2};
   unsigned long values[MAX_FIELDS];
   uint8_t parsed = 0;
   char* p = text + 3;
@@ -105,7 +107,7 @@ bool parseFrame(char* text) {
     if (!*end && (parsed == MIN_FIELDS || parsed == FRONT_FIELDS || parsed == LAMP_FIELDS ||
                     parsed == DECLOG_FIELDS || parsed == GEN_FIELDS || parsed == NANO_ENC_FIELDS ||
                     parsed == POT_FIELDS || parsed == ENC_FIELDS || parsed == SENSOR_FIELDS ||
-                    parsed == ABS_PIN_FIELDS || parsed == D6_FIELDS || parsed == RESET_FIELDS || parsed == ECU_FIELDS || parsed == KNOB_FIELDS || parsed == PAGE_FIELDS || parsed == MAX_FIELDS)) break;
+                    parsed == ABS_PIN_FIELDS || parsed == D6_FIELDS || parsed == RESET_FIELDS || parsed == ECU_FIELDS || parsed == KNOB_FIELDS || parsed == PAGE_FIELDS || parsed == NAV_FIELDS || parsed == MAX_FIELDS)) break;
     if (*end != ',' || parsed == MAX_FIELDS) return false;
     p = end + 1;
   }
@@ -136,8 +138,11 @@ bool parseFrame(char* text) {
   if (latest.ecuField) ecuCheck.onTurns(uint8_t(values[25]));  // Knob turned -> white CHECKING lamp.
   latest.knobHz = parsed >= KNOB_FIELDS ? values[26] : 0;  // Blinking knob lamp while the outputs are cut.
   latest.nanoPage = parsed >= PAGE_FIELDS ? uint8_t(values[27]) : 0;  // 0: no Nano page (swipes work).
-  latest.nanoNav = parsed >= MAX_FIELDS ? uint8_t(values[28]) : 0;    // 1 selecting, 2 locked, 3 Declog adjust.
-  latest.nanoSel = parsed >= MAX_FIELDS ? uint8_t(values[29]) : 0;    // Selected page while selecting.
+  latest.nanoNav = parsed >= NAV_FIELDS ? uint8_t(values[28]) : 0;    // 1 selecting, 2 locked, 3 Declog adjust.
+  latest.nanoSel = parsed >= NAV_FIELDS ? uint8_t(values[29]) : 0;    // Selected page while selecting.
+  latest.declogField = parsed >= MAX_FIELDS;  // Declog set value and output state (page 3 indicator).
+  latest.declogSetHz = latest.declogField ? uint8_t(values[30]) : 0;
+  latest.declogOut = latest.declogField ? uint8_t(values[31]) : 0;
   latest.gens = parsed >= GEN_FIELDS;
   for (uint8_t i = 0; i < 3; ++i) latest.genHz[i] = latest.gens ? values[14 + i] / 100.0f : 0;
   latest.pagePot = parsed >= POT_FIELDS && values[18] >= 1;  // The encoder Mega sends page 0: no pot.
@@ -214,6 +219,11 @@ String liveJson() {
   // Mega: KY-040 speed encoder (D22 / D23 / D24) -> rear D44 / front D3, Declog pot A2 -> D11.
   const char* const GEN_KEYS[3] = {",\"gen_rear_hz\":", ",\"gen_front_hz\":", ",\"gen_declog_hz\":"};
   for (uint8_t i = 0; i < 3; ++i) { json += GEN_KEYS[i]; json += latest.gens ? String(latest.genHz[i], 1) : String("null"); }
+  // Nano page 3: Declog set value (Hz) and D3 output state "off" / "release" (long press held) /
+  // "on" (null with older Nano firmware).
+  json += F(",\"declog_set_hz\":"); json += latest.declogField ? String(latest.declogSetHz) : String("null");
+  json += F(",\"declog_output\":");
+  json += !latest.declogField ? F("null") : latest.declogOut == 2 ? F("\"on\"") : latest.declogOut == 1 ? F("\"release\"") : F("\"off\"");
   // Wheel the sender's speed encoder adjusts ("rear" / "front"; null without one).
   json += F(",\"speed_encoder\":");
   json += latest.speedSel == 1 ? F("\"rear\"") : latest.speedSel == 2 ? F("\"front\"") : F("null");

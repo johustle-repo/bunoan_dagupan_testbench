@@ -11,7 +11,7 @@
 //   FREE      power-up, page 1, nothing selected;
 //   SELECTING single press: turning moves the selection (sel), the page shown stays;
 //   LOCKED    double tap while selecting: the selected page is shown and its signals run;
-//   ADJUST    long press: page 3, turning sets the Declog 0-100 Hz.
+//   ADJUST    long press: page 3, turning sets the Declog 0-100 Hz, a long press there outputs it on D3.
 namespace pageSel {
 
 enum Nav : uint8_t { FREE = 0, SELECTING = 1, LOCKED = 2, ADJUST = 3 };

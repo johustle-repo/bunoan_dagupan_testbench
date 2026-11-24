@@ -55,10 +55,10 @@ A second rotary encoder with a push button replaces the ESP32 page button and th
 |---|---|
 | **Single press** | **SELECT**: turning moves the selection over pages 1–3 (ESP32 footer `SELECT n/3` in amber, the page's dot blinks). The page shown and its signals stay. A single press while selecting cancels. Acts 300 ms after the release, once no second press came. |
 | **Double tap** (second press within 300 ms) | **LOCK** while selecting: the selected page is shown and its signals switch over (footer `LOCKED n/3` in cyan). Ignored when not selecting. |
-| **Long press** (held 600 ms) | **DECLOG ADJUST**: jumps to page 3, and turning sets the Declog on D3, 0–100 Hz, 1 Hz per click, 5 Hz per click when spun quickly (footer `ADJUST 3/3` in amber). A long or single press leaves it; page 3 stays, locked. |
-| Turn | Only in SELECT (moves the selection) or DECLOG ADJUST (sets the Hz); otherwise nothing. |
+| **Long press** (held 600 ms) | From page 1 / 2 (or while selecting): **DECLOG ADJUST**, jumps to page 3 with the set value at 0 Hz and D3 off (footer `ADJUST 3/3` in amber). **On page 3: OUTPUT only while held**. Once held 600 ms, D3 outputs the set value (set 78 Hz → D3 78 Hz; ESP32 green **Output 78%** lamp) until you release; release stops D3. No long press = no output. Turning while held changes D3 with it. The set value and output state go to the ESP32 as the 31st / 32nd `A1` fields (0 off, 2 running). A single press in ADJUST locks page 3 (the set value stays). |
+| Turn | In SELECT: moves the selection. On page 3: sets the Declog value, 0–100 Hz, 1 Hz per click, 5 Hz per click when spun quickly. **Turning only changes the set value**; D3 only runs while a long press is held. Otherwise nothing. |
 
-Power-up: page 1, Declog 0 Hz. Only the shown page's signals run: **page 1** D9 / D10 / D4 / D11 out, D7 / D8 in, D13 ABS LED; **page 2** D6 in only, no outputs; **page 3** D3 out, D2 in. The other inputs read 0, other outputs stop LOW, and the Declog setting is kept while off page 3. The speed knob is ignored off page 1 and keeps its speed. The page, the nav state (0 free, 1 selecting, 2 locked, 3 Declog adjust) and the selected page go to the ESP32 as the 28th–30th `A1` fields; the screen follows them.
+Power-up: page 1, Declog 0 Hz. Only the shown page's signals run: **page 1** D9 / D10 / D4 / D11 out, D7 / D8 in, D13 ABS LED; **page 2** D6 in only, no outputs; **page 3** D3 out, D2 in. The other inputs read 0, other outputs stop LOW. **Leaving page 3 sets the Declog set value and D3 to 0 Hz**, so page 3 always starts again from 0. The speed knob is ignored off page 1 and keeps its speed. The page, the nav state (0 free, 1 selecting, 2 locked, 3 Declog adjust) and the selected page go to the ESP32 as the 28th–30th `A1` fields; the screen follows them.
 
 A / B are decoded in the 20 kHz Timer2 sampler with the same transition table as the speed encoder (4 transitions = one click), so no click is lost. If clockwise turns the Declog down, set `REVERSE` to `true` in `DeclogEncoder.h` (or swap A and B). If only every second detent moves it, set `STEPS_PER_CLICK` to 2. Serial Monitor: `# DECLOG ENC single press -> SELECT ...`, `# DECLOG ENC turn -> select page 2`, `# DECLOG ENC double tap -> LOCKED page 2`, `# DECLOG ENC long press -> DECLOG ADJUST on page 3 ...`, `# DECLOG ENC turn -> Declog 12 Hz`.
 
@@ -75,7 +75,7 @@ TCS: BLINKING
 ABS: ACTIVE
 Declog (D2): 50.0 Hz
 Encoder rear -> D9: 600 Hz (+0 Hz offset), front -> D10: 600 Hz | knob 100 km/h
-Page / Declog encoder: A2 1 D12 1 SW A6 1023 (pressed below 300) | pos 50 | Declog 50 Hz
+Page / Declog encoder: A2 1 D12 1 SW A6 1023 (pressed below 300) | pos 50 | Declog set 50 Hz, out 50 Hz
 Declog encoder -> D3: 50 Hz
 REF1 (A3): 12.00 V (pin 2.07 V)
 Battery (A4): 13.80 V (pin 2.38 V)

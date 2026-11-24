@@ -95,6 +95,9 @@ struct AbsData {
   uint8_t nanoPage;              // Page from the Nano page / Declog encoder (28 fields), 0 = none.
   uint8_t nanoNav;               // Nano encoder: 0 free, 1 selecting, 2 locked, 3 Declog adjust (30 fields).
   uint8_t nanoSel;               // Nano encoder: page being selected (1-3), 0 when not selecting.
+  bool declogField;              // Frame carries the Declog set value and output state (32 fields).
+  uint8_t declogSetHz;           // Declog set value, 0-100 Hz (turned on page 3).
+  uint8_t declogOut;             // Declog output: 0 D3 off, 1 long press held (release to output), 2 D3 running.
 };
 
 inline const char* senderName(AbsData::Sender s) {
@@ -519,6 +522,57 @@ void ecuBadge(aa::Buf& b, int8_t ecu, bool lit, int knobHz = -1, bool knobLit = 
   aa::text(b, aaLabel, kph, cx - 13, P2Y + 38, knobHz ? AMBER : DIM, aa::RIGHT, 1);
 }
 
+constexpr uint32_t ECU_BLINK_MS = 200;  // Status-change blink (ECU lamp, Declog output lamp).
+constexpr uint8_t ECU_BLINKS = 5;
+constexpr uint32_t ABS_FLASH_MS = 400;  // Online lamp flash (400 ms on / 400 ms off) while the ABS light is on.
+
+// Declog output indicator (page 3, top right of the gauge panel, where page 1
+// has the ECU lamp), from the Nano's 31st / 32nd A1 fields:
+//   grey lamp + "Output Off"     D3 off;
+//   amber lamp blinking + "Release"  long press held: releasing outputs the set value;
+//   green lamp + "Output 78%"    D3 running; it blinks 5 times when the
+//                                output is triggered (released) or changes.
+// Second row: "Set 78%" (0-100 Hz = 0-100 %), amber while it differs from what D3 outputs (a long
+// press would change D3), grey when equal.
+struct DeclogView { int8_t state; bool lit; int setHz, outHz; };
+DeclogView declogView = {-1, false, 0, 0};  // state -1: no indicator (no link, older Nano firmware).
+int declogShownOut = -1;                     // Output Hz the last blink was for (-1 = off).
+uint32_t declogBlinkStartMs = 0;
+bool declogBlinking = false;
+DeclogView declogLamp(const AbsData& d, bool running, uint32_t now) {
+  if (!running || !d.declogField) { declogShownOut = -1; declogBlinking = false; return {-1, false, 0, 0}; }
+  const int out = d.declogOut == 2 ? int(lroundf(d.genHz[2])) : 0;
+  DeclogView v = {int8_t(d.declogOut), true, d.declogSetHz, out};
+  const int shownOut = d.declogOut == 2 ? out : -1;
+  if (shownOut != declogShownOut) {  // Output triggered, changed or stopped.
+    declogBlinking = shownOut >= 0;
+    declogBlinkStartMs = now;
+    declogShownOut = shownOut;
+  }
+  if (d.declogOut == 1) v.lit = (now / ABS_FLASH_MS) % 2 == 0;  // Release: amber blinking.
+  else if (declogBlinking) {
+    const uint32_t phase = (now - declogBlinkStartMs) / ECU_BLINK_MS;  // Even = off, odd = on.
+    if (phase >= 2u * ECU_BLINKS) declogBlinking = false;
+    else v.lit = phase % 2;
+  }
+  return v;
+}
+
+void declogBadge(aa::Buf& b, const DeclogView& v) {
+  if (v.state < 0) return;
+  const float cx = P2X + P2W - 16, cy = P2Y + 13;  // Same spot as the page 1 ECU lamp.
+  const uint16_t c = v.state == 2 ? GREEN : v.state == 1 ? AMBER : MUTED;
+  ecuLight(b, cx, cy, c, v.state != 0 && v.lit);
+  char line[16];
+  // Shown in % like the DECLOG bar: 0-100 Hz = 0-100 %.
+  if (v.state == 2) snprintf(line, sizeof(line), "Output %d%%", v.outHz);
+  else strlcpy(line, v.state == 1 ? "Release" : "Output Off", sizeof(line));
+  aa::text(b, aaLabel, line, cx - 13, P2Y + 18, v.state == 0 ? MUTED : c, aa::RIGHT, 1);
+  snprintf(line, sizeof(line), "Set %d%%", v.setHz);
+  const bool pending = v.state == 2 ? v.setHz != v.outHz : v.setHz > 0;
+  aa::text(b, aaLabel, line, cx - 13, P2Y + 38, pending ? AMBER : MUTED, aa::RIGHT, 1);
+}
+
 // REAR bar panel while the ECU check fails (page 1): red stripe and the
 // reason, centred in the panel (the red lamp, Offline and the knob lamp are
 // at the top right of the gauge panel).
@@ -540,9 +594,6 @@ void ecuOffline(int8_t ecu) {
 // (200 ms off / 200 ms on), then it stays on. A knob turn shows the white
 // CHECKING lamp for 3 s (steady); then the current status comes back,
 // blinking 5 times if it differs from the one shown before.
-constexpr uint32_t ECU_BLINK_MS = 200;
-constexpr uint8_t ECU_BLINKS = 5;
-constexpr uint32_t ABS_FLASH_MS = 400;  // Online lamp flash (400 ms on / 400 ms off) while the ABS light is on.
 struct EcuView { int8_t status; bool lit; };
 uint8_t ecuShown = AbsData::ECU_UNKNOWN;
 uint32_t ecuBlinkStartMs = 0;
@@ -589,6 +640,7 @@ void renderGauge2(float v, uint8_t which, bool signal, bool adjust = false, int8
       aa::text(b, aaSmall, "ADJUST", 24 + aa::textWidth(aaLabel, g.title) + 6, P2Y + 18, AMBER, aa::LEFT, 1);
     }
     ecuBadge(b, ecu, ecuLit, knobHz, knobLit, outKmh);
+    if (which == G_DECLOG) declogBadge(b, declogView);
     if (braking) {  // Speed encoder held (brake): red BRAKING under the gauge title.
       aa::circle(b, 16, P2Y + 33, 3.5f, RED);
       aa::text(b, aaLabel, "BRAKING", 24, P2Y + 38, RED, aa::LEFT, 1);
@@ -959,9 +1011,13 @@ void update(const AbsData& d, uint8_t page, uint8_t sel = 0, bool locked = false
     } else {
       // Page 3: Declog from the sender; drops to 0 without live data.
       const float hz = ease(easeDeclog, running ? constrain(d.declogHz, 0.0f, DECLOG_MAX_HZ) : 0.0f, 0.05f);
-      const int32_t key = lroundf(hz * 20);
+      // Output indicator top right: state, lamp phase, set and output Hz.
+      const DeclogView dv = declogLamp(d, running, now);
+      const int32_t key = lroundf(hz * 20) | int32_t(dv.state + 1) << 12 | int32_t(dv.lit) << 14
+                          | int32_t(dv.setHz & 0x7f) << 15 | int32_t(dv.outHz & 0x7f) << 22;
       if (key != shownGaugeKey[0]) {
         shownGaugeKey[0] = key;
+        declogView = dv;
         renderGauge2(hz, G_DECLOG, true);
       }
     }

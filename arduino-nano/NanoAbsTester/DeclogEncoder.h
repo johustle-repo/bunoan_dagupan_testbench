@@ -15,11 +15,17 @@
 //                   selecting cancels.
 //   Double tap   -> LOCK (while selecting): the selected page is shown and
 //                   its signals run ("LOCKED n/3").
-//   Long press   -> DECLOG ADJUST (held 600 ms): jumps to page 3, turning sets
-//                   the Declog on D3, 0-100 Hz, 1 Hz per click, 5 Hz per
-//                   click when spun quickly ("ADJUST 3/3"). A long or single
-//                   press leaves it (page 3 stays, LOCKED).
-// Turning does nothing outside SELECT / ADJUST. A single press acts 300 ms
+//   Long press   -> (held 600 ms) from page 1 / 2 or while selecting: jumps
+//                   to page 3, DECLOG ADJUST ("ADJUST 3/3"), set 0 Hz, D3 off.
+//                   On page 3: D3 outputs the set Hz ONLY WHILE the button is
+//                   held past 600 ms (set 78 Hz -> D3 78 Hz, ESP32 green
+//                   "Output" lamp); releasing stops D3. No long press, no output.
+//   Turn on page 3 -> sets the Declog, 0-100 Hz, 1 Hz per click, 5 Hz per
+//                   click when spun quickly. Only the set value changes; D3
+//                   only runs while a long press is held.
+//   Single press in ADJUST -> LOCKED page 3 (the set value stays).
+// Leaving page 3 (double tap lock on page 1 / 2) sets both the set value and
+// D3 to 0. Turning does nothing outside SELECT / page 3. A single press acts 300 ms
 // after its release, once no second press came (so a double tap is never
 // also a single press).
 // A / B are decoded in the 20 kHz Timer2 sampler with the same transition
@@ -48,7 +54,12 @@ volatile int8_t stepAccumulator = 0;
 volatile int8_t pending = 0;  // Clicks counted by the ISR, not yet applied.
 long position = 0;            // Clicks since power-up (Serial Monitor).
 
-int hz = 0;                   // Declog setting, whole Hz.
+int hz = 0;                   // Declog set value, whole Hz (turning on page 3).
+int outHz = 0;                // Declog running on D3, whole Hz (hz copied in when a long press on page 3 is released).
+bool armed = false;           // Long press held on page 3: D3 runs at the set value until release.
+// Declog output state for the ESP32 (32nd A1 field): 0 D3 off, 2 D3 running
+// (1, "release to output", is no longer sent).
+inline uint8_t outState() { return outHz ? 2 : 0; }
 pageSel::Nav beforeSelect = pageSel::FREE;  // Nav state a cancelled select goes back to.
 
 // Called from the Timer2 sampler ISR (20 kHz).
@@ -110,16 +121,18 @@ bool onDouble() {
 
 bool onLong() {
   using namespace pageSel;
-  if (nav == ADJUST) {
-    nav = LOCKED;
-    Serial.println(F("# DECLOG ENC long press -> Declog adjust off (page 3 locked)"));
+  if (page == 3 && nav != SELECTING) {  // On page 3: D3 outputs the set value while held.
+    armed = true;
+    outHz = hz;
+    nav = ADJUST;
+    Serial.print(F("# DECLOG ENC long press held -> D3 OUTPUT ")); Serial.print(outHz); Serial.println(F(" Hz (release stops it)"));
     return false;
   }
   const bool changed = page != 3;
   page = 3;
   sel = 0;
   nav = ADJUST;
-  Serial.print(F("# DECLOG ENC long press -> DECLOG ADJUST on page 3, turn to set 0-100 Hz (now "));
+  Serial.print(F("# DECLOG ENC long press -> DECLOG ADJUST on page 3, turn to set 0-100 Hz, long press to output (set "));
   Serial.print(hz); Serial.println(F(" Hz)"));
   if (changed) logPage();
   return changed;
@@ -140,10 +153,12 @@ bool update(unsigned long now) {
     if (nav == SELECTING) {
       sel = wrap(int(sel) + clicks);
       Serial.print(F("# DECLOG ENC turn -> select page ")); Serial.println(sel);
-    } else if (nav == ADJUST) {
+    } else if (page == 3) {  // ADJUST or LOCKED on page 3: set value only, D3 unchanged.
       const bool fast = clicks > 1 || clicks < -1 || now - lastClickMs < FAST_MS;
       hz = constrain(hz + clicks * (fast ? FAST_STEP_HZ : 1), 0, MAX_HZ);
-      Serial.print(F("# DECLOG ENC turn -> Declog ")); Serial.print(hz); Serial.println(F(" Hz"));
+      if (armed) outHz = hz;  // Turned while held: D3 follows.
+      Serial.print(F("# DECLOG ENC turn -> Declog set ")); Serial.print(hz);
+      Serial.print(F(" Hz (D3 ")); Serial.print(outHz); Serial.println(F(" Hz, hold long press to output)"));
     }  // Otherwise turning does nothing.
     lastClickMs = now;
   }
@@ -166,6 +181,10 @@ bool update(unsigned long now) {
         if (second) pageChanged |= onDouble();
         else { waiting = true; releaseMs = now; }
         second = false;
+      } else if (armed) {                // Release of a long press on page 3: D3 stops.
+        armed = false;
+        outHz = 0;
+        Serial.println(F("# DECLOG ENC long press released -> D3 OFF"));
       }
     }
   }
@@ -177,6 +196,13 @@ bool update(unsigned long now) {
   if (waiting && !held && now - releaseMs > DOUBLE_MS) {
     waiting = false;
     pageChanged |= onSingle();
+  }
+
+  // 3. Off page 3: set value and D3 back to 0.
+  if (page != 3 && (hz || outHz || armed)) {
+    hz = outHz = 0;
+    armed = false;
+    Serial.println(F("# DECLOG left page 3 -> set 0 Hz, D3 0 Hz"));
   }
   return pageChanged;
 }
@@ -190,7 +216,9 @@ void printStatus(Print& out) {
   out.print(F(") | pos ")); out.print(position);
   out.print(nav == SELECTING ? F(" | SELECTING ") : nav == LOCKED ? F(" | LOCKED") : nav == ADJUST ? F(" | DECLOG ADJUST") : F(" | free"));
   if (nav == SELECTING) out.print(sel);
-  out.print(F(" | Declog ")); out.print(hz); out.println(F(" Hz"));
+  out.print(F(" | Declog set ")); out.print(hz);
+  out.print(F(" Hz, out ")); out.print(outHz);
+  out.println(armed ? F(" Hz (release to output)") : F(" Hz"));
 }
 
 }  // namespace declogEnc
