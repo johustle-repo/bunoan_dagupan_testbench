@@ -320,8 +320,9 @@ void updateEncoder(uint32_t now) {
 bool oledOk = false;
 uint32_t oledProbeMs = 0;
 
-//   F73%                   LOCK     <- fade duty while fading / D12 locked
-//            gauge 0-250 kph
+//   [60Hz]     [OUT]      [FADE]    <- DIP switches: filled = ON, outline = OFF
+//    (o)     gauge 0-250    [####]  <- D12 60 Hz LED (filled = lit) / fade bar
+//   60Hz                     73%       and % while the 15 kHz fade runs
 //   720Hz      120 kph              <- output in pot Hz, speed = Hz / 6
 //   IN1 120   IN2 120               <- input speeds, km/h
 Adafruit_SSD1306 oled(128, 64, &Wire, -1, 400000UL, 400000UL);
@@ -358,7 +359,7 @@ void oledDetect() {
   delay(1000);
 }
 
-constexpr int16_t GX = 64, GY = 36, GR = 34;  // Gauge centre and radius.
+constexpr int16_t GX = 64, GY = 38, GR = 27;  // Gauge centre and radius (top at y 11, under the DIP row).
 
 // Point on the gauge at v km/h (0 = left, 250 = right), radius r.
 void gaugePoint(float v, float r, int16_t& x, int16_t& y) {
@@ -429,6 +430,15 @@ void updateDip(uint32_t now, bool force = false) {
   }
 }
 
+// DIP switch box in the top row: ON = filled with black text, OFF = outline.
+void dipBox(int16_t x, int16_t w, const __FlashStringHelper* label, bool on) {
+  if (on) oled.fillRect(x, 0, w, 9, SSD1306_WHITE);
+  else oled.drawRect(x, 0, w, 9, SSD1306_WHITE);
+  oled.setTextColor(on ? SSD1306_BLACK : SSD1306_WHITE);
+  oled.setCursor(x + 2, 1); oled.print(label);
+  oled.setTextColor(SSD1306_WHITE);
+}
+
 // The gauge shows the speed (0-250 kph), or, with the knob on D3, the D3
 // frequency (0-15000 Hz on the same arc: ticks every 1500 Hz, long every 3000).
 void drawOled() {
@@ -452,17 +462,22 @@ void drawOled() {
   gaugePoint(gaugeV, GR - 8, nx, ny);
   oled.drawLine(GX, GY, nx, ny, SSD1306_WHITE);
   oled.fillCircle(GX, GY, 2, SSD1306_WHITE);
-  // Top corners: fade duty, LOCK.
-  if (fading) {
-    oled.setCursor(0, 0);
-    oled.print(F("F")); oled.print(int(fadeDuty * 100 + 0.5f)); oled.print('%');
-  }
-  if (!dipLogic) { oled.setCursor(92, 1); oled.print(F("D12off")); }  // DIP 1 OFF: D12 held LOW.
-  else if (locked) {
-    oled.fillRect(102, 0, 26, 9, SSD1306_WHITE);
-    oled.setTextColor(SSD1306_BLACK);
-    oled.setCursor(104, 1); oled.print(F("LOCK"));
-    oled.setTextColor(SSD1306_WHITE);
+  // Top row: the 3 DIP switches, filled box = ON, outline = OFF.
+  dipBox(0, 27, F("60Hz"), dipLogic);
+  dipBox(53, 21, F("OUT"), dipSpeed);
+  dipBox(101, 27, F("FADE"), dipFade);
+  // Left: the D12 60 Hz logic 1 LED, as the real one (lit = locked and DIP 1 ON).
+  if (dipLogic && locked) oled.fillCircle(11, 21, 6, SSD1306_WHITE);
+  else oled.drawCircle(11, 21, 6, SSD1306_WHITE);
+  oled.setCursor(0, 30); oled.print(F("60Hz"));
+  // Right: fade bar, full at 100 %, empty at 0 %, with the % while fading.
+  if (dipFade) {
+    oled.drawRect(98, 13, 30, 8, SSD1306_WHITE);
+    if (fading) {
+      const int16_t fill = int16_t(fadeDuty * 26 + 0.5f);
+      if (fill > 0) oled.fillRect(100, 15, fill, 4, SSD1306_WHITE);
+      oled.setCursor(100, 23); oled.print(int(fadeDuty * 100 + 0.5f)); oled.print('%');
+    }
   }
   // Big value under the gauge, the scale ends outside the arc.
   char s[8];
@@ -477,7 +492,6 @@ void drawOled() {
   // Bottom row, knob on D3 (inverted): "KNOB: D3", Hz only; else the D6 Hz
   // beside the speed and the inputs in km/h.
   if (knobD3) {
-    if (!fading) { oled.setCursor(0, 0); oled.print(dipFade ? F("D3") : F("D3 OFF")); }  // Top left (the fade % goes there while fading).
     oled.fillRect(0, 56, 128, 8, SSD1306_WHITE);
     oled.setTextColor(SSD1306_BLACK);
     oled.setCursor(2, 57); oled.print(F("KNOB: D3  0-15000 Hz"));
@@ -488,7 +502,6 @@ void drawOled() {
   oled.setCursor(0, 47);
   if (dipSpeed) { oled.print(outHz); oled.print(F("Hz")); }
   else oled.print(F("OUT OFF"));  // DIP 2 OFF: D6 / D5 held LOW.
-  if (!dipFade) { oled.setCursor(0, 0); oled.print(F("D3 OFF")); }  // DIP 3 OFF (never fading then).
   snprintf(s, sizeof s, "%3d", int(in1.hz / HZ_PER_KMH + 0.5f));
   oled.setCursor(0, 57); oled.print(F("IN1 ")); oled.print(s);
   snprintf(s, sizeof s, "%3d", int(in2.hz / HZ_PER_KMH + 0.5f));

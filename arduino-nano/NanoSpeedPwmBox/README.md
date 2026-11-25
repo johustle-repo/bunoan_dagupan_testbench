@@ -35,7 +35,7 @@ Read every 10 ms (50 ms debounce); a change works at once, also while running. *
 | 2 | **D4** | **D6 / D5 encoder frequency out disabled**: stopped LOW; the knob still sets the speed | Enabled again: back at the knob speed |
 | 3 | **D2** | **D3 15 kHz fade out disabled**: a running fade stops, D3 LOW, short press ignored | Enabled again (a D3 Hz set by hand comes back too) |
 
-Serial Monitor: `# DIP 1 (D11) OFF: ...` on each change, and `DIP 1on 2on 3on` in the status line. An **open switch, or no DIP switch connected, reads OFF** (the pull-up holds the pin HIGH), so close a switch to GND to enable its output. The OLED shows `D12off`, `OUT OFF` and `D3 OFF` for switches that are OFF.
+Serial Monitor: `# DIP 1 (D11) OFF: ...` on each change, and `DIP 1on 2on 3on` in the status line. An **open switch, or no DIP switch connected, reads OFF** (the pull-up holds the pin HIGH), so close a switch to GND to enable its output. The OLED's top row shows the three switches (filled = ON, outline = OFF).
 
 **The switch common must go to GND.** Wired to 5V, both positions read HIGH (pull-up), so the switches do nothing. For a switch to 5V, set `DIP_TO_GND = false` and fit a 10 kΩ pull-down from each of D11 / D4 / D2 to GND.
 
@@ -46,14 +46,18 @@ The OLED is looked for at start-up (I2C probe of 0x3C, then 0x3D) and then every
 **OLED** (SSD1306 128×64): speedometer 0–250 kph.
 
 ```
-F73%                     [LOCK]      <- fade duty while fading / D12 locked
-          ,--''''--.
- 0      /     \     \    250         <- gauge 0-250 kph, ticks every 25
-720Hz      120 kph                   <- Freq output in pot, speed = Hz / 6
+[60Hz]      [OUT]       [FADE]       <- DIP 1 / 2 / 3: filled box = ON, outline = OFF
+ (o)       ,--''''--.    [#####  ]   <- D12 60 Hz LED (filled = lit) / fade bar
+60Hz  0   /    \    \ 250   73%         and its % while the 15 kHz fade runs
+720Hz      120 kph                   <- Freq output in pot (OUT OFF: DIP 2 OFF), speed = Hz / 6
 IN1 120         IN2 120              <- Freq 1 / 2 input in km/h
 ```
 
-With the knob on **D3** the same gauge shows the **D3 frequency, 0–15000 Hz** (scale ends `0` / `15k`, ticks every 1500 Hz): the big number is the D3 Hz, `D3` at the top left, and the bottom row turns white with `KNOB: D3  0-15000 Hz`. No speed is shown in D3 mode.
+- **DIP row** (top): each switch is a filled box when ON and an outline when OFF.
+- **60 Hz LED** (left): a filled dot when D12 is lit (locked, DIP 1 ON), an empty circle when it is off, the same as the real LED on D12.
+- **Fade bar** (right, only while DIP 3 is ON): full at 100 %, emptying to 0 % over the 3 s fade, with the % under it; an empty outline when no fade runs.
+
+With the knob on **D3** the same gauge shows the **D3 frequency, 0–15000 Hz** (scale ends `0` / `15k`, ticks every 1500 Hz): the big number is the D3 Hz, and the bottom row turns white with `KNOB: D3  0-15000 Hz`. No speed is shown in D3 mode.
 
 A 1.3" SH1106 OLED is not supported by this library (it would show a shifted picture).
 
