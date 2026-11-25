@@ -2,13 +2,12 @@
 //
 // Arduino Nano (ATmega328P). One Nano, three sections (from the hand drawing):
 //   1. Fade:  an encoder long press starts a 15 kHz PWM on D3 that fades from
-//             100 % to 0 % duty in 3 s, shown on 3 LEDs.
+//             100 % to 0 % duty in 3 s.
 //   2. Inputs: Freq 1 / Freq 2 input are copied to Freq 1 / Freq 2 output;
 //             D12 (60 Hz logic 1) goes HIGH when Freq 1 input reaches 60 Hz
 //             (10 km/h) and stays HIGH (LOCKED) until the power is restarted or RESET is pressed.
 //   3. Pot:   the EC11 encoder sets 0-250 km/h; Freq 1 / Freq 2 output in pot give
-//             km/h x 6 Hz (0-1500 Hz). A TM1637 shows the speed and the fade;
-//             a 0.96" I2C OLED, if connected, shows the speed
+//             km/h x 6 Hz (0-1500 Hz). A 0.96" I2C OLED, if connected, shows the speed
 //             (Freq / 6) on a gauge.
 //
 // Pins:
@@ -26,10 +25,11 @@
 //        turn: speed 0-250 km/h, 1 km/h per click (5 when spun fast), or D3 Hz
 //        short press: knob on speed <-> knob on D3 (0-15000 Hz, 100 Hz per click, 500 fast)
 //        long press (1 s): start the D3 fade (again)
-//   D4 / D2   TM1637 CLK / DIO (4 digits), auto-detected
 //   A4 / A5   OLED SDA / SCL (SSD1306 128x64 I2C, 0x3C or 0x3D), auto-detected
-//   Fade LEDs 3 LEDs, each pin -> 220-330 ohm -> LED (+), LED (-) -> GND.
-//             LED 1 (bottom) .. LED 3 (top) = A3, D11, D13
+//   DIP switch (3 pins, each switch pin -> GND, internal pull-ups; ON = closed = LOW):
+//        1 -> D2   D12 60 Hz logic 1:  OFF = D12 LOW and not locking, ON = working
+//        2 -> D4   D6 / D5 encoder frequency out: OFF = stopped LOW, ON = back at the knob speed
+//        3 -> D11  D3 15 kHz fade out: OFF = D3 LOW, no fade (long press ignored), ON = enabled
 // USB Serial Monitor: 115200 baud, a status line twice a second.
 //
 // Timers: Timer0 = millis(), Timer1 = D6 / D5 (toggled in its interrupt),
@@ -57,10 +57,10 @@ constexpr uint8_t PIN_IN1 = 8, PIN_IN2 = 7;       // Freq 1 / 2 input.
 constexpr uint8_t PIN_POT1 = 6, PIN_POT2 = 5;     // Freq 1 / 2 output in pot.
 constexpr uint8_t PIN_LOGIC = 12, PIN_FADE = 3;
 constexpr uint8_t PIN_ENC_A = A2, PIN_ENC_B = A1, PIN_ENC_SW = A0;  // EC11 A, B, C (button).
-// Fade bar graph: LED 1 (bottom, last to go out) .. LED 7 (top, first to go out).
-// D13 is also the Nano's onboard L LED, which blinks briefly on reset.
-constexpr uint8_t PIN_LED[] = {A3, 11, 13};
-constexpr uint8_t LED_COUNT = sizeof(PIN_LED);
+constexpr uint8_t PIN_DIP_LOGIC = 2, PIN_DIP_SPEED = 4, PIN_DIP_FADE = 11;  // DIP 1 / 2 / 3.
+
+// DIP switch state, ON = enabled (read in updateDip(), all ON until then).
+bool dipLogic = true, dipSpeed = true, dipFade = true;
 
 // ========= D6 / D5: Freq 1 / 2 output in pot (Timer1 interrupt) ============
 // D5 / D6 are Timer0's pins (millis), so Timer1 runs in CTC mode without pins
@@ -183,30 +183,11 @@ void updateFade(uint32_t now) {
   setFadeDuty(1.0f - float(t) / FADE_MS);
 }
 
-// ========================= Fade LEDs: bar graph =============================
-// LEDs lit = D3 duty x 3, rounded up: all 3 at 100 %, the top one goes out
-// below 66.7 %, ... LED 1 goes out at 0 %. With D3 set by hand: its
-// frequency / 15000 Hz x 3 instead.
-void ledsBegin() {
-  for (uint8_t pin : PIN_LED) { pinMode(pin, OUTPUT); digitalWrite(pin, LOW); }
-}
-
-uint8_t ledsLit = 0;
-
-void updateLeds() {
-  const float level = fading ? fadeDuty : float(d3Hz) / D3_MAX_HZ;
-  uint8_t lit = level <= 0 ? 0 : uint8_t(ceilf(level * LED_COUNT - 0.001f));
-  if (lit > LED_COUNT) lit = LED_COUNT;
-  if (lit == ledsLit) return;
-  ledsLit = lit;
-  for (uint8_t i = 0; i < LED_COUNT; i++) digitalWrite(PIN_LED[i], i < lit ? HIGH : LOW);
-}
-
 // Start-up check (runs first, all pins still inputs): drive each output pin
 // LOW alone and see whether A4 (SDA) or A5 (SCL) follows it, i.e. that pin is
 // wired / bridged to the I2C bus (D9 was, on the earlier perfboard).
 void pinsCheckI2c() {
-  static const uint8_t PINS[] = {10, 9, 6, 5, 12, 3, A3, 11, 13, 2, 4};
+  static const uint8_t PINS[] = {10, 9, 6, 5, 12, 3};
   pinMode(A4, INPUT_PULLUP); pinMode(A5, INPUT_PULLUP);
   delay(2);
   Serial.print(F("# I2C idle: SDA(A4) ")); Serial.print(digitalRead(A4));
@@ -317,77 +298,23 @@ void updateEncoder(uint32_t now) {
   if (knobD3) {
     fading = false;
     const long hz = constrain(long(d3Hz) + clicks * long(fast ? D3_FAST_STEP_HZ : D3_STEP_HZ), 0L, long(D3_MAX_HZ));
-    setD3Hz(hz);
-    Serial.print(F("# D3 ")); Serial.print(hz); Serial.println(F(" Hz"));
+    if (dipFade) setD3Hz(hz); else d3Hz = hz;  // DIP 3 OFF: kept, D3 stays LOW until ON.
+    Serial.print(F("# D3 ")); Serial.print(hz); Serial.println(dipFade ? F(" Hz") : F(" Hz (DIP 3 OFF: D3 LOW)"));
     return;
   }
   kmh = constrain(kmh + clicks * (fast ? FAST_STEP_KMH : 1), 0, MAX_KMH);
-  setOutHz(uint16_t(kmh) * HZ_PER_KMH);
+  if (dipSpeed) setOutHz(uint16_t(kmh) * HZ_PER_KMH);  // DIP 2 OFF: D6 / D5 stay LOW until ON.
   Serial.print(F("# SPEED ")); Serial.print(kmh); Serial.print(F(" km/h = "));
   Serial.print(outHz); Serial.println(F(" Hz on D6 / D5"));
 }
 
-// ================== Displays: TM1637 and OLED, auto-detected ================
-// TM1637 on D4 (CLK) / D2 (DIO); OLED on A4 (SDA) / A5 (SCL). Each is looked
-// for at start-up, then every 2 s while it is missing (so it can be plugged in
-// while the box runs); a TM1637 that stops answering is looked for again.
-// Either one, or both at once, can be connected.
-//   TM1637: a command is sent and its acknowledge bit read (DIO pulled LOW
-//           on the 9th clock).
-//   OLED:   I2C probe of 0x3C, then 0x3D.
-bool tmOk = false, oledOk = false;
-uint32_t tmProbeMs = 0, oledProbeMs = 0;
+// ========================= Display: OLED, auto-detected =====================
+// OLED on A4 (SDA) / A5 (SCL): looked for at start-up (I2C probe of 0x3C,
+// then 0x3D), then every 2 s while it is missing, so it can be plugged in
+// while the box runs.
+bool oledOk = false;
+uint32_t oledProbeMs = 0;
 
-// ------------------------------ TM1637 --------------------------------------
-// 4 digits: the speed in km/h (right-aligned), or "F" + the fade duty % while
-// the D3 fade runs ("F100" .. "F  0"). Bit-banged: open-drain, a pin is pulled
-// LOW as an OUTPUT and released (pull-up) as an INPUT. Bytes go LSB first.
-constexpr uint8_t TM_DIO = 2, TM_CLK = 4;
-const uint8_t TM_DIGITS[10] = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
-constexpr uint8_t TM_F = 0x71;
-
-inline void tmLow(uint8_t pin) { pinMode(pin, OUTPUT); digitalWrite(pin, LOW); }
-inline void tmHigh(uint8_t pin) { pinMode(pin, INPUT_PULLUP); }
-inline void tmWait() { delayMicroseconds(50); }  // Modules have caps on CLK / DIO: go slow.
-
-void tmStart() { tmHigh(TM_DIO); tmHigh(TM_CLK); tmWait(); tmLow(TM_DIO); tmWait(); }
-void tmStop() { tmLow(TM_CLK); tmWait(); tmLow(TM_DIO); tmWait(); tmHigh(TM_CLK); tmWait(); tmHigh(TM_DIO); tmWait(); }
-
-bool tmByte(uint8_t b) {  // true = acknowledged.
-  for (uint8_t i = 0; i < 8; i++, b >>= 1) {
-    tmLow(TM_CLK); tmWait();
-    if (b & 1) tmHigh(TM_DIO); else tmLow(TM_DIO);
-    tmWait(); tmHigh(TM_CLK); tmWait();
-  }
-  tmLow(TM_CLK); tmHigh(TM_DIO); tmWait();
-  tmHigh(TM_CLK); tmWait();
-  const bool ack = digitalRead(TM_DIO) == LOW;
-  tmLow(TM_CLK); tmWait();
-  return ack;
-}
-
-bool tmCommand(uint8_t c) { tmStart(); const bool ack = tmByte(c); tmStop(); return ack; }
-
-// Show 4 segment bytes, full brightness. false = the TM1637 didn't answer.
-bool tmShow(const uint8_t seg[4]) {
-  bool ok = tmCommand(0x40);  // Write data, auto-increment address.
-  tmStart();
-  ok &= tmByte(0xC0);         // From digit 0.
-  for (uint8_t i = 0; i < 4; i++) ok &= tmByte(seg[i]);
-  tmStop();
-  ok &= tmCommand(0x8F);      // Display on, brightness 7.
-  return ok;
-}
-
-// Right-aligned number in digits 1-3 (0-999), digit 0 = first.
-void tmNumber(uint8_t seg[4], uint8_t first, int v) {
-  seg[0] = first;
-  seg[1] = v >= 100 ? TM_DIGITS[v / 100 % 10] : 0;
-  seg[2] = v >= 10 ? TM_DIGITS[v / 10 % 10] : 0;
-  seg[3] = TM_DIGITS[v % 10];
-}
-
-// ------------------------------- OLED ---------------------------------------
 //   F73%                   LOCK     <- fade duty while fading / D12 locked
 //            gauge 0-250 kph
 //   720Hz      120 kph              <- output in pot Hz, speed = Hz / 6
@@ -397,21 +324,6 @@ Adafruit_SSD1306 oled(128, 64, &Wire, -1, 400000UL, 400000UL);
 bool i2cProbe(uint8_t addr) {
   Wire.beginTransmission(addr);
   return Wire.endTransmission() == 0;
-}
-
-void tmDetect() {
-  tmProbeMs = millis();
-  tmOk = tmCommand(0x40);
-  static bool told = false;
-  if (!tmOk) {
-    if (!told) { told = true; Serial.println(F("# TM1637 not found (CLK D4, DIO D2)")); }
-    return;
-  }
-  told = false;
-  Serial.println(F("# TM1637 found (CLK D4, DIO D2)"));
-  static const uint8_t DASH[4] = {0x40, 0x40, 0x40, 0x40};
-  tmShow(DASH);  // "----" for 0.5 s.
-  delay(500);
 }
 
 void oledDetect() {
@@ -451,6 +363,63 @@ void gaugePoint(float v, float r, int16_t& x, int16_t& y) {
 }
 
 bool locked = false;  // D12, set in loop().
+
+// ============================ DIP switch ====================================
+// Read every 10 ms; a switch must read the same for 50 ms before it counts
+// (contact bounce). Each change takes effect at once:
+//   DIP 1 (D2)  D12 logic: OFF = D12 LOW, no locking; ON = D12 shows the lock again
+//               (a lock from before is kept, a new one can happen).
+//   DIP 2 (D4)  D6 / D5: OFF = stopped LOW (the knob still sets the speed);
+//               ON = back at the knob speed.
+//   DIP 3 (D11) D3: OFF = a running fade stops, D3 LOW, long press ignored;
+//               ON = the fade works again (and a D3 Hz set by hand comes back).
+void dipBegin() {
+  pinMode(PIN_DIP_LOGIC, INPUT_PULLUP);
+  pinMode(PIN_DIP_SPEED, INPUT_PULLUP);
+  pinMode(PIN_DIP_FADE, INPUT_PULLUP);
+  delay(2);
+}
+
+void applyDip(uint8_t i, bool on) {
+  switch (i) {
+    case 0:
+      dipLogic = on;
+      digitalWrite(PIN_LOGIC, on && locked ? HIGH : LOW);
+      Serial.println(on ? F("# DIP 1 (D2) ON: D12 60 Hz logic enabled") : F("# DIP 1 (D2) OFF: D12 60 Hz logic disabled (LOW)"));
+      break;
+    case 1:
+      dipSpeed = on;
+      setOutHz(on ? uint16_t(kmh) * HZ_PER_KMH : 0);
+      Serial.println(on ? F("# DIP 2 (D4) ON: D6 / D5 encoder frequency out enabled") : F("# DIP 2 (D4) OFF: D6 / D5 encoder frequency out disabled (LOW)"));
+      break;
+    default:
+      dipFade = on;
+      if (!on) {
+        const uint16_t keep = d3Hz;
+        fading = false;
+        setFadeDuty(0);  // D3 LOW.
+        setD3Hz(0);
+        d3Hz = keep;     // Comes back when DIP 3 is ON again.
+      } else if (d3Hz) setD3Hz(d3Hz);
+      Serial.println(on ? F("# DIP 3 (D11) ON: D3 15 kHz fade out enabled") : F("# DIP 3 (D11) OFF: D3 15 kHz fade out disabled (LOW)"));
+      break;
+  }
+}
+
+// force: apply all three now (start-up).
+void updateDip(uint32_t now, bool force = false) {
+  static const uint8_t PINS[3] = {PIN_DIP_LOGIC, PIN_DIP_SPEED, PIN_DIP_FADE};
+  static bool stable[3] = {true, true, true}, last[3] = {true, true, true};
+  static uint32_t changeMs[3] = {0, 0, 0}, readMs = 0;
+  if (!force && now - readMs < 10) return;
+  readMs = now;
+  for (uint8_t i = 0; i < 3; i++) {
+    const bool on = digitalRead(PINS[i]) == LOW;  // Closed to GND = ON.
+    if (force) { last[i] = stable[i] = on; applyDip(i, on); continue; }
+    if (on != last[i]) { last[i] = on; changeMs[i] = now; }
+    if (on != stable[i] && now - changeMs[i] >= 50) { stable[i] = on; applyDip(i, on); }
+  }
+}
 
 // The gauge shows the speed (0-250 kph), or, with the knob on D3, the D3
 // frequency (0-15000 Hz on the same arc: ticks every 1500 Hz, long every 3000).
@@ -515,45 +484,13 @@ void drawOled() {
   oled.display();  // ~25 ms; the outputs run on timers / interrupts meanwhile.
 }
 
-// TM1637: F + fade % while fading; with the knob on D3, the D3 frequency in
-// kHz with the colon as the point ("15:00" = 15.00 kHz, " 2:50" = 2.50 kHz);
-// else the speed. Sent only when it changes (and once a second, which also
-// checks it is still there).
-void drawTm(uint32_t now) {
-  static uint8_t shown[4] = {0xFF, 0xFF, 0xFF, 0xFF};
-  static uint32_t sentMs = 0;
-  uint8_t seg[4];
-  if (fading) tmNumber(seg, TM_F, int(fadeDuty * 100 + 0.5f));
-  else if (knobD3) {
-    const uint16_t v = d3Hz / 10;  // 10 Hz units: 1500 = 15.00 kHz.
-    seg[0] = v >= 1000 ? TM_DIGITS[v / 1000] : 0;
-    seg[1] = TM_DIGITS[v / 100 % 10] | 0x80;  // Colon.
-    seg[2] = TM_DIGITS[v / 10 % 10];
-    seg[3] = TM_DIGITS[v % 10];
-  }
-  else tmNumber(seg, 0, kmh);
-  if (!memcmp(seg, shown, 4) && now - sentMs < 1000) return;
-  sentMs = now;
-  memcpy(shown, seg, 4);
-  if (!tmShow(seg)) {
-    Serial.println(F("# TM1637 stopped answering"));
-    memset(shown, 0xFF, 4);
-    tmOk = false;
-    tmProbeMs = now;
-  }
-}
-
 void updateDisplay(uint32_t now) {
-  if (!tmOk && now - tmProbeMs >= 2000) tmDetect();
   if (!oledOk && now - oledProbeMs >= 2000) oledDetect();
   static uint32_t lastMs = 0;
   if (now - lastMs < 100) return;
   lastMs = now;
-  if (tmOk) drawTm(now);
   if (oledOk) drawOled();
 }
-
-void displayDetect() { tmDetect(); oledDetect(); }
 
 // =============================== Setup / loop ===============================
 void setup() {
@@ -569,7 +506,8 @@ void setup() {
   encoderBegin();
   setOutHz(0);
   fadeBegin();
-  ledsBegin();
+  dipBegin();
+  updateDip(millis(), true);
 
   // Inputs with pull-up: unconnected reads HIGH (0 Hz), no mains hum, and
   // open-collector Hall sensors work. The copies start at the input level.
@@ -584,11 +522,14 @@ void setup() {
   PCMSK2 |= _BV(PCINT23);  // D7.
   PCICR |= _BV(PCIE0) | _BV(PCIE2);
 
-  displayDetect();
+  oledDetect();
 }
 
 void loop() {
   const uint32_t now = millis();
+
+  // 0. DIP switch: D12 logic / D6-D5 speed out / D3 fade on or off.
+  updateDip(now);
 
   // 1. Encoder turns -> speed -> D6 / D5.
   updateEncoder(now);
@@ -608,12 +549,12 @@ void loop() {
   }
   if (swStable == LOW && !longDone && now - swDownMs >= 1000) {
     longDone = true;  // Once per press: release and hold again to restart.
-    startFade(now);
+    if (dipFade) startFade(now);
+    else Serial.println(F("# FADE ignored: DIP 3 (D11) OFF"));
   }
 
-  // 3. D3 fade and its LED bar graph.
+  // 3. D3 fade.
   updateFade(now);
-  updateLeds();
 
   // 4. Inputs every 250 ms, and the 60 Hz LOCKED logic output.
   static uint32_t measureMs = 0;
@@ -621,7 +562,7 @@ void loop() {
     measureMs = now;
     in1.measure();
     in2.measure();
-    if (!locked && in1.hz >= LOCK_HZ) {
+    if (dipLogic && !locked && in1.hz >= LOCK_HZ) {  // DIP 1 OFF: no locking.
       locked = true;
       digitalWrite(PIN_LOGIC, HIGH);
       Serial.println(F("# D12 LOCKED HIGH: Freq 1 input reached 60 Hz (power restart or RESET to clear)"));
@@ -643,6 +584,8 @@ void loop() {
     if (fading) { Serial.print(F(" | D3 FADE ")); Serial.print(int(fadeDuty * 100 + 0.5f)); Serial.print(F(" %")); }
     else { Serial.print(F(" | D3 ")); Serial.print(d3Hz); Serial.print(F(" Hz")); }
     Serial.print(knobD3 ? F(" | KNOB D3") : F(" | KNOB SPEED"));
+    Serial.print(F(" | DIP ")); Serial.print(dipLogic ? F("1on ") : F("1off "));
+    Serial.print(dipSpeed ? F("2on ") : F("2off ")); Serial.print(dipFade ? F("3on") : F("3off"));
     Serial.print(F(" | EC11 A(A2) ")); Serial.print(digitalRead(PIN_ENC_A)); Serial.print(F(" B(A1) ")); Serial.print(digitalRead(PIN_ENC_B)); Serial.print(F(" C(A0) ")); Serial.println(swStable == LOW ? F("pressed") : F("up"));
   }
 }
