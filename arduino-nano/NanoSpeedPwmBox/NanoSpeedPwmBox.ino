@@ -1,7 +1,7 @@
 // Nano Speed / PWM Box
 //
 // Arduino Nano (ATmega328P). One Nano, three sections (from the hand drawing):
-//   1. Fade:  an encoder long press starts a 15 kHz PWM on D3 that fades from
+//   1. Fade:  an encoder short press starts a 15 kHz PWM on D3 that fades from
 //             100 % to 0 % duty in 3 s.
 //   2. Inputs: Freq 1 / Freq 2 input are copied to Freq 1 / Freq 2 output;
 //             D12 (60 Hz logic 1) goes HIGH when Freq 1 input reaches 60 Hz
@@ -19,18 +19,18 @@
 //   D5   OUT  Freq 2 output in pot, the same frequency as D6, in phase
 //   D12  OUT  60 Hz logic 1: HIGH (LOCKED) once Freq 1 input >= 60 Hz (10 km/h);
 //             only a power restart or the RESET button makes it LOW again
-//   D3   OUT  Fade: 15 kHz PWM, 100 % -> 0 % duty in 3 s on an encoder long press, then LOW;
+//   D3   OUT  Fade: 15 kHz PWM, 100 % -> 0 % duty in 3 s on an encoder short press, then LOW;
 //             or, knob on D3, a 0-15000 Hz square wave set by hand, 50 % duty (Timer2 OC2B)
 //   Encoder (EC11) A -> A2, B -> A1, C (button) -> A0, + -> 5V, GND -> GND
 //        turn: speed 0-250 km/h, 1 km/h per click (5 when spun fast), or D3 Hz
-//        short press: knob on speed <-> knob on D3 (0-15000 Hz, 100 Hz per click, 500 fast)
-//        long press (1 s): start the D3 fade (again)
+//        short press: start the D3 15 kHz fade (again)
+//        long press (1 s): knob on speed <-> knob on D3 (0-15000 Hz, 100 Hz per click, 500 fast)
 //   A4 / A5   OLED SDA / SCL (SSD1306 128x64 I2C, 0x3C or 0x3D), auto-detected
 //   DIP switch (3 pins, each switch pin -> GND, internal pull-ups; ON = closed = LOW,
 //             open / not connected = OFF; DIP_TO_GND = false for a switch to 5V):
 //        1 -> D2   D12 60 Hz logic 1:  OFF = D12 LOW and not locking, ON = working
 //        2 -> D4   D6 / D5 encoder frequency out: OFF = stopped LOW, ON = back at the knob speed
-//        3 -> D11  D3 15 kHz fade out: OFF = D3 LOW, no fade (long press ignored), ON = enabled
+//        3 -> D11  D3 15 kHz fade out: OFF = D3 LOW, no fade (short press ignored), ON = enabled
 // USB Serial Monitor: 115200 baud, a status line twice a second.
 //
 // Timers: Timer0 = millis(), Timer1 = D6 / D5 (toggled in its interrupt),
@@ -128,7 +128,7 @@ void fadeBegin() {
   setFadeDuty(0);
 }
 
-// ============ D3: 0-15000 Hz by hand (Timer2, short press = knob) ===========
+// ============ D3: 0-15000 Hz by hand (Timer2, long press = knob) ============
 // Same fast PWM mode, but TOP (OCR2A) and the prescaler set the frequency:
 // f = F_CPU / (N x (TOP+1)), the smallest N that fits TOP in 8 bits, 50 %
 // duty (OCR2B = half). 15000 Hz -> /8, TOP 132 (15.04 kHz); 100 Hz -> /1024,
@@ -287,7 +287,7 @@ void encoderBegin() {
 }
 
 int kmh = 0;  // Speed set by the encoder.
-bool knobD3 = false;  // Short press toggles: false = knob sets the speed, true = D3 Hz.
+bool knobD3 = false;  // Long press toggles: false = knob sets the speed, true = D3 Hz.
 
 // Turns: speed (1 km/h per click, 5 when spun fast; D6 / D5 = km/h x 6 Hz),
 // or, with the knob on D3, D3 0-15000 Hz (100 Hz per click, 500 fast).
@@ -376,7 +376,7 @@ bool locked = false;  // D12, set in loop().
 //               (a lock from before is kept, a new one can happen).
 //   DIP 2 (D4)  D6 / D5: OFF = stopped LOW (the knob still sets the speed);
 //               ON = back at the knob speed.
-//   DIP 3 (D11) D3: OFF = a running fade stops, D3 LOW, long press ignored;
+//   DIP 3 (D11) D3: OFF = a running fade stops, D3 LOW, short press ignored;
 //               ON = the fade works again (and a D3 Hz set by hand comes back).
 void dipBegin() {
   const uint8_t mode = DIP_TO_GND ? INPUT_PULLUP : INPUT;  // To 5V: external pull-downs.
@@ -546,7 +546,8 @@ void loop() {
   // 1. Encoder turns -> speed -> D6 / D5.
   updateEncoder(now);
 
-  // 2. Encoder button (A0): long press (1 s) starts the 3 s fade.
+  // 2. Encoder button (A0): short press starts the 3 s 15 kHz fade (again),
+  //    long press (1 s) switches the knob between speed and D3 Hz.
   static bool swPrev = HIGH, swStable = HIGH, longDone = false;
   static uint32_t swChangeMs = 0, swDownMs = 0;
   const bool raw = digitalRead(PIN_ENC_SW);
@@ -554,15 +555,15 @@ void loop() {
   if (now - swChangeMs >= 30 && raw != swStable) {
     swStable = raw;
     if (swStable == LOW) { swDownMs = now; longDone = false; }
-    else if (!longDone) {  // Short press (released before 1 s): switch the knob.
-      knobD3 = !knobD3;
-      Serial.println(knobD3 ? F("# KNOB: D3 frequency 0-15000 Hz") : F("# KNOB: speed (D6 / D5)"));
+    else if (!longDone) {  // Short press (released before 1 s): 15 kHz fade.
+      if (dipFade) startFade(now);
+      else Serial.println(F("# FADE ignored: DIP 3 (D11) OFF"));
     }
   }
   if (swStable == LOW && !longDone && now - swDownMs >= 1000) {
-    longDone = true;  // Once per press: release and hold again to restart.
-    if (dipFade) startFade(now);
-    else Serial.println(F("# FADE ignored: DIP 3 (D11) OFF"));
+    longDone = true;  // Once per press.
+    knobD3 = !knobD3;
+    Serial.println(knobD3 ? F("# KNOB: D3 frequency 0-15000 Hz") : F("# KNOB: speed (D6 / D5)"));
   }
 
   // 3. D3 fade.
