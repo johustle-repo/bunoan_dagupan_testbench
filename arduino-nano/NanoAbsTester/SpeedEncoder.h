@@ -192,12 +192,16 @@ void checkInputs(unsigned long now, bool rearEdge, bool frontEdge) {
   }
 }
 
-// Page 1 on (outputs back at the knob's speed) or off (stopped; the knob's
-// speed is kept for when page 1 comes back).
+// Page 1 on or off (stopped). Leaving page 1 sets the knob speed to 0, so
+// page 1 always comes back at 0 km/h (D9 / D10 / D4 / D11 stay LOW until turned up).
 void setActive(bool on) {
   if (on == active) return;
   active = on;
-  if (!on) rearOffsetHz = 0;  // Drop a running TCS pulse.
+  if (!on) {
+    rearOffsetHz = 0;  // Drop a running TCS pulse.
+    if (kmh) Serial.println(F("# SPEED ENC page left -> speed 0"));
+    kmh = 0;
+  }
   braking = recovering = false;  // Drop a brake too: page 1 comes back at the knob speed.
   outKmh = kmh;
   apply();
