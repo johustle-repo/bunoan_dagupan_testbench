@@ -35,7 +35,9 @@ Read every 10 ms (50 ms debounce); a change works at once, also while running. *
 | 2 | **D4** | **D6 / D5 encoder frequency out disabled**: stopped LOW; the knob still sets the speed | Enabled again: back at the knob speed |
 | 3 | **D11** | **D3 15 kHz fade out disabled**: a running fade stops, D3 LOW, long press ignored | Enabled again (a D3 Hz set by hand comes back too) |
 
-Serial Monitor: `# DIP 1 (D2) OFF: ...` on each change, and `DIP 1on 2on 3on` in the status line. No DIP switch connected = all ON (pull-ups).
+Serial Monitor: `# DIP 1 (D2) OFF: ...` on each change, and `DIP 1on 2on 3on` in the status line. An **open switch, or no DIP switch connected, reads OFF** (the pull-up holds the pin HIGH), so close a switch to GND to enable its output. The OLED shows `D12off`, `OUT OFF` and `D3 OFF` for switches that are OFF.
+
+**The switch common must go to GND.** Wired to 5V, both positions read HIGH (pull-up), so the switches do nothing. For a switch to 5V, set `DIP_TO_GND = false` and fit a 10 kΩ pull-down from each of D2 / D4 / D11 to GND.
 
 ### Display: OLED (auto-detected)
 

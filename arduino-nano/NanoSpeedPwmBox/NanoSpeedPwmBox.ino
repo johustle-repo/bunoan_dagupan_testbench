@@ -26,7 +26,8 @@
 //        short press: knob on speed <-> knob on D3 (0-15000 Hz, 100 Hz per click, 500 fast)
 //        long press (1 s): start the D3 fade (again)
 //   A4 / A5   OLED SDA / SCL (SSD1306 128x64 I2C, 0x3C or 0x3D), auto-detected
-//   DIP switch (3 pins, each switch pin -> GND, internal pull-ups; ON = closed = LOW):
+//   DIP switch (3 pins, each switch pin -> GND, internal pull-ups; ON = closed = LOW,
+//             open / not connected = OFF; DIP_TO_GND = false for a switch to 5V):
 //        1 -> D2   D12 60 Hz logic 1:  OFF = D12 LOW and not locking, ON = working
 //        2 -> D4   D6 / D5 encoder frequency out: OFF = stopped LOW, ON = back at the knob speed
 //        3 -> D11  D3 15 kHz fade out: OFF = D3 LOW, no fade (long press ignored), ON = enabled
@@ -50,6 +51,10 @@ constexpr int FAST_STEP_KMH = 5;       // Encoder spun quickly.
 constexpr unsigned long FAST_MS = 40;  // Clicks closer than this = fast.
 constexpr int8_t STEPS_PER_CLICK = 4;  // Encoder transitions per detent (EC11).
 constexpr bool ENC_REVERSE = false;    // true if clockwise makes it slower.
+// DIP switch wiring. true: switch common -> GND, internal pull-ups, ON = pin LOW
+// (an open switch, or no DIP switch, reads OFF). false: common -> 5V, a 10 k
+// pull-down resistor from each pin to GND, ON = pin HIGH.
+constexpr bool DIP_TO_GND = true;
 
 // ------------------------------- Pins ---------------------------------------
 constexpr uint8_t PIN_COPY1 = 10, PIN_COPY2 = 9;  // Freq 1 / 2 output (copies of the inputs).
@@ -59,7 +64,7 @@ constexpr uint8_t PIN_LOGIC = 12, PIN_FADE = 3;
 constexpr uint8_t PIN_ENC_A = A2, PIN_ENC_B = A1, PIN_ENC_SW = A0;  // EC11 A, B, C (button).
 constexpr uint8_t PIN_DIP_LOGIC = 2, PIN_DIP_SPEED = 4, PIN_DIP_FADE = 11;  // DIP 1 / 2 / 3.
 
-// DIP switch state, ON = enabled (read in updateDip(), all ON until then).
+// DIP switch state, ON = enabled (read at start-up and in updateDip()).
 bool dipLogic = true, dipSpeed = true, dipFade = true;
 
 // ========= D6 / D5: Freq 1 / 2 output in pot (Timer1 interrupt) ============
@@ -374,11 +379,14 @@ bool locked = false;  // D12, set in loop().
 //   DIP 3 (D11) D3: OFF = a running fade stops, D3 LOW, long press ignored;
 //               ON = the fade works again (and a D3 Hz set by hand comes back).
 void dipBegin() {
-  pinMode(PIN_DIP_LOGIC, INPUT_PULLUP);
-  pinMode(PIN_DIP_SPEED, INPUT_PULLUP);
-  pinMode(PIN_DIP_FADE, INPUT_PULLUP);
+  const uint8_t mode = DIP_TO_GND ? INPUT_PULLUP : INPUT;  // To 5V: external pull-downs.
+  pinMode(PIN_DIP_LOGIC, mode);
+  pinMode(PIN_DIP_SPEED, mode);
+  pinMode(PIN_DIP_FADE, mode);
   delay(2);
 }
+
+inline bool dipReadOn(uint8_t pin) { return (digitalRead(pin) == LOW) == DIP_TO_GND; }
 
 void applyDip(uint8_t i, bool on) {
   switch (i) {
@@ -414,7 +422,7 @@ void updateDip(uint32_t now, bool force = false) {
   if (!force && now - readMs < 10) return;
   readMs = now;
   for (uint8_t i = 0; i < 3; i++) {
-    const bool on = digitalRead(PINS[i]) == LOW;  // Closed to GND = ON.
+    const bool on = dipReadOn(PINS[i]);
     if (force) { last[i] = stable[i] = on; applyDip(i, on); continue; }
     if (on != last[i]) { last[i] = on; changeMs[i] = now; }
     if (on != stable[i] && now - changeMs[i] >= 50) { stable[i] = on; applyDip(i, on); }
@@ -449,7 +457,8 @@ void drawOled() {
     oled.setCursor(0, 0);
     oled.print(F("F")); oled.print(int(fadeDuty * 100 + 0.5f)); oled.print('%');
   }
-  if (locked) {
+  if (!dipLogic) { oled.setCursor(92, 1); oled.print(F("D12off")); }  // DIP 1 OFF: D12 held LOW.
+  else if (locked) {
     oled.fillRect(102, 0, 26, 9, SSD1306_WHITE);
     oled.setTextColor(SSD1306_BLACK);
     oled.setCursor(104, 1); oled.print(F("LOCK"));
@@ -468,7 +477,7 @@ void drawOled() {
   // Bottom row, knob on D3 (inverted): "KNOB: D3", Hz only; else the D6 Hz
   // beside the speed and the inputs in km/h.
   if (knobD3) {
-    if (!fading) { oled.setCursor(0, 0); oled.print(F("D3")); }  // Top left (the fade % goes there while fading).
+    if (!fading) { oled.setCursor(0, 0); oled.print(dipFade ? F("D3") : F("D3 OFF")); }  // Top left (the fade % goes there while fading).
     oled.fillRect(0, 56, 128, 8, SSD1306_WHITE);
     oled.setTextColor(SSD1306_BLACK);
     oled.setCursor(2, 57); oled.print(F("KNOB: D3  0-15000 Hz"));
@@ -476,7 +485,10 @@ void drawOled() {
     oled.display();
     return;
   }
-  oled.setCursor(0, 47); oled.print(outHz); oled.print(F("Hz"));
+  oled.setCursor(0, 47);
+  if (dipSpeed) { oled.print(outHz); oled.print(F("Hz")); }
+  else oled.print(F("OUT OFF"));  // DIP 2 OFF: D6 / D5 held LOW.
+  if (!dipFade) { oled.setCursor(0, 0); oled.print(F("D3 OFF")); }  // DIP 3 OFF (never fading then).
   snprintf(s, sizeof s, "%3d", int(in1.hz / HZ_PER_KMH + 0.5f));
   oled.setCursor(0, 57); oled.print(F("IN1 ")); oled.print(s);
   snprintf(s, sizeof s, "%3d", int(in2.hz / HZ_PER_KMH + 0.5f));
@@ -580,7 +592,7 @@ void loop() {
     Serial.print(F(" ")); Serial.print(kmh); Serial.print(F(" km/h, D6/D5 ")); Serial.print(outHz);
     Serial.print(F(" Hz | IN1 D8 ")); Serial.print(in1.hz, 1); Serial.print(F(" Hz -> D10"));
     Serial.print(F(" | IN2 D7 ")); Serial.print(in2.hz, 1); Serial.print(F(" Hz -> D9"));
-    Serial.print(F(" | D12 ")); Serial.print(locked ? F("LOCKED") : F("LOW"));
+    Serial.print(F(" | D12 ")); Serial.print(!dipLogic ? F("OFF (DIP 1)") : locked ? F("LOCKED") : F("LOW"));
     if (fading) { Serial.print(F(" | D3 FADE ")); Serial.print(int(fadeDuty * 100 + 0.5f)); Serial.print(F(" %")); }
     else { Serial.print(F(" | D3 ")); Serial.print(d3Hz); Serial.print(F(" Hz")); }
     Serial.print(knobD3 ? F(" | KNOB D3") : F(" | KNOB SPEED"));
