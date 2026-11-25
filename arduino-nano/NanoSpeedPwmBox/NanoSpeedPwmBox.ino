@@ -4,7 +4,7 @@
 //   1. Fade:  an encoder short press starts a 15 kHz PWM on D3 that fades from
 //             100 % to 0 % duty in 3 s.
 //   2. Inputs: Freq 1 / Freq 2 input are copied to Freq 1 / Freq 2 output;
-//             D12 (60 Hz logic 1) goes HIGH when Freq 1 input reaches 60 Hz
+//             D12 (60 Hz logic 1 LED) goes HIGH when the knob is at 10 km/h or Freq 1 input reaches 60 Hz
 //             (10 km/h) and stays HIGH (LOCKED) until the power is restarted or RESET is pressed.
 //   3. Pot:   the EC11 encoder sets 0-250 km/h; Freq 1 / Freq 2 output in pot give
 //             km/h x 6 Hz (0-1500 Hz). A 0.96" I2C OLED, if connected, shows the speed
@@ -17,7 +17,7 @@
 //   D7   IN   Freq 2 input (pin-change interrupt, internal pull-up)
 //   D6   OUT  Freq 1 output in pot, 0-1500 Hz square wave, 50 % duty
 //   D5   OUT  Freq 2 output in pot, the same frequency as D6, in phase
-//   D12  OUT  60 Hz logic 1: HIGH (LOCKED) once Freq 1 input >= 60 Hz (10 km/h);
+//   D12  OUT  60 Hz logic 1: HIGH (LOCKED) once the knob >= 10 km/h (60 Hz) or Freq 1 input >= 60 Hz, DIP 1 ON;
 //             only a power restart or the RESET button makes it LOW again
 //   D3   OUT  Fade: 15 kHz PWM, 100 % -> 0 % duty in 3 s on an encoder short press, then LOW;
 //             or, knob on D3, a 0-15000 Hz square wave set by hand, 50 % duty (Timer2 OC2B)
@@ -588,10 +588,14 @@ void loop() {
     measureMs = now;
     in1.measure();
     in2.measure();
-    if (dipLogic && !locked && in1.hz >= LOCK_HZ) {  // DIP 1 OFF: no locking.
+    // D12 locks on the knob at 10 km/h (60 Hz) or more, or on 60 Hz at Freq 1
+    // input; only DIP 1 matters (DIP 2 / DIP 3 don't). DIP 1 OFF: no locking.
+    const bool knobLock = kmh * HZ_PER_KMH >= LOCK_HZ, inputLock = in1.hz >= LOCK_HZ;
+    if (dipLogic && !locked && (knobLock || inputLock)) {
       locked = true;
       digitalWrite(PIN_LOGIC, HIGH);
-      Serial.println(F("# D12 LOCKED HIGH: Freq 1 input reached 60 Hz (power restart or RESET to clear)"));
+      Serial.println(knobLock ? F("# D12 LOCKED HIGH: knob at 10 km/h (60 Hz) (power restart or RESET to clear)")
+                              : F("# D12 LOCKED HIGH: Freq 1 input reached 60 Hz (power restart or RESET to clear)"));
     }
   }
 
