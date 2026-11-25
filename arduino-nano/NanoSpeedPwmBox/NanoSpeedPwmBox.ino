@@ -28,9 +28,9 @@
 //   A4 / A5   OLED SDA / SCL (SSD1306 128x64 I2C, 0x3C or 0x3D), auto-detected
 //   DIP switch (3 pins, each switch pin -> GND, internal pull-ups; ON = closed = LOW,
 //             open / not connected = OFF; DIP_TO_GND = false for a switch to 5V):
-//        1 -> D2   D12 60 Hz logic 1:  OFF = D12 LOW and not locking, ON = working
+//        1 -> D11  D12 60 Hz logic 1:  OFF = D12 LOW and not locking, ON = working
 //        2 -> D4   D6 / D5 encoder frequency out: OFF = stopped LOW, ON = back at the knob speed
-//        3 -> D11  D3 15 kHz fade out: OFF = D3 LOW, no fade (short press ignored), ON = enabled
+//        3 -> D2   D3 15 kHz fade out: OFF = D3 LOW, no fade (short press ignored), ON = enabled
 // USB Serial Monitor: 115200 baud, a status line twice a second.
 //
 // Timers: Timer0 = millis(), Timer1 = D6 / D5 (toggled in its interrupt),
@@ -62,7 +62,7 @@ constexpr uint8_t PIN_IN1 = 8, PIN_IN2 = 7;       // Freq 1 / 2 input.
 constexpr uint8_t PIN_POT1 = 6, PIN_POT2 = 5;     // Freq 1 / 2 output in pot.
 constexpr uint8_t PIN_LOGIC = 12, PIN_FADE = 3;
 constexpr uint8_t PIN_ENC_A = A2, PIN_ENC_B = A1, PIN_ENC_SW = A0;  // EC11 A, B, C (button).
-constexpr uint8_t PIN_DIP_LOGIC = 2, PIN_DIP_SPEED = 4, PIN_DIP_FADE = 11;  // DIP 1 / 2 / 3.
+constexpr uint8_t PIN_DIP_LOGIC = 11, PIN_DIP_SPEED = 4, PIN_DIP_FADE = 2;  // DIP 1 / 2 / 3.
 
 // DIP switch state, ON = enabled (read at start-up and in updateDip()).
 bool dipLogic = true, dipSpeed = true, dipFade = true;
@@ -372,11 +372,11 @@ bool locked = false;  // D12, set in loop().
 // ============================ DIP switch ====================================
 // Read every 10 ms; a switch must read the same for 50 ms before it counts
 // (contact bounce). Each change takes effect at once:
-//   DIP 1 (D2)  D12 logic: OFF = D12 LOW, no locking; ON = D12 shows the lock again
+//   DIP 1 (D11)  D12 logic: OFF = D12 LOW, no locking; ON = D12 shows the lock again
 //               (a lock from before is kept, a new one can happen).
 //   DIP 2 (D4)  D6 / D5: OFF = stopped LOW (the knob still sets the speed);
 //               ON = back at the knob speed.
-//   DIP 3 (D11) D3: OFF = a running fade stops, D3 LOW, short press ignored;
+//   DIP 3 (D2) D3: OFF = a running fade stops, D3 LOW, short press ignored;
 //               ON = the fade works again (and a D3 Hz set by hand comes back).
 void dipBegin() {
   const uint8_t mode = DIP_TO_GND ? INPUT_PULLUP : INPUT;  // To 5V: external pull-downs.
@@ -393,7 +393,7 @@ void applyDip(uint8_t i, bool on) {
     case 0:
       dipLogic = on;
       digitalWrite(PIN_LOGIC, on && locked ? HIGH : LOW);
-      Serial.println(on ? F("# DIP 1 (D2) ON: D12 60 Hz logic enabled") : F("# DIP 1 (D2) OFF: D12 60 Hz logic disabled (LOW)"));
+      Serial.println(on ? F("# DIP 1 (D11) ON: D12 60 Hz logic enabled") : F("# DIP 1 (D11) OFF: D12 60 Hz logic disabled (LOW)"));
       break;
     case 1:
       dipSpeed = on;
@@ -409,7 +409,7 @@ void applyDip(uint8_t i, bool on) {
         setD3Hz(0);
         d3Hz = keep;     // Comes back when DIP 3 is ON again.
       } else if (d3Hz) setD3Hz(d3Hz);
-      Serial.println(on ? F("# DIP 3 (D11) ON: D3 15 kHz fade out enabled") : F("# DIP 3 (D11) OFF: D3 15 kHz fade out disabled (LOW)"));
+      Serial.println(on ? F("# DIP 3 (D2) ON: D3 15 kHz fade out enabled") : F("# DIP 3 (D2) OFF: D3 15 kHz fade out disabled (LOW)"));
       break;
   }
 }
@@ -557,7 +557,7 @@ void loop() {
     if (swStable == LOW) { swDownMs = now; longDone = false; }
     else if (!longDone) {  // Short press (released before 1 s): 15 kHz fade.
       if (dipFade) startFade(now);
-      else Serial.println(F("# FADE ignored: DIP 3 (D11) OFF"));
+      else Serial.println(F("# FADE ignored: DIP 3 (D2) OFF"));
     }
   }
   if (swStable == LOW && !longDone && now - swDownMs >= 1000) {
