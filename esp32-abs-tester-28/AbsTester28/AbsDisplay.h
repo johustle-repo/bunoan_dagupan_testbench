@@ -996,9 +996,11 @@ void update(const AbsData& d, uint8_t page, uint8_t sel = 0, bool locked = false
       const bool adjust = !selfTest && d.speedSel == 2;  // Speed encoder on FRONT.
       const int8_t ecu = selfTest ? -1 : ev.status;  // Real ECU lamp, top right.
       // Knob lamp under it while the ECU check fails or Online (-1 = not shown).
-      const int knob = ecu >= 0 && (ecuFault(d.ecu) || ecu == AbsData::ECU_OK) ? int(d.knobHz) : -1;
-      // Output speed: "Speed Out / N kph" while checking, "N kph" under Online.
-      const int outKmh = ecu == ECU_CHECK || ecu == AbsData::ECU_OK ? int(d.knobHz / HZ_PER_KMH) : 0;
+      const int knob = ecu >= 0 && (ecuFault(d.ecu) || (ecu == AbsData::ECU_OK && d.ecuChecking)) ? int(d.knobHz) : -1;
+      // Output speed: "Speed Out / N kph" while checking, "N kph" + lamp under Online
+      // only while the knob is being turned (3 s after each turn); 0 = hidden.
+      const bool turning = ecu == AbsData::ECU_OK && d.ecuChecking;
+      const int outKmh = ecu == ECU_CHECK || turning ? int(d.knobHz / HZ_PER_KMH) : 0;
       const bool braking = !selfTest && d.brake;
       const int32_t key = lroundf(front * 4) | int32_t(have) << 16 | int32_t(adjust) << 17 | int32_t(ecu + 1) << 18 | int32_t(ev.lit) << 22 | int32_t(knob >= 0 && knobLit) << 23
                           | int32_t(braking) << 24 | int32_t(outKmh & 0x3f) << 25;
