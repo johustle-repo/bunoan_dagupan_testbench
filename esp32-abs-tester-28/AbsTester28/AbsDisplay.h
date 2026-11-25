@@ -513,9 +513,11 @@ void ecuBadge(aa::Buf& b, int8_t ecu, bool lit, int knobHz = -1, bool knobLit = 
     return;  // The second line takes the knob row.
   }
   if (*LABELS[ecu]) aa::text(b, aaLabel, LABELS[ecu], cx - 13, P2Y + 18, lit ? c : aa::mix(PANEL, c, 120), aa::RIGHT, 1);
-  if (ecu == AbsData::ECU_OK) {  // Online: the output speed under it (steady, even while Online flashes).
-    char kph[12];
+  if (ecu == AbsData::ECU_OK) {  // Online: the output speed under it (steady, even while Online flashes)
+    char kph[12];                // and a green lamp blinking with the speed (knobBlink rate); knob at 0 = neither shown.
+    if (outKmh <= 0) return;
     snprintf(kph, sizeof(kph), "%dkph", outKmh);
+    ecuLight(b, cx, cy + 20, GREEN, knobLit);
     aa::text(b, aaLabel, kph, cx - 13, P2Y + 38, c, aa::RIGHT, 1);
     return;
   }
@@ -993,8 +995,8 @@ void update(const AbsData& d, uint8_t page, uint8_t sel = 0, bool locked = false
       const bool have = selfTest || d.front;
       const bool adjust = !selfTest && d.speedSel == 2;  // Speed encoder on FRONT.
       const int8_t ecu = selfTest ? -1 : ev.status;  // Real ECU lamp, top right.
-      // Knob lamp under it while the ECU check fails (-1 = not shown).
-      const int knob = ecu >= 0 && ecuFault(d.ecu) ? int(d.knobHz) : -1;
+      // Knob lamp under it while the ECU check fails or Online (-1 = not shown).
+      const int knob = ecu >= 0 && (ecuFault(d.ecu) || ecu == AbsData::ECU_OK) ? int(d.knobHz) : -1;
       // Output speed: "Speed Out / N kph" while checking, "N kph" under Online.
       const int outKmh = ecu == ECU_CHECK || ecu == AbsData::ECU_OK ? int(d.knobHz / HZ_PER_KMH) : 0;
       const bool braking = !selfTest && d.brake;
