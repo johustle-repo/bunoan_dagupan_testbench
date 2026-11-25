@@ -496,8 +496,8 @@ bool knobBlink(uint16_t knobHz) {
   return knobPhase < 0.5f;
 }
 
-// outKmh: the knob's output speed, shown as "Speed out N kph" while the knob
-// was just turned (in place of the old "Checking").
+// outKmh: the knob's output speed, shown as "Speed Out / N kph" while the knob
+// was just turned (in place of the old "Checking"), and as "N kph" under Online.
 void ecuBadge(aa::Buf& b, int8_t ecu, bool lit, int knobHz = -1, bool knobLit = false, int outKmh = 0) {
   if (ecu < 0) return;
   static const char* const LABELS[7] = {"", "Online", "Offline", "Offline", "Offline", "Reset", ""};
@@ -513,6 +513,12 @@ void ecuBadge(aa::Buf& b, int8_t ecu, bool lit, int knobHz = -1, bool knobLit = 
     return;  // The second line takes the knob row.
   }
   if (*LABELS[ecu]) aa::text(b, aaLabel, LABELS[ecu], cx - 13, P2Y + 18, lit ? c : aa::mix(PANEL, c, 120), aa::RIGHT, 1);
+  if (ecu == AbsData::ECU_OK) {  // Online: the output speed under it (steady, even while Online flashes).
+    char kph[12];
+    snprintf(kph, sizeof(kph), "%dkph", outKmh);
+    aa::text(b, aaLabel, kph, cx - 13, P2Y + 38, c, aa::RIGHT, 1);
+    return;
+  }
   if (knobHz < 0) return;
   // Knob lamp and speed (knob Hz / 6, whole km/h), one row below, lined up
   // with the lamp and text above.
@@ -989,7 +995,8 @@ void update(const AbsData& d, uint8_t page, uint8_t sel = 0, bool locked = false
       const int8_t ecu = selfTest ? -1 : ev.status;  // Real ECU lamp, top right.
       // Knob lamp under it while the ECU check fails (-1 = not shown).
       const int knob = ecu >= 0 && ecuFault(d.ecu) ? int(d.knobHz) : -1;
-      const int outKmh = ecu == ECU_CHECK ? int(d.knobHz / HZ_PER_KMH) : 0;  // "Speed out N kph".
+      // Output speed: "Speed Out / N kph" while checking, "N kph" under Online.
+      const int outKmh = ecu == ECU_CHECK || ecu == AbsData::ECU_OK ? int(d.knobHz / HZ_PER_KMH) : 0;
       const bool braking = !selfTest && d.brake;
       const int32_t key = lroundf(front * 4) | int32_t(have) << 16 | int32_t(adjust) << 17 | int32_t(ecu + 1) << 18 | int32_t(ev.lit) << 22 | int32_t(knob >= 0 && knobLit) << 23
                           | int32_t(braking) << 24 | int32_t(outKmh & 0x3f) << 25;
