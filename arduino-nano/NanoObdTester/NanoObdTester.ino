@@ -97,7 +97,18 @@ bool sendRequest(uint8_t mode, uint8_t pid, bool withPid) {
   waitMode = mode;
   waitPid = withPid ? pid : 0;
   requestMs = millis();
-  return can.sendMsgBuf(OBD_FUNCTIONAL_ID, 0, 8, frame) == CAN_OK;
+  // A failed send means no node acknowledged the frame: the other MCP2515 is
+  // unpowered, at another bit rate / crystal, or CANH / CANL / J1 are wrong.
+  static int8_t acked = -1;
+  const bool ok = can.sendMsgBuf(OBD_FUNCTIONAL_ID, 0, 8, frame) == CAN_OK;
+  if (int8_t(ok) != acked) {
+    acked = ok;
+    char line[64];
+    snprintf(line, sizeof(line), ok ? "# CAN TX acknowledged (TEC %u REC %u)" : "# CAN TX NOT acknowledged (TEC %u REC %u EFLG %02X)",
+             can.errorCountTX(), can.errorCountRX(), can.getError());
+    emit(line);
+  }
+  return ok;
 }
 
 void scheduleNext(uint32_t now) {
@@ -181,13 +192,30 @@ void handleFrame(const uint8_t* f, uint8_t len) {
   }
 }
 
+uint32_t rxFrames = 0, rxLastId = 0;
+
 void readCan() {
   while (digitalRead(PIN_CAN_INT) == LOW || can.checkReceive() == CAN_MSGAVAIL) {
     uint32_t id;
     uint8_t len, buf[8];
     if (can.readMsgBuf(&id, &len, buf) != CAN_OK) break;
+    rxFrames++; rxLastId = id;
     if ((id & 0x7FF) == OBD_RESPONSE_ID && len >= 1) handleFrame(buf, len);
   }
+}
+
+// Bus health, checked once a second, printed when the error counters change.
+void printHealth(uint32_t now) {
+  static uint32_t lastMs = 0;
+  static uint8_t lastTec = 0, lastRec = 0, lastEflg = 0;
+  if (now - lastMs < 1000) return;
+  lastMs = now;
+  const uint8_t tec = can.errorCountTX(), rec = can.errorCountRX(), eflg = can.getError();
+  if (tec == lastTec && rec == lastRec && eflg == lastEflg) return;
+  lastTec = tec; lastRec = rec; lastEflg = eflg;
+  char line[72];
+  snprintf(line, sizeof(line), "# CAN bus TEC %u REC %u EFLG %02X RX %lu last %03lX", tec, rec, eflg, rxFrames, rxLastId);
+  emit(line);
 }
 
 // ---------------------------- ESP32 commands --------------------------------
@@ -222,6 +250,7 @@ void loop() {
     return;
   }
   readCan();
+  printHealth(now);
   if (waiting && millis() - requestMs >= RESPONSE_TIMEOUT_MS) {
     waiting = false;
     rxActive = false;

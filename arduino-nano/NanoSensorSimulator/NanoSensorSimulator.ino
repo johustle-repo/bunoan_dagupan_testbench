@@ -274,7 +274,10 @@ bool testerSeen = false;
 
 void canBegin() {
   canReady = can.begin(MCP_ANY, CAN_500KBPS, CAN_CRYSTAL) == CAN_OK;
-  if (canReady) can.setMode(MCP_NORMAL);
+  if (canReady && can.setMode(MCP_NORMAL) != MCP2515_OK) {
+    Serial.println(F("# CAN MCP2515 did not enter NORMAL mode, retrying"));
+    canReady = false;
+  }
   Serial.println(canReady ? F("# CAN MCP2515 OK, 500 kbps, 8 MHz crystal, OBD-II ECU on 0x7E8")
                           : F("# CAN MCP2515 not found (check CS D8, SI D11, SO D12, SCK D13, 5V)"));
 }
@@ -391,10 +394,12 @@ void updateCan(uint32_t now) {
     return;
   }
 
+  static uint32_t rxFrames = 0, rxLastId = 0;
   while (digitalRead(PIN_CAN_INT) == LOW || can.checkReceive() == CAN_MSGAVAIL) {
     uint32_t id;
     uint8_t len, buf[8];
     if (can.readMsgBuf(&id, &len, buf) != CAN_OK) break;
+    rxFrames++; rxLastId = id;
     id &= 0x7FF;
     if (id != OBD_FUNCTIONAL_ID && id != OBD_REQUEST_ID) continue;
     lastRequestMs = now;
@@ -404,6 +409,20 @@ void updateCan(uint32_t now) {
 
   const bool active = testerSeen && now - lastRequestMs < TESTER_ACTIVE_MS;
   if (testerSeen && !active) { testerSeen = false; Serial.println(F("# OBD scan tool gone")); }
+  // Bus health on the Serial Monitor whenever the MCP2515 error counters change.
+  static uint32_t lastHealthMs = 0;
+  static uint8_t lastTec = 0, lastRec = 0, lastEflg = 0;
+  if (now - lastHealthMs >= 1000) {
+    lastHealthMs = now;
+    const uint8_t tec = can.errorCountTX(), rec = can.errorCountRX(), eflg = can.getError();
+    if (tec != lastTec || rec != lastRec || eflg != lastEflg) {
+      lastTec = tec; lastRec = rec; lastEflg = eflg;
+      char line[72];
+      snprintf(line, sizeof(line), "# CAN bus TEC %u REC %u EFLG %02X RX %lu last %03lX", tec, rec, eflg, rxFrames, rxLastId);
+      Serial.println(line);
+    }
+  }
+
   const char state = active ? 'C' : '.';
   if (state != canState) { canState = state; lcdDirty = true; }
 }
