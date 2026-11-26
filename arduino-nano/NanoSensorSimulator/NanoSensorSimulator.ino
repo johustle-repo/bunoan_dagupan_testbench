@@ -1,12 +1,20 @@
-// Nano Sensor Simulator
+// Nano Sensor Simulator (Set 1: ECU simulator)
 //
 // Replaces the five sensor knobs of the ECU testbench (IAT, ECT, O2, MAP, TPS).
 // Each sensor is a PWM output with an RC filter, giving a steady 0-5 V into
 // the Mega's A0-A4. One rotary encoder sets them, a 16x2 I2C LCD shows them.
 // The values are set in real units (deg C, kPa, %), converted back to volts
 // with the same formulas the Mega and ESP32 use (SensorConversion.h).
-// The five values also go out on CAN (MCP2515, 500 kbps) every 100 ms to the
-// gateway Nano (NanoCanGateway), which forwards them to the ESP32.
+//
+// It is also an OBD-II ECU on CAN (MCP2515, 500 kbps, 11-bit IDs): it answers
+// a scan tool (Set 2: NanoObdTester + EspObdDashboard) on 0x7E8 for requests
+// on 0x7DF (functional) or 0x7E0 (physical), ISO 15765-2 single and
+// multi-frame.
+//   Mode 01  PID 00 supported PIDs, 01 MIL + DTC count, 05 ECT, 0B MAP,
+//            0F IAT, 11 TPS, 14 O2 B1S1 voltage
+//   Mode 03  stored DTCs      Mode 04  clear DTCs (an active fault sets its DTC again)
+// A sensor with an active fault reports its fail-safe value in mode 01, like
+// a real ECU: IAT 20 C, ECT 80 C, O2 0.45 V, MAP 100 kPa, TPS 0 %.
 //
 // Encoder:
 //   Turn          change the selected sensor (spin fast = bigger steps)
@@ -26,17 +34,13 @@
 //   D11  OUT  MCP2515 SI  (SPI MOSI)
 //   D12  IN   MCP2515 SO  (SPI MISO)
 //   D13  OUT  MCP2515 SCK
-//   D2   IN   MCP2515 INT (optional here, only sending)
+//   D2   IN   MCP2515 INT (LOW = request waiting)
 //   A2   IN   Encoder A / CLK
 //   A1   IN   Encoder B / DT
 //   A0   IN   Encoder button / SW (to GND = pressed)
 //   A4   I/O  LCD SDA
 //   A5   OUT  LCD SCL
 //   GND       common ground with the Mega
-//
-// CAN frame, ID 0x100, 8 bytes:
-//   0 IAT deg C + 40   1 ECT deg C + 40   2 O2 V x 100   3 MAP kPa   4 TPS %
-//   5 HIGH-fault bits  6 LOW-fault bits (bit 0 IAT ... bit 4 TPS)   7 counter
 //
 // Board: Arduino Nano (ATmega328P). Libraries: "LiquidCrystal I2C" by Frank de
 // Brabander, "mcp_can" by coryjfowler.
@@ -67,10 +71,14 @@ constexpr uint8_t PIN_ENC_B = A1;  // PC1 / PCINT9
 constexpr uint8_t PIN_ENC_SW = A0;
 
 constexpr uint8_t PIN_CAN_CS = 8;
-constexpr uint32_t CAN_ID_SENSORS = 0x100;
-constexpr uint16_t CAN_PERIOD_MS = 100;
-constexpr uint16_t CAN_RETRY_MS = 2000;   // Re-try MCP2515 start-up this often if it failed.
+constexpr uint8_t PIN_CAN_INT = 2;
 constexpr uint8_t CAN_CRYSTAL = MCP_8MHZ; // Crystal on the MCP2515 module ("8.000").
+constexpr uint16_t CAN_RETRY_MS = 2000;   // Re-try MCP2515 start-up this often if it failed.
+constexpr uint32_t OBD_FUNCTIONAL_ID = 0x7DF;  // Scan tool -> all ECUs.
+constexpr uint32_t OBD_REQUEST_ID = 0x7E0;     // Scan tool -> this ECU (also flow control).
+constexpr uint32_t OBD_RESPONSE_ID = 0x7E8;    // This ECU -> scan tool.
+constexpr uint16_t FLOW_CONTROL_WAIT_MS = 150;
+constexpr uint16_t TESTER_ACTIVE_MS = 2000;    // LCD shows 'C' this long after a request.
 
 // ============================== Sensors =====================================
 // Same tables and limits as SensorConversion.h on the Mega / ESP32.
@@ -106,15 +114,17 @@ struct Sensor {
   int16_t value;      // In units below (O2: millivolts).
   bool hasLowFault;   // Sensor has a low ERR limit that 0 V crosses.
   Fault fault;
+  int16_t failSafe;   // Value reported over OBD while the fault is active.
+  uint16_t dtcLow, dtcHigh;  // P-codes, as the 2 OBD bytes (P0112 = 0x0112).
 };
 
 Sensor sensors[SENSOR_COUNT] = {
-  // name  ltr  pin  full scale       min  max   step fast  start  lowFault
-  {"IAT", 'I', 5,  NANO_VCC,         15,  55,    1,   5,   25,   true,  FAULT_NONE},  // deg C
-  {"ECT", 'E', 6,  NANO_VCC,         20,  120,   1,   5,   90,   true,  FAULT_NONE},  // deg C
-  {"O2 ", 'O', 9,  O2_FULL_SCALE_V,  20,  1200,  10,  50,  450,  true,  FAULT_NONE},  // mV
-  {"MAP", 'M', 10, NANO_VCC,         10,  100,   1,   5,   35,   false, FAULT_NONE},  // kPa
-  {"TPS", 'T', 3,  NANO_VCC,         0,   100,   1,   5,   0,    false, FAULT_NONE},  // %
+  // name  ltr  pin  full scale       min  max   step fast  start  lowFault  fault       safe  DTC low DTC high
+  {"IAT", 'I', 5,  NANO_VCC,         15,  55,    1,   5,   25,   true,  FAULT_NONE, 20,   0x0112, 0x0113},  // deg C
+  {"ECT", 'E', 6,  NANO_VCC,         20,  120,   1,   5,   90,   true,  FAULT_NONE, 80,   0x0117, 0x0118},  // deg C
+  {"O2 ", 'O', 9,  O2_FULL_SCALE_V,  20,  1200,  10,  50,  450,  true,  FAULT_NONE, 450,  0x0131, 0x0132},  // mV
+  {"MAP", 'M', 10, NANO_VCC,         10,  100,   1,   5,   35,   false, FAULT_NONE, 100,  0x0107, 0x0108},  // kPa
+  {"TPS", 'T', 3,  NANO_VCC,         0,   100,   1,   5,   0,    false, FAULT_NONE, 0,    0x0122, 0x0123},  // %
 };
 
 // Volts the sensor should give for its value (no fault).
@@ -228,24 +238,149 @@ void updateButton(uint32_t now) {
   }
 }
 
-// ============================== CAN (MCP2515) ===============================
-// Sends frame CAN_ID_SENSORS every CAN_PERIOD_MS. canState is shown in the
-// last LCD character: 'C' = frames acknowledged by the gateway, 'x' = sent but
-// no node acknowledged (gateway off / CANH-CANL / 120 ohm), '-' = no MCP2515.
+// ============================== OBD-II ECU ==================================
+// Stored DTCs: a fault sets its DTC at once; the DTC stays stored after the
+// fault is gone, until a scan tool sends mode 04. MIL = any DTC stored.
+uint8_t storedHigh = 0, storedLow = 0;  // Bit i = sensor i.
+
+void updateStoredDtcs() {
+  for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
+    const uint8_t bit = 1 << i;
+    if (sensors[i].fault == FAULT_HIGH && !(storedHigh & bit)) {
+      storedHigh |= bit;
+      Serial.print(F("# DTC stored P")); Serial.println(sensors[i].dtcHigh, HEX);
+    }
+    if (sensors[i].fault == FAULT_LOW && !(storedLow & bit)) {
+      storedLow |= bit;
+      Serial.print(F("# DTC stored P")); Serial.println(sensors[i].dtcLow, HEX);
+    }
+  }
+}
+
+uint8_t storedCount() {
+  uint8_t n = 0;
+  for (uint8_t i = 0; i < SENSOR_COUNT; i++) n += ((storedHigh >> i) & 1) + ((storedLow >> i) & 1);
+  return n;
+}
+
+// Value the ECU reports: the set value, or the fail-safe one during a fault.
+int16_t reported(uint8_t id) { return sensors[id].fault != FAULT_NONE ? sensors[id].failSafe : sensors[id].value; }
+
 MCP_CAN can(PIN_CAN_CS);
 bool canReady = false;
-char canState = '-';
+char canState = '-';           // LCD: 'C' scan tool active, '.' CAN OK / idle, '-' no MCP2515.
+uint32_t lastRequestMs = 0;
+bool testerSeen = false;
 
 void canBegin() {
   canReady = can.begin(MCP_ANY, CAN_500KBPS, CAN_CRYSTAL) == CAN_OK;
   if (canReady) can.setMode(MCP_NORMAL);
-  Serial.println(canReady ? F("# CAN MCP2515 OK, 500 kbps, 8 MHz crystal")
+  Serial.println(canReady ? F("# CAN MCP2515 OK, 500 kbps, 8 MHz crystal, OBD-II ECU on 0x7E8")
                           : F("# CAN MCP2515 not found (check CS D8, SI D11, SO D12, SCK D13, 5V)"));
 }
 
+bool canSend(uint8_t* frame) { return can.sendMsgBuf(OBD_RESPONSE_ID, 0, 8, frame) == CAN_OK; }
+
+// Waits for the scan tool's flow control (0x30 = continue) on 0x7E0.
+bool waitFlowControl(uint8_t& stMin) {
+  const uint32_t start = millis();
+  while (millis() - start < FLOW_CONTROL_WAIT_MS) {
+    if (can.checkReceive() != CAN_MSGAVAIL) continue;
+    uint32_t id;
+    uint8_t len, buf[8];
+    if (can.readMsgBuf(&id, &len, buf) != CAN_OK) continue;
+    if ((id & 0x7FF) == OBD_REQUEST_ID && len >= 3 && buf[0] == 0x30) {
+      stMin = buf[2] <= 127 ? buf[2] : 1;
+      return true;
+    }
+  }
+  return false;
+}
+
+// ISO 15765-2: single frame up to 7 bytes, else first frame + consecutive frames.
+void sendResponse(const uint8_t* data, uint8_t n) {
+  uint8_t frame[8];
+  if (n <= 7) {
+    memset(frame, 0x00, 8);
+    frame[0] = n;
+    memcpy(frame + 1, data, n);
+    canSend(frame);
+    return;
+  }
+  frame[0] = 0x10;
+  frame[1] = n;
+  memcpy(frame + 2, data, 6);
+  if (!canSend(frame)) return;
+  uint8_t stMin = 0;
+  if (!waitFlowControl(stMin)) { Serial.println(F("# OBD no flow control from the scan tool")); return; }
+  uint8_t idx = 6, sn = 1;
+  while (idx < n) {
+    memset(frame, 0x00, 8);
+    frame[0] = 0x20 | (sn++ & 0x0F);
+    const uint8_t chunk = n - idx < 7 ? n - idx : 7;
+    memcpy(frame + 1, data + idx, chunk);
+    idx += chunk;
+    delay(stMin ? stMin : 1);
+    canSend(frame);
+  }
+}
+
+constexpr uint8_t SUPPORTED_PIDS[] = {0x01, 0x05, 0x0B, 0x0F, 0x11, 0x14};
+
+void handleRequest(const uint8_t* buf, uint8_t len) {
+  if (len < 2 || (buf[0] & 0xF0) != 0x00) return;  // Single-frame requests only.
+  const uint8_t n = buf[0] & 0x0F;
+  if (n < 1 || n > 7) return;
+  const uint8_t mode = buf[1];
+  uint8_t r[2 + 2 * 2 * SENSOR_COUNT];
+  uint8_t rn = 0;
+
+  if (mode == 0x01 && n >= 2) {
+    const uint8_t pid = buf[2];
+    r[0] = 0x41; r[1] = pid;
+    switch (pid) {
+      case 0x00: {
+        uint32_t bits = 0;
+        for (uint8_t p : SUPPORTED_PIDS) bits |= 1UL << (32 - p);
+        r[2] = bits >> 24; r[3] = bits >> 16; r[4] = bits >> 8; r[5] = bits;
+        rn = 6;
+        break;
+      }
+      case 0x01: {
+        const uint8_t count = storedCount();
+        r[2] = (count ? 0x80 : 0x00) | count;  // MIL + number of DTCs.
+        r[3] = 0x00; r[4] = 0x00; r[5] = 0x00;
+        rn = 6;
+        break;
+      }
+      case 0x05: r[2] = uint8_t(reported(ECT) + 40); rn = 3; break;
+      case 0x0B: r[2] = uint8_t(reported(MAP)); rn = 3; break;
+      case 0x0F: r[2] = uint8_t(reported(IAT) + 40); rn = 3; break;
+      case 0x11: r[2] = uint8_t((reported(TPS) * 255L + 50) / 100); rn = 3; break;
+      case 0x14: r[2] = uint8_t(reported(O2) / 5); r[3] = 0xFF; rn = 4; break;  // A = V x 200, B = FF: no trim.
+      default: return;  // Unsupported PID: no answer, as on a real ECU.
+    }
+  } else if (mode == 0x03) {
+    r[0] = 0x43;
+    r[1] = storedCount();
+    rn = 2;
+    for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
+      if ((storedHigh >> i) & 1) { r[rn++] = sensors[i].dtcHigh >> 8; r[rn++] = sensors[i].dtcHigh & 0xFF; }
+      if ((storedLow >> i) & 1) { r[rn++] = sensors[i].dtcLow >> 8; r[rn++] = sensors[i].dtcLow & 0xFF; }
+    }
+  } else if (mode == 0x04) {
+    storedHigh = storedLow = 0;  // Active faults set theirs again on the next loop.
+    Serial.println(F("# DTCs cleared by the scan tool"));
+    r[0] = 0x44;
+    rn = 1;
+  } else {
+    return;  // Other modes: not supported.
+  }
+  sendResponse(r, rn);
+}
+
 void updateCan(uint32_t now) {
-  static uint32_t lastMs = 0, lastRetryMs = 0;
-  static uint8_t counter = 0;
+  static uint32_t lastRetryMs = 0;
   if (!canReady) {
     if (now - lastRetryMs >= CAN_RETRY_MS) {
       lastRetryMs = now;
@@ -255,33 +390,28 @@ void updateCan(uint32_t now) {
     if (canState != '-') { canState = '-'; lcdDirty = true; }
     return;
   }
-  if (now - lastMs < CAN_PERIOD_MS) return;
-  lastMs = now;
 
-  uint8_t frame[8];
-  frame[0] = uint8_t(sensors[IAT].value + 40);
-  frame[1] = uint8_t(sensors[ECT].value + 40);
-  frame[2] = uint8_t(sensors[O2].value / 10);
-  frame[3] = uint8_t(sensors[MAP].value);
-  frame[4] = uint8_t(sensors[TPS].value);
-  frame[5] = frame[6] = 0;
-  for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
-    if (sensors[i].fault == FAULT_HIGH) frame[5] |= 1 << i;
-    if (sensors[i].fault == FAULT_LOW) frame[6] |= 1 << i;
+  while (digitalRead(PIN_CAN_INT) == LOW || can.checkReceive() == CAN_MSGAVAIL) {
+    uint32_t id;
+    uint8_t len, buf[8];
+    if (can.readMsgBuf(&id, &len, buf) != CAN_OK) break;
+    id &= 0x7FF;
+    if (id != OBD_FUNCTIONAL_ID && id != OBD_REQUEST_ID) continue;
+    lastRequestMs = now;
+    if (!testerSeen) { testerSeen = true; Serial.println(F("# OBD scan tool connected")); }
+    handleRequest(buf, len);
   }
-  frame[7] = counter++;
 
-  const char state = can.sendMsgBuf(CAN_ID_SENSORS, 0, 8, frame) == CAN_OK ? 'C' : 'x';
-  if (state != canState) {
-    canState = state;
-    lcdDirty = true;
-    Serial.println(state == 'C' ? F("# CAN frames acknowledged") : F("# CAN no ACK (gateway off, CANH/CANL, 120 ohm?)"));
-  }
+  const bool active = testerSeen && now - lastRequestMs < TESTER_ACTIVE_MS;
+  if (testerSeen && !active) { testerSeen = false; Serial.println(F("# OBD scan tool gone")); }
+  const char state = active ? 'C' : '.';
+  if (state != canState) { canState = state; lcdDirty = true; }
 }
 
 // ========================= Display (16x2 I2C LCD) ===========================
 //   IAT  25'C 2.300V   <- selected sensor: value (or HIGH / LOW fault) and output volts
-//   [I] E  O  M  T C   <- [ ] = selected, ! = sensor in fault, last char = CAN state
+//   [I] E  O  M  T C   <- [ ] = selected, ! = sensor in fault,
+//                         last char: C = scan tool connected, . = CAN idle, - = no MCP2515
 // LiquidCrystal_I2C library (Frank de Brabander) at the fixed address LCD_ADDR.
 LiquidCrystal_I2C lcd(LCD_ADDR, 16, 2);
 char lcdShown[2][17];
@@ -295,8 +425,8 @@ void lcdBegin() {
   Serial.println(ack == 0 ? F(" answered") : F(" did NOT answer"));
   lcd.init();
   lcd.backlight();
-  lcd.setCursor(0, 0); lcd.print(F("SENSOR SIMULATOR"));
-  lcd.setCursor(0, 1); lcd.print(F("IAT ECT O2 MAP T"));
+  lcd.setCursor(0, 0); lcd.print(F("ECU SIMULATOR"));
+  lcd.setCursor(0, 1); lcd.print(F("OBD-II CAN 500k"));
   delay(1200);
   lcd.clear();
   memset(lcdShown, ' ', sizeof(lcdShown));  // Matches the cleared screen.
@@ -350,8 +480,9 @@ void drawLcd() {
 // ============================== Main ========================================
 void setup() {
   Serial.begin(115200);
-  Serial.println(F("# NANO SENSOR SIMULATOR (IAT D5, ECT D6, O2 D9, MAP D10, TPS D3, CAN CS D8)"));
+  Serial.println(F("# NANO ECU SIMULATOR, OBD-II (IAT D5, ECT D6, O2 D9, MAP D10, TPS D3, CAN CS D8)"));
 
+  pinMode(PIN_CAN_INT, INPUT_PULLUP);
   canBegin();  // Before the PWM outputs: SPI start-up sets D10 (SS).
 
   for (uint8_t i = 0; i < SENSOR_COUNT; i++) pinMode(sensors[i].pin, OUTPUT);
@@ -369,6 +500,7 @@ void loop() {
   const uint32_t now = millis();
   updateEncoder(now);
   updateButton(now);
+  updateStoredDtcs();
   updateCan(now);
   drawLcd();
 }

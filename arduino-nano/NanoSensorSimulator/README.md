@@ -65,9 +65,12 @@ Board: Arduino Nano (ATmega328P). Libraries: **mcp_can** (coryjfowler) and **Liq
 Brabander). Serial at 115200 prints every change, for example
 `# MAP 35 kPa -> 1.176 V (duty 60)`.
 
-## CAN
+## OBD-II (CAN)
 
-Every 100 ms the five values go out on CAN ID `0x100` (MCP2515, 500 kbps,
-8 MHz crystal) to the gateway Nano. See `esp32-can/README.md` for the whole
-link. The last character on LCD line 2 shows the CAN state: `C` = the gateway
-acknowledged the frames, `x` = no node acknowledged, `-` = MCP2515 not found.
+This Nano is the **ECU** of the OBD-II bench (Set 1). It answers a scan tool
+over CAN (MCP2515, 500 kbps, 8 MHz crystal): requests on 0x7DF / 0x7E0,
+answers on 0x7E8. Mode 01 PIDs 00, 01, 05, 0B, 0F, 11 and 14, mode 03 (read
+DTCs) and mode 04 (clear DTCs). A fault set with a long press stores its DTC
+and turns on the MIL until it is cleared. See `esp32-can/README.md` for the
+whole bench. The last character on LCD line 2 shows: `C` = scan tool talking,
+`.` = CAN OK but no requests, `-` = MCP2515 not found.
