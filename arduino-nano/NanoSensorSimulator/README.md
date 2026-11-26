@@ -14,7 +14,8 @@ dashboard shows what the LCD shows.
 | D6 | ECT → 10 kΩ → Mega **A1**, 10 µF to GND |
 | D9 | O2 → 10 kΩ → Mega **A2**, **3.3 kΩ** and 10 µF to GND (0–1.24 V full scale) |
 | D10 | MAP → 10 kΩ → Mega **A3**, 10 µF to GND |
-| D11 | TPS → 10 kΩ → Mega **A4**, 10 µF to GND |
+| **D3** | TPS → 10 kΩ → Mega **A4**, 10 µF to GND (moved from D11 for the MCP2515) |
+| D8 / D11 / D12 / D13 / D2 | MCP2515 CS / SI / SO / SCK / INT, plus 5V and GND |
 | A2 / A1 / A0 | Encoder CLK / DT / SW (internal pull-ups) |
 | A4 / A5 | LCD SDA / SCL (backpack at 0x27; set `LCD_ADDR` to 0x3F if nothing shows) |
 | GND | Common ground with the Mega |
@@ -60,6 +61,13 @@ timer 0 PWM (980 Hz, about 13 mV ripple). O2, MAP and TPS run at 31 kHz.
 
 ## Build
 
-Board: Arduino Nano (ATmega328P). Library: **LiquidCrystal I2C** (Frank de
+Board: Arduino Nano (ATmega328P). Libraries: **mcp_can** (coryjfowler) and **LiquidCrystal I2C** (Frank de
 Brabander). Serial at 115200 prints every change, for example
 `# MAP 35 kPa -> 1.176 V (duty 60)`.
+
+## CAN
+
+Every 100 ms the five values go out on CAN ID `0x100` (MCP2515, 500 kbps,
+8 MHz crystal) to the gateway Nano. See `esp32-can/README.md` for the whole
+link. The last character on LCD line 2 shows the CAN state: `C` = the gateway
+acknowledged the frames, `x` = no node acknowledged, `-` = MCP2515 not found.

@@ -5,6 +5,8 @@
 // the Mega's A0-A4. One rotary encoder sets them, a 16x2 I2C LCD shows them.
 // The values are set in real units (deg C, kPa, %), converted back to volts
 // with the same formulas the Mega and ESP32 use (SensorConversion.h).
+// The five values also go out on CAN (MCP2515, 500 kbps) every 100 ms to the
+// gateway Nano (NanoCanGateway), which forwards them to the ESP32.
 //
 // Encoder:
 //   Turn          change the selected sensor (spin fast = bigger steps)
@@ -19,7 +21,12 @@
 //   D6   OUT  ECT  (PWM 980 Hz)  -> 10k -> Mega A1, 10 uF to GND
 //   D9   OUT  O2   (PWM 31 kHz)  -> 10k -> Mega A2, 3.3k + 10 uF to GND (0-1.24 V)
 //   D10  OUT  MAP  (PWM 31 kHz)  -> 10k -> Mega A3, 10 uF to GND
-//   D11  OUT  TPS  (PWM 31 kHz)  -> 10k -> Mega A4, 10 uF to GND
+//   D3   OUT  TPS  (PWM 31 kHz)  -> 10k -> Mega A4, 10 uF to GND
+//   D8   OUT  MCP2515 CS
+//   D11  OUT  MCP2515 SI  (SPI MOSI)
+//   D12  IN   MCP2515 SO  (SPI MISO)
+//   D13  OUT  MCP2515 SCK
+//   D2   IN   MCP2515 INT (optional here, only sending)
 //   A2   IN   Encoder A / CLK
 //   A1   IN   Encoder B / DT
 //   A0   IN   Encoder button / SW (to GND = pressed)
@@ -27,11 +34,18 @@
 //   A5   OUT  LCD SCL
 //   GND       common ground with the Mega
 //
-// Board: Arduino Nano (ATmega328P). Library: "LiquidCrystal I2C" by Frank de Brabander.
+// CAN frame, ID 0x100, 8 bytes:
+//   0 IAT deg C + 40   1 ECT deg C + 40   2 O2 V x 100   3 MAP kPa   4 TPS %
+//   5 HIGH-fault bits  6 LOW-fault bits (bit 0 IAT ... bit 4 TPS)   7 counter
+//
+// Board: Arduino Nano (ATmega328P). Libraries: "LiquidCrystal I2C" by Frank de
+// Brabander, "mcp_can" by coryjfowler.
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <SPI.h>
 #include <LiquidCrystal_I2C.h>
+#include <mcp_can.h>
 #include <util/atomic.h>
 
 // ============================== Settings ====================================
@@ -51,6 +65,12 @@ constexpr uint8_t LCD_ADDR = 0x27;        // I2C LCD address; try 0x3F if nothin
 constexpr uint8_t PIN_ENC_A = A2;  // PC2 / PCINT10
 constexpr uint8_t PIN_ENC_B = A1;  // PC1 / PCINT9
 constexpr uint8_t PIN_ENC_SW = A0;
+
+constexpr uint8_t PIN_CAN_CS = 8;
+constexpr uint32_t CAN_ID_SENSORS = 0x100;
+constexpr uint16_t CAN_PERIOD_MS = 100;
+constexpr uint16_t CAN_RETRY_MS = 2000;   // Re-try MCP2515 start-up this often if it failed.
+constexpr uint8_t CAN_CRYSTAL = MCP_8MHZ; // Crystal on the MCP2515 module ("8.000").
 
 // ============================== Sensors =====================================
 // Same tables and limits as SensorConversion.h on the Mega / ESP32.
@@ -94,7 +114,7 @@ Sensor sensors[SENSOR_COUNT] = {
   {"ECT", 'E', 6,  NANO_VCC,         20,  120,   1,   5,   90,   true,  FAULT_NONE},  // deg C
   {"O2 ", 'O', 9,  O2_FULL_SCALE_V,  20,  1200,  10,  50,  450,  true,  FAULT_NONE},  // mV
   {"MAP", 'M', 10, NANO_VCC,         10,  100,   1,   5,   35,   false, FAULT_NONE},  // kPa
-  {"TPS", 'T', 11, NANO_VCC,         0,   100,   1,   5,   0,    false, FAULT_NONE},  // %
+  {"TPS", 'T', 3,  NANO_VCC,         0,   100,   1,   5,   0,    false, FAULT_NONE},  // %
 };
 
 // Volts the sensor should give for its value (no fault).
@@ -208,9 +228,60 @@ void updateButton(uint32_t now) {
   }
 }
 
+// ============================== CAN (MCP2515) ===============================
+// Sends frame CAN_ID_SENSORS every CAN_PERIOD_MS. canState is shown in the
+// last LCD character: 'C' = frames acknowledged by the gateway, 'x' = sent but
+// no node acknowledged (gateway off / CANH-CANL / 120 ohm), '-' = no MCP2515.
+MCP_CAN can(PIN_CAN_CS);
+bool canReady = false;
+char canState = '-';
+
+void canBegin() {
+  canReady = can.begin(MCP_ANY, CAN_500KBPS, CAN_CRYSTAL) == CAN_OK;
+  if (canReady) can.setMode(MCP_NORMAL);
+  Serial.println(canReady ? F("# CAN MCP2515 OK, 500 kbps, 8 MHz crystal")
+                          : F("# CAN MCP2515 not found (check CS D8, SI D11, SO D12, SCK D13, 5V)"));
+}
+
+void updateCan(uint32_t now) {
+  static uint32_t lastMs = 0, lastRetryMs = 0;
+  static uint8_t counter = 0;
+  if (!canReady) {
+    if (now - lastRetryMs >= CAN_RETRY_MS) {
+      lastRetryMs = now;
+      canBegin();
+      for (uint8_t i = 0; i < SENSOR_COUNT; i++) applyOutput(i);  // SPI start-up can touch D10.
+    }
+    if (canState != '-') { canState = '-'; lcdDirty = true; }
+    return;
+  }
+  if (now - lastMs < CAN_PERIOD_MS) return;
+  lastMs = now;
+
+  uint8_t frame[8];
+  frame[0] = uint8_t(sensors[IAT].value + 40);
+  frame[1] = uint8_t(sensors[ECT].value + 40);
+  frame[2] = uint8_t(sensors[O2].value / 10);
+  frame[3] = uint8_t(sensors[MAP].value);
+  frame[4] = uint8_t(sensors[TPS].value);
+  frame[5] = frame[6] = 0;
+  for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
+    if (sensors[i].fault == FAULT_HIGH) frame[5] |= 1 << i;
+    if (sensors[i].fault == FAULT_LOW) frame[6] |= 1 << i;
+  }
+  frame[7] = counter++;
+
+  const char state = can.sendMsgBuf(CAN_ID_SENSORS, 0, 8, frame) == CAN_OK ? 'C' : 'x';
+  if (state != canState) {
+    canState = state;
+    lcdDirty = true;
+    Serial.println(state == 'C' ? F("# CAN frames acknowledged") : F("# CAN no ACK (gateway off, CANH/CANL, 120 ohm?)"));
+  }
+}
+
 // ========================= Display (16x2 I2C LCD) ===========================
 //   IAT  25'C 2.300V   <- selected sensor: value (or HIGH / LOW fault) and output volts
-//   [I] E  O  M  T     <- [ ] = selected, ! = sensor in fault
+//   [I] E  O  M  T C   <- [ ] = selected, ! = sensor in fault, last char = CAN state
 // LiquidCrystal_I2C library (Frank de Brabander) at the fixed address LCD_ADDR.
 LiquidCrystal_I2C lcd(LCD_ADDR, 16, 2);
 char lcdShown[2][17];
@@ -271,17 +342,20 @@ void drawLcd() {
     line[i * 3 + 1] = sensors[i].letter;
     line[i * 3 + 2] = i == selected ? ']' : sensors[i].fault != FAULT_NONE ? '!' : ' ';
   }
-  line[15] = '\0';
+  line[15] = canState;
+  line[16] = '\0';
   lcdLine(1, line);
 }
 
 // ============================== Main ========================================
 void setup() {
   Serial.begin(115200);
-  Serial.println(F("# NANO SENSOR SIMULATOR (IAT D5, ECT D6, O2 D9, MAP D10, TPS D11)"));
+  Serial.println(F("# NANO SENSOR SIMULATOR (IAT D5, ECT D6, O2 D9, MAP D10, TPS D3, CAN CS D8)"));
+
+  canBegin();  // Before the PWM outputs: SPI start-up sets D10 (SS).
 
   for (uint8_t i = 0; i < SENSOR_COUNT; i++) pinMode(sensors[i].pin, OUTPUT);
-  // Timer1 (D9, D10) and Timer2 (D11, D3) to 31.4 kHz for low ripple.
+  // Timer1 (D9, D10) and Timer2 (D3) to 31.4 kHz for low ripple.
   // Timer0 (D5, D6) stays at 980 Hz because millis() depends on it.
   TCCR1B = (TCCR1B & 0xF8) | 0x01;
   TCCR2B = (TCCR2B & 0xF8) | 0x01;
@@ -295,5 +369,6 @@ void loop() {
   const uint32_t now = millis();
   updateEncoder(now);
   updateButton(now);
+  updateCan(now);
   drawLcd();
 }
