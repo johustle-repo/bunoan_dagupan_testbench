@@ -1,0 +1,75 @@
+OBD-II (J1962, 16 pin) <-> MCP2515 CAN module pinout
+=====================================================
+
+OBD-II pins used for CAN
+------------------------
+  OBD-II pin   Signal                        Connect to
+  ----------   ---------------------------   ------------------------------------
+      6        CAN High (ISO 15765 / J-2284)  MCP2515 CANH
+     14        CAN Low  (ISO 15765 / J-2284)  MCP2515 CANL
+      4        Chassis ground                 Nano / MCP2515 GND
+      5        Signal ground                  Nano / MCP2515 GND
+     16        +12 V battery (always on)      ONLY through a 12 V -> 5 V buck
+                                              converter (optional, see Power)
+
+Female socket (as on the car / ECU side, looking into it)
+---------------------------------------------------------
+     _____________________________________________
+     \   1   2   3  [4]  [5]  [6]  7   8         /
+      \   9  10  11  12   13 [14]  15 [16]      /
+       \_______________________________________/
+
+     4, 5 = GND     6 = CAN-H     14 = CAN-L     16 = +12 V
+
+The male plug (scan-tool side) is the mirror image: check the pin numbers
+moulded into the plug.
+
+
+Bench wiring (Set 1 = ECU simulator, Set 2 = diagnostic tool)
+-------------------------------------------------------------
+  Set 1  ECU simulator  : FEMALE OBD-II socket (like the car)
+  Set 2  diagnostic tool: MALE OBD-II plug (like a scan tool),
+                          easiest from a cut OBD-II pigtail cable
+
+  MCP2515 module    Set 1 socket pin    Set 2 plug pin
+  --------------    ----------------    --------------
+  CANH              6                   6
+  CANL              14                  14
+  GND               4 and 5             4 and 5
+
+  J1 120 ohm jumper: FITTED on BOTH modules (each is one end of the bus).
+  Check, power off: CAN-H to CAN-L = about 60 ohm.
+
+  No code change is needed: plug Set 2 into Set 1 like a scan tool into a car.
+
+
+MCP2515 -> Nano (for reference)
+-------------------------------
+  MCP2515   Set 1 Nano (ECU)   Set 2 Nano (tester)
+  -------   ----------------   -------------------
+  VCC       5V                 5V
+  GND       GND                GND
+  CS        D8                 D10
+  SI        D11                D11
+  SO        D12                D12
+  SCK       D13                D13
+  INT       D2                 D2
+
+  Crystal: 8.000 MHz on both modules. Bus: 500 kbps, 11-bit IDs.
+  Requests 0x7DF (functional) / 0x7E0 (physical), answers 0x7E8.
+
+
+Connecting Set 2 to a REAL car
+------------------------------
+  - REMOVE the J1 jumper on the MCP2515: the car's bus already has its own
+    two 120 ohm terminators.
+  - Works with most cars from about 2008 that use 500 kbps / 11-bit CAN.
+    Cars on 250 kbps, 29-bit IDs, or K-line (pin 7, older cars) will not answer.
+  - "Clear DTC" on a real car erases its codes AND resets the readiness
+    monitors (can fail an emissions check until the car is driven).
+
+Power
+-----
+  - Pin 16 is 12-14.4 V with spikes. NEVER connect it to the Nano 5V pin.
+  - Use a buck converter (MP1584 / LM2596 set to 5.0 V) -> Nano 5V, with its
+    GND to pins 4/5, or simply power the Nano from USB.
