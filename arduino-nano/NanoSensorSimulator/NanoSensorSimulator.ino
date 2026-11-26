@@ -13,6 +13,11 @@
 //   Mode 01  PID 00 supported PIDs, 01 MIL + DTC count, 05 ECT, 0B MAP,
 //            0F IAT, 11 TPS, 14 O2 B1S1 voltage
 //   Mode 03  stored DTCs      Mode 04  clear DTCs (an active fault sets its DTC again)
+//   Mode 07  pending DTCs
+// Range / engine checks (thresholds under "Range and engine checks"):
+//   outside NORMAL -> pending DTC, beyond SAFE -> confirmed DTC + MIL
+//   P0217 engine overheat (ECT), P0111 IAT range, P0171 too lean / P0172 too
+//   rich (O2), P0106 MAP high at closed throttle, P0121 TPS open with no load
 // A sensor with an active fault reports its fail-safe value in mode 01, like
 // a real ECU: IAT 20 C, ECT 80 C, O2 0.45 V, MAP 100 kPa, TPS 0 %.
 //
@@ -257,8 +262,95 @@ void updateStoredDtcs() {
   }
 }
 
+// ----------------------- Range and engine checks ----------------------------
+// Besides the circuit faults above, the ECU watches whether the values stay
+// in their NORMAL range and inside their SAFE limit:
+//   outside normal        -> PENDING DTC (mode 07), no MIL
+//   beyond the safe limit -> CONFIRMED DTC (mode 03) + MIL, stored until mode 04
+// A level must hold for RANGE_CONFIRM_MS (no DTC while sweeping the knob).
+// A check is skipped while one of its sensors has a circuit fault.
+constexpr uint16_t RANGE_CONFIRM_MS = 1000;
+constexpr int16_t ECT_NORMAL_MAX = 105, ECT_SAFE_MAX = 115;    // deg C  -> P0217 engine overheat
+constexpr int16_t IAT_NORMAL_MAX = 45,  IAT_SAFE_MAX = 50;     // deg C  -> P0111 IAT range
+constexpr int16_t O2_LEAN_NORMAL = 200, O2_LEAN_SAFE = 100;    // mV, below -> P0171 too lean
+constexpr int16_t O2_RICH_NORMAL = 800, O2_RICH_SAFE = 900;    // mV, above -> P0172 too rich
+constexpr int16_t MAP_IDLE_TPS_MAX = 5;                        // %, throttle closed for the MAP check
+constexpr int16_t MAP_IDLE_NORMAL = 60, MAP_IDLE_SAFE = 80;    // kPa at closed throttle -> P0106 MAP range
+constexpr int16_t TPS_NOLOAD_MAP_MAX = 30;                     // kPa, no engine load for the TPS check
+constexpr int16_t TPS_NOLOAD_NORMAL = 50, TPS_NOLOAD_SAFE = 80;// % with no load -> P0121 TPS range
+
+enum CheckId : uint8_t { CHK_OVERHEAT, CHK_IAT, CHK_LEAN, CHK_RICH, CHK_MAP, CHK_TPS, CHECK_COUNT };
+struct RangeCheck {
+  uint16_t dtc;
+  const char* text;
+  uint8_t sensor;  // Sensor marked on the LCD.
+  uint8_t level;   // Accepted level: 0 normal, 1 outside normal, 2 beyond safe.
+  uint8_t candidate;
+  uint32_t sinceMs;
+};
+RangeCheck checks[CHECK_COUNT] = {
+  {0x0217, "engine overheat", ECT, 0, 0, 0},
+  {0x0111, "IAT range",       IAT, 0, 0, 0},
+  {0x0171, "system too lean", O2,  0, 0, 0},
+  {0x0172, "system too rich", O2,  0, 0, 0},
+  {0x0106, "MAP range",       MAP, 0, 0, 0},
+  {0x0121, "TPS range",       TPS, 0, 0, 0},
+};
+uint8_t confirmedChecks = 0;  // Bit c = check c confirmed (latched until mode 04).
+
+bool ok(uint8_t id) { return sensors[id].fault == FAULT_NONE; }
+uint8_t above(int16_t v, int16_t normal, int16_t safe) { return v > safe ? 2 : v > normal ? 1 : 0; }
+uint8_t below(int16_t v, int16_t normal, int16_t safe) { return v < safe ? 2 : v < normal ? 1 : 0; }
+
+// Level the values give now, or 0xFF when the check can't run (circuit fault).
+uint8_t evaluate(uint8_t c) {
+  const int16_t ect = sensors[ECT].value, iat = sensors[IAT].value, o2 = sensors[O2].value;
+  const int16_t map = sensors[MAP].value, tps = sensors[TPS].value;
+  switch (c) {
+    case CHK_OVERHEAT: return ok(ECT) ? above(ect, ECT_NORMAL_MAX, ECT_SAFE_MAX) : 0xFF;
+    case CHK_IAT:      return ok(IAT) ? above(iat, IAT_NORMAL_MAX, IAT_SAFE_MAX) : 0xFF;
+    case CHK_LEAN:     return ok(O2) ? below(o2, O2_LEAN_NORMAL, O2_LEAN_SAFE) : 0xFF;
+    case CHK_RICH:     return ok(O2) ? above(o2, O2_RICH_NORMAL, O2_RICH_SAFE) : 0xFF;
+    case CHK_MAP:
+      if (!ok(MAP) || !ok(TPS)) return 0xFF;
+      return tps <= MAP_IDLE_TPS_MAX ? above(map, MAP_IDLE_NORMAL, MAP_IDLE_SAFE) : 0;
+    case CHK_TPS:
+      if (!ok(MAP) || !ok(TPS)) return 0xFF;
+      return map <= TPS_NOLOAD_MAP_MAX ? above(tps, TPS_NOLOAD_NORMAL, TPS_NOLOAD_SAFE) : 0;
+  }
+  return 0;
+}
+
+void updateRangeChecks(uint32_t now) {
+  for (uint8_t c = 0; c < CHECK_COUNT; c++) {
+    RangeCheck& k = checks[c];
+    const uint8_t level = evaluate(c);
+    if (level == 0xFF) continue;  // Monitor disabled: keep the last result.
+    if (level != k.candidate) { k.candidate = level; k.sinceMs = now; }
+    if (k.candidate == k.level || now - k.sinceMs < RANGE_CONFIRM_MS) continue;
+    k.level = k.candidate;
+    lcdDirty = true;
+    Serial.print(F("# P")); Serial.print(k.dtc < 0x1000 ? F("0") : F("")); Serial.print(k.dtc, HEX);
+    Serial.print(' '); Serial.print(k.text);
+    if (k.level == 2) {
+      if (!(confirmedChecks & (1 << c))) { confirmedChecks |= 1 << c; Serial.println(F(": beyond SAFE limit, DTC CONFIRMED, MIL on")); }
+      else Serial.println(F(": beyond SAFE limit again (already stored)"));
+    }
+    else if (k.level == 1) Serial.println(F(": outside NORMAL range, DTC PENDING"));
+    else Serial.println(F(": back to normal"));
+  }
+}
+
+uint8_t pendingMask() {
+  uint8_t m = 0;
+  for (uint8_t c = 0; c < CHECK_COUNT; c++) if (checks[c].level >= 1) m |= 1 << c;
+  return m;
+}
+
+uint8_t bitCount(uint8_t v) { uint8_t n = 0; for (; v; v >>= 1) n += v & 1; return n; }
+
 uint8_t storedCount() {
-  uint8_t n = 0;
+  uint8_t n = bitCount(confirmedChecks);
   for (uint8_t i = 0; i < SENSOR_COUNT; i++) n += ((storedHigh >> i) & 1) + ((storedLow >> i) & 1);
   return n;
 }
@@ -335,7 +427,7 @@ void handleRequest(const uint8_t* buf, uint8_t len) {
   const uint8_t n = buf[0] & 0x0F;
   if (n < 1 || n > 7) return;
   const uint8_t mode = buf[1];
-  uint8_t r[2 + 2 * 2 * SENSOR_COUNT];
+  uint8_t r[2 + 2 * (2 * SENSOR_COUNT + CHECK_COUNT)];
   uint8_t rn = 0;
 
   if (mode == 0x01 && n >= 2) {
@@ -371,8 +463,20 @@ void handleRequest(const uint8_t* buf, uint8_t len) {
       if ((storedHigh >> i) & 1) { r[rn++] = sensors[i].dtcHigh >> 8; r[rn++] = sensors[i].dtcHigh & 0xFF; }
       if ((storedLow >> i) & 1) { r[rn++] = sensors[i].dtcLow >> 8; r[rn++] = sensors[i].dtcLow & 0xFF; }
     }
+    for (uint8_t c = 0; c < CHECK_COUNT; c++)
+      if ((confirmedChecks >> c) & 1) { r[rn++] = checks[c].dtc >> 8; r[rn++] = checks[c].dtc & 0xFF; }
+  } else if (mode == 0x07) {  // Pending DTCs: range checks outside normal now.
+    const uint8_t m = pendingMask();
+    r[0] = 0x47;
+    r[1] = bitCount(m);
+    rn = 2;
+    for (uint8_t c = 0; c < CHECK_COUNT; c++)
+      if ((m >> c) & 1) { r[rn++] = checks[c].dtc >> 8; r[rn++] = checks[c].dtc & 0xFF; }
   } else if (mode == 0x04) {
     storedHigh = storedLow = 0;  // Active faults set theirs again on the next loop.
+    confirmedChecks = 0;         // A check still beyond safe confirms again on the next loop.
+    for (uint8_t c = 0; c < CHECK_COUNT; c++)
+      if (checks[c].level == 2) confirmedChecks |= 1 << c;
     Serial.println(F("# DTCs cleared by the scan tool"));
     r[0] = 0x44;
     rn = 1;
@@ -429,7 +533,7 @@ void updateCan(uint32_t now) {
 
 // ========================= Display (16x2 I2C LCD) ===========================
 //   IAT  25'C 2.300V   <- selected sensor: value (or HIGH / LOW fault) and output volts
-//   [I] E  O  M  T C   <- [ ] = selected, ! = sensor in fault,
+//   [I] E  O  M  T C   <- [ ] = selected, ! = circuit fault or beyond safe, * = outside normal,
 //                         last char: C = scan tool connected, . = CAN idle, - = no MCP2515
 // LiquidCrystal_I2C library (Frank de Brabander) at the fixed address LCD_ADDR.
 LiquidCrystal_I2C lcd(LCD_ADDR, 16, 2);
@@ -487,9 +591,14 @@ void drawLcd() {
   lcdLine(0, line);
 
   for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
+    uint8_t level = 0;  // Worst range check on this sensor.
+    for (uint8_t c = 0; c < CHECK_COUNT; c++)
+      if (checks[c].sensor == i && checks[c].level > level) level = checks[c].level;
     line[i * 3] = i == selected ? '[' : ' ';
     line[i * 3 + 1] = sensors[i].letter;
-    line[i * 3 + 2] = i == selected ? ']' : sensors[i].fault != FAULT_NONE ? '!' : ' ';
+    line[i * 3 + 2] = i == selected ? ']'
+                    : sensors[i].fault != FAULT_NONE || level == 2 ? '!'
+                    : level == 1 ? '*' : ' ';
   }
   line[15] = canState;
   line[16] = '\0';
@@ -520,6 +629,7 @@ void loop() {
   updateEncoder(now);
   updateButton(now);
   updateStoredDtcs();
+  updateRangeChecks(now);
   updateCan(now);
   drawLcd();
 }

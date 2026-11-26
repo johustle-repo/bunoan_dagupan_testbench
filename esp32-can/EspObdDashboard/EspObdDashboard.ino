@@ -41,6 +41,7 @@ struct Live {
   uint32_t supported = 0;
   // Mode 03.
   String dtcs = "";        // "P0113,P0122"
+  String pend = "";        // Mode 07 pending DTCs, same format.
   bool dtcRead = false;
   uint32_t dtcMs = 0;
   // Status.
@@ -95,6 +96,12 @@ void parseLine(char* line) {
     live.dtcs = list;
     live.dtcRead = true;
     live.dtcMs = millis();
+  } else if (strcmp(f[0], "PEND") == 0 && n >= 2) {
+    live.lastAnswerMs = millis();
+    String list;
+    for (int i = 2; i < n; i++) { if (i > 2) list += ','; list += f[i]; }
+    if (list != live.pend && list.length()) event("Pending: " + list);
+    live.pend = list;
   } else if (strcmp(f[0], "CLR") == 0) {
     live.lastAnswerMs = millis();
     event("DTCs cleared");
@@ -142,6 +149,8 @@ void handleLive() {
   j += ",\"dtcAge\":"; j += live.dtcRead ? now - live.dtcMs : 0;
   j += ",\"dtcs\":[";
   if (live.dtcs.length()) { j += '"'; String s = live.dtcs; s.replace(",", "\",\""); j += s; j += '"'; }
+  j += "],\"pend\":[";
+  if (live.pend.length()) { j += '"'; String s = live.pend; s.replace(",", "\",\""); j += s; j += '"'; }
   j += "],\"supported\":\""; j += String(live.supported, HEX);
   j += "\",\"answers\":"; j += live.answers;
   j += ",\"noResp\":"; j += live.noResponse;
@@ -181,6 +190,8 @@ main{padding:18px;max-width:1000px;margin:auto;display:grid;gap:14px}
 .lamp.on{background:var(--warn);border-color:#ffd88a;box-shadow:0 0 14px var(--warn)}
 .codes{display:flex;gap:8px;flex-wrap:wrap;min-height:34px;margin-top:10px}
 .code{font:600 18px ui-monospace,Consolas,monospace;padding:4px 10px;border-radius:8px;background:#3a2a12;color:var(--warn)}
+.code.pend{background:transparent;border:1px dashed var(--warn);color:#d9b56a}
+.code small{font:500 11px system-ui;margin-left:6px;opacity:.8}
 .none{color:var(--ok);font-weight:600;padding-top:6px}
 button{font:600 14px system-ui;padding:9px 16px;border-radius:8px;border:1px solid var(--line);background:#222a33;color:var(--text);cursor:pointer}
 button:hover{background:#2b3540}button.danger{border-color:#5a2a2a}
@@ -213,7 +224,9 @@ footer{color:var(--dim);font-size:12px;text-align:center;padding:4px 18px 18px}
 <script>
 const DESC={P0107:'MAP circuit low',P0108:'MAP circuit high',P0112:'IAT circuit low',P0113:'IAT circuit high',
 P0117:'ECT circuit low',P0118:'ECT circuit high',P0122:'TPS circuit low',P0123:'TPS circuit high',
-P0131:'O2 B1S1 circuit low voltage',P0132:'O2 B1S1 circuit high voltage'};
+P0131:'O2 B1S1 circuit low voltage',P0132:'O2 B1S1 circuit high voltage',
+P0217:'Engine coolant over temperature',P0111:'IAT circuit range/performance',P0171:'System too lean (bank 1)',
+P0172:'System too rich (bank 1)',P0106:'MAP circuit range/performance',P0121:'TPS circuit range/performance'};
 const $=id=>document.getElementById(id);
 function show(id,v,d){$(id).textContent=v===null?'–':Number(v).toFixed(d)}
 async function cmd(c){try{await fetch('/api/cmd?c='+c,{method:'POST'})}catch(e){}}
@@ -226,8 +239,10 @@ async function tick(){
     $('lamp').classList.toggle('on',d.mil);$('miltext').textContent=d.mil?'MIL ON':'MIL OFF';
     $('count').textContent=d.dtcCount+' DTC'+(d.dtcCount==1?'':'s')+' (PID 01)';
     const c=$('codes');
-    c.innerHTML=!d.dtcRead?'<span class="sub">not read yet</span>':d.dtcs.length?d.dtcs.map(x=>'<span class="code" title="'+(DESC[x]||'')+'">'+x+'</span>').join(''):'<span class="none">No DTCs stored</span>';
-    $('desc').textContent=d.dtcs.map(x=>x+' '+(DESC[x]||'')).join(' · ')||(d.event&&d.eventAge<5000?d.event:'');
+    const pend=d.pend.filter(x=>!d.dtcs.includes(x));
+    const tag=(x,p)=>'<span class="code'+(p?' pend':'')+'" title="'+(DESC[x]||'')+'">'+x+'<small>'+(p?'pending':'stored')+'</small></span>';
+    c.innerHTML=!d.dtcRead?'<span class="sub">not read yet</span>':(d.dtcs.length||pend.length)?d.dtcs.map(x=>tag(x,0)).join('')+pend.map(x=>tag(x,1)).join(''):'<span class="none">No DTCs stored</span>';
+    $('desc').textContent=d.dtcs.concat(pend).map(x=>x+' '+(DESC[x]||'')).join(' · ')||(d.event&&d.eventAge<5000?d.event:'');
     $('foot').textContent='answers '+d.answers+' · no answer '+d.noResp+' · PIDs 01-20: '+d.supported+(d.event?' · '+d.event:'');
   }catch(e){$('state').textContent='ESP32 OFFLINE';$('state').style.color='var(--bad)'}
 }

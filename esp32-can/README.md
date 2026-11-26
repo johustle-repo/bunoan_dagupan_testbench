@@ -65,11 +65,35 @@ fail-safe value: IAT 20 °C, ECT 80 °C, O2 0.45 V, MAP 100 kPa, TPS 0 %.
 | MAP | — | P0108 |
 | TPS | — | P0123 |
 
+## Range and engine checks (Set 1)
+
+Besides the circuit faults, the ECU checks that each value stays in its
+**normal** range and inside its **safe** limit. A level has to hold for 1 s
+before it counts, so sweeping the knob through a range doesn't set a code.
+
+| DTC | Check | Normal | Pending (outside normal) | Confirmed + MIL (beyond safe) |
+|---|---|---|---|---|
+| **P0217** | Engine coolant over temperature | ECT ≤ 105 °C | 106–115 °C | above 115 °C |
+| P0111 | IAT range/performance | IAT ≤ 45 °C | 46–50 °C | above 50 °C |
+| **P0171** | System too lean | O2 ≥ 0.20 V | 0.10–0.19 V | below 0.10 V |
+| **P0172** | System too rich | O2 ≤ 0.80 V | 0.81–0.90 V | above 0.90 V |
+| P0106 | MAP range: high at closed throttle (TPS ≤ 5 %) | MAP ≤ 60 kPa | 61–80 kPa | above 80 kPa |
+| P0121 | TPS range: open with no load (MAP ≤ 30 kPa) | TPS ≤ 50 % | 51–80 % | above 80 % |
+
+- **Pending** (mode 07) shows only while the value is outside normal. The MIL stays off.
+- **Confirmed** (mode 03) turns the MIL on and stays stored after the value
+  returns to normal, until **Clear DTC**.
+- A check is skipped while one of its sensors has a circuit fault (long press).
+- The thresholds are constants under "Range and engine checks" in
+  `NanoSensorSimulator.ino`.
+- On the Set 1 LCD, `*` after a sensor letter = outside normal, `!` = beyond
+  safe or circuit fault.
+
 ## Using it
 
 1. Join Wi-Fi **ECU-OBD** (password `ECUdemo2026`) and open http://192.168.4.1/.
 2. The page shows ECU ONLINE, the live data, the MIL and the stored DTCs.
-   DTCs are read every 2 s, or press **Read DTC**.
+   DTCs (stored and pending) are read every 2 s, or press **Read DTC**.
 3. Long-press the Set 1 encoder to set a fault: the MIL comes on and the DTC appears.
 4. Turn the encoder to remove the fault, then press **Clear DTC**.
 

@@ -9,7 +9,7 @@
 //
 // What it does:
 //   - polls mode 01 PIDs 01, 05, 0F, 0B, 11, 14 in turn, one every 50 ms
-//   - reads the DTCs (mode 03) every 2 s and on a READ command
+//   - reads the stored DTCs (mode 03) and pending DTCs (mode 07) every 2 s and on READ
 //   - clears the DTCs (mode 04) on a CLEAR command
 //   - asks for the supported PIDs (PID 00) at start and every 10 s
 //   Requests go out on 0x7DF, answers come from 0x7E8; for multi-frame
@@ -29,6 +29,7 @@
 // Lines to the ESP32:
 //   PID,<pid>,<A>,<B>,<C>,<D>   mode 01 answer (hex PID, decimal bytes)
 //   DTC,<n>,<code>,...          mode 03 answer, e.g. DTC,2,P0113,P0122
+//   PEND,<n>,<code>,...         mode 07 answer (pending DTCs), e.g. PEND,1,P0217
 //   CLR,OK                      mode 04 done
 //   NEG,<mode>,<code>           negative answer (7F)
 //   NORESP,<mode>,<pid>         no answer in 150 ms
@@ -118,9 +119,12 @@ void scheduleNext(uint32_t now) {
   if (waiting || now - requestMs < REQUEST_GAP_MS) return;
 
   if (clearRequested) { clearRequested = false; sendRequest(0x04, 0, false); return; }
+  static bool pendingNext = false;  // After each mode 03, also ask mode 07.
+  if (pendingNext) { pendingNext = false; sendRequest(0x07, 0, false); return; }
   if (readRequested || now - lastDtcMs >= DTC_PERIOD_MS) {
     readRequested = false;
     lastDtcMs = now;
+    pendingNext = true;
     sendRequest(0x03, 0, false);
     return;
   }
@@ -136,22 +140,22 @@ void scheduleNext(uint32_t now) {
 
 // ---------------------------- Answers ---------------------------------------
 void handleAnswer(const uint8_t* d, uint8_t n) {
-  char line[64];
+  char line[96];
   if (n >= 2 && d[0] == 0x41) {
     uint8_t b[4] = {0, 0, 0, 0};
     for (uint8_t i = 0; i < 4 && i + 2 < n; i++) b[i] = d[i + 2];
     snprintf(line, sizeof(line), "PID,%02X,%u,%u,%u,%u", d[1], b[0], b[1], b[2], b[3]);
     emit(line);
     if (waitMode == 0x01 && waitPid == d[1]) waiting = false;
-  } else if (n >= 2 && d[0] == 0x43) {
+  } else if (n >= 2 && (d[0] == 0x43 || d[0] == 0x47)) {  // Stored (03) or pending (07) DTCs.
     const uint8_t count = d[1];
-    int len = snprintf(line, sizeof(line), "DTC,%u", count);
+    int len = snprintf(line, sizeof(line), d[0] == 0x43 ? "DTC,%u" : "PEND,%u", count);
     for (uint8_t i = 0; i < count && 2 + 2 * i + 1 < n && len < int(sizeof(line)) - 8; i++) {
       const uint8_t hi = d[2 + 2 * i], lo = d[3 + 2 * i];
       len += snprintf(line + len, sizeof(line) - len, ",%c%u%X%02X", "PCBU"[hi >> 6], (hi >> 4) & 3, hi & 0x0F, lo);
     }
     emit(line);
-    if (waitMode == 0x03) waiting = false;
+    if (waitMode == (d[0] & 0x0F)) waiting = false;
   } else if (n >= 1 && d[0] == 0x44) {
     emit("CLR,OK");
     if (waitMode == 0x04) waiting = false;
