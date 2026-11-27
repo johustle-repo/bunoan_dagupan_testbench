@@ -78,6 +78,7 @@ This Nano is the **ECU** of the OBD-II bench (Set 1). It answers a scan tool
 over CAN (MCP2515, 500 kbps, 8 MHz crystal): requests on 0x7DF / 0x7E0,
 answers on 0x7E8. Mode 01 PIDs 00, 01, 05, 0B, 0C (RPM), 0F, 11 and 14, mode 03 (read
 DTCs) and mode 04 (clear DTCs). A fault set with a long press stores its DTC
-and turns on the MIL until it is cleared. See `esp32-can/README.md` for the
+and turns on the MIL until it is cleared. Clear DTC (mode 04) also removes the
+faults and puts out-of-range values back to their power-up values. See `esp32-can/README.md` for the
 whole bench. The last character on LCD line 2 shows: `C` = scan tool talking,
 `.` = CAN OK but no requests, `-` = MCP2515 not found.

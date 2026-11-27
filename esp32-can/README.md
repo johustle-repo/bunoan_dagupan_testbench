@@ -54,7 +54,7 @@ D0/D1 stay free, so uploads over USB work with the ESP32 connected.
 | 01 11 | TPS, % × 255 / 100 |
 | 01 14 | O2 B1S1, V × 200 (B = FF) |
 | 03 | Stored DTCs (multi-frame when there are 3 or more) |
-| 04 | Clears the DTCs. A fault that is still active stores its DTC again at once |
+| 04 | Clears the DTCs and resets Set 1 to normal: faults removed, out-of-range values back to their power-up values |
 
 A long press on the Set 1 encoder sets a fault. Its DTC is stored and stays
 until **Clear DTC**. While a fault is active, mode 01 gives that sensor's
@@ -102,18 +102,22 @@ before it counts, so sweeping the knob through a range doesn't set a code.
 1. Join Wi-Fi **ECU-OBD** (password `ECUdemo2026`) and open http://192.168.4.1/.
 2. The page shows the link chain (ESP32 → Tester → ECU), a tachometer, the live
    data with normal / caution / danger zones, the MIL, the stored and pending
-   DTCs with their meaning, and an activity log. DTCs are read every 2 s, or
-   press **Read DTC**.
-3. Long-press the Set 1 encoder to set a fault: the MIL comes on and the DTC appears.
-4. Turn the encoder to remove the fault, then press **Clear DTC** (press it
-   twice: the first press asks you to confirm).
+   DTCs with their meaning, and an activity log.
+3. Set a problem on Set 1: long-press the encoder (circuit fault), or turn a
+   value out of range (e.g. ECT above 105 °C, RPM above 6000).
+4. Press **Read DTC**. The DTCs are read **only** when you press it: the DTC
+   card (codes, MIL, count) shows the result of the last read and does not
+   change by itself.
+5. Press **Clear DTC** (twice: the first press asks you to confirm). The ECU
+   clears the codes **and resets the problem to normal**: every fault is
+   removed and every out-of-range value goes back to its power-up value
+   (IAT 25 °C, ECT 90 °C, O2 0.45 V, MAP 35 kPa, TPS 0 %, RPM 800). The
+   tester then reads the DTCs once to show the result.
 
 **Clear DTC** is re-sent up to 3 times until the Nano answers `ACK,CLEAR`. The
 page then says one of:
-- *Cleared …, MIL off*: done.
-- *Cleared, but P0113 came back*: the ECU cleared it, but the fault is still
-  active on Set 1 (still in fault, or the value is still beyond its safe
-  limit), so it stored the code again at once, as a real ECU does. Fix it first.
+- *Cleared …. Set 1 reset to normal, no DTCs stored, MIL off*: done.
+- *Cleared, but P0113 is still stored*: press Clear DTC again.
 - *The Nano tester did not answer CLEAR*: check the wire ESP32 GPIO17 → Nano D8.
 - *The ECU did not answer the clear*: check the CAN bus.
 

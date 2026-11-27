@@ -121,7 +121,7 @@ padding:12px 16px;border-radius:12px;background:#1f2633;border:1px solid var(--l
       <button id="bRead" onclick="cmd('read')"><span class="spin"></span>Read DTC</button>
       <button id="bClear" class="danger" onclick="clearClick()"><span class="spin"></span><span id="clearTxt">Clear DTC</span></button>
     </div>
-    <div id="codes"><div class="muted">Waiting for the first DTC read&hellip;</div></div>
+    <div id="codes"><div class="muted">Press <b>Read DTC</b> to read the trouble codes from the ECU.</div></div>
     <div class="muted" id="age"></div>
   </div>
 </section>
@@ -246,15 +246,15 @@ async function tick(){
     const st=status(s.k,v,d),e=$('s_'+s.k);e.textContent=st[0];e.className='c-'+st[1];
   }
   $('x_o2').textContent=d.afr===null?'':'AFR '+d.afr.toFixed(1)+':1';
-  $('mil').classList.toggle('on',d.mil);$('miltext').textContent=d.mil?'CHECK ENGINE'+DOT+'MIL ON':'MIL OFF';
-  $('count').textContent=d.dtcCount+' stored DTC'+(d.dtcCount==1?'':'s')+' reported in PID 01';
+  $('mil').classList.toggle('on',d.mil);$('miltext').textContent=!d.dtcRead?'MIL '+DASH:d.mil?'CHECK ENGINE'+DOT+'MIL ON':'MIL OFF';
+  $('count').textContent=!d.dtcRead?'Not read yet':d.dtcCount+' stored DTC'+(d.dtcCount==1?'':'s')+' in the last read';
   const pend=d.pend.filter(x=>!d.dtcs.includes(x));
   const row=(x,p)=>{const i=DESC[x]||['Unknown code','Not in this tool\'s list'];
     return '<div class="dtc'+(p?' pend':'')+'"><div class="code">'+esc(x)+'</div><div><div class="t">'+esc(i[0])+'</div><div class="h">'+esc(i[1])+'</div></div><span class="badge">'+(p?'Pending':'Stored')+'</span></div>'};
-  $('codes').innerHTML=!d.dtcRead?'<div class="muted">Waiting for the first DTC read&hellip;</div>':
+  $('codes').innerHTML=!d.dtcRead?'<div class="muted">Press <b>Read DTC</b> to read the trouble codes from the ECU.</div>':
     (d.dtcs.length||pend.length)?d.dtcs.map(x=>row(x,0)).join('')+pend.map(x=>row(x,1)).join(''):
     '<div class="empty"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M5 12l5 5 9-10"/></svg>No DTCs stored or pending</div>';
-  $('age').textContent=d.dtcRead?'DTCs read '+ago(d.dtcAge)+DOT+'read every 2 s':'';
+  $('age').textContent=d.dtcRead?'Last read '+ago(d.dtcAge)+DOT+'press Read DTC to update':'';
   $('bRead').classList.toggle('busy',d.busy=='read');$('bRead').disabled=d.busy!='';
   $('bClear').classList.toggle('busy',d.busy=='clear');$('bClear').disabled=d.busy!='';
   $('log').innerHTML=d.log.length?d.log.map(e=>'<div class="ev l'+e.lv+'"><i></i><span>'+esc(e.msg)+'</span><small>'+ago(e.age)+'</small></div>').join(''):'<div class="muted">No activity yet</div>';

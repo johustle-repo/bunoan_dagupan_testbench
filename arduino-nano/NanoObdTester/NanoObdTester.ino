@@ -10,7 +10,8 @@
 // What it does:
 //   - polls mode 01 PIDs 01, 05, 0F, 0B, 11, 14 in turn, one every 50 ms,
 //     with RPM (PID 0C) between each of them so the tachometer stays smooth
-//   - reads the stored DTCs (mode 03) and pending DTCs (mode 07) every 2 s and on READ
+//   - reads the stored DTCs (mode 03) and pending DTCs (mode 07) only on READ
+//     (Read DTC button) and once right after a CLEAR, to show the result
 //   - clears the DTCs (mode 04) on a CLEAR command
 //   - asks for the supported PIDs (PID 00) at start and every 10 s
 //   Requests go out on 0x7DF, answers come from 0x7E8; for multi-frame
@@ -64,7 +65,6 @@ constexpr uint32_t OBD_PHYSICAL_ID = 0x7E0;   // Flow control to the ECU.
 constexpr uint32_t OBD_RESPONSE_ID = 0x7E8;
 constexpr uint16_t REQUEST_GAP_MS = 50;
 constexpr uint16_t RESPONSE_TIMEOUT_MS = 150;
-constexpr uint16_t DTC_PERIOD_MS = 2000;
 constexpr uint16_t SUPPORTED_PERIOD_MS = 10000;
 constexpr uint32_t ESP_BAUD = 38400;
 
@@ -134,7 +134,7 @@ bool sendRequest(uint8_t mode, uint8_t pid, bool withPid) {
 }
 
 void scheduleNext(uint32_t now) {
-  static uint32_t lastDtcMs = 0, lastSupportedMs = 0;
+  static uint32_t lastSupportedMs = 0;
   static uint8_t pidIndex = 0;
   static bool supportedAsked = false;
   if (waiting || now - requestMs < REQUEST_GAP_MS) return;
@@ -142,9 +142,8 @@ void scheduleNext(uint32_t now) {
   if (clearRequested) { clearRequested = false; sendRequest(0x04, 0, false); return; }
   static bool pendingNext = false;  // After each mode 03, also ask mode 07.
   if (pendingNext) { pendingNext = false; sendRequest(0x07, 0, false); return; }
-  if (readRequested || now - lastDtcMs >= DTC_PERIOD_MS) {
+  if (readRequested) {
     readRequested = false;
-    lastDtcMs = now;
     pendingNext = true;
     sendRequest(0x03, 0, false);
     return;

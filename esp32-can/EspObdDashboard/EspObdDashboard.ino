@@ -3,7 +3,7 @@
 // The screen of the scan tool. The Nano OBD-II Tester talks CAN to the ECU
 // simulator and sends its answers here as text lines; this ESP32 decodes them
 // and shows a scan-tool page over Wi-Fi: tachometer, live data with normal /
-// caution / danger zones, MIL, stored and pending DTCs with descriptions, the
+// caution / danger zones, MIL and DTCs (as of the last Read DTC press), the
 // Read DTC / Clear DTC buttons (sent back to the Nano as READ / CLEAR) and an
 // activity log.
 //
@@ -93,6 +93,11 @@ struct Command {
 enum ClearState : uint8_t { CLR_IDLE, CLR_WAIT_ACK, CLR_WAIT_ECU, CLR_WAIT_READ } clearState = CLR_IDLE;
 uint32_t clearMs = 0;
 String clearedCodes = "";  // DTCs stored when Clear was pressed.
+// Read DTC: the codes are only read when the button is pressed (and after a
+// clear). Waiting for the mode 03 + 07 answers.
+bool readWait = false;
+uint32_t readMs = 0;
+constexpr uint32_t READ_DONE_MS = 3000;
 
 void sendCmd() {
   Serial2.print(cmd.name);
@@ -123,6 +128,10 @@ void updateCommands() {
     clearState = CLR_IDLE;
   }
   if (clearState == CLR_WAIT_READ && now - clearMs >= CLEAR_DONE_MS + 3000) clearState = CLR_IDLE;
+  if (readWait && now - readMs >= READ_DONE_MS) {
+    readWait = false;
+    event(LV_BAD, "No answer to Read DTC from the ECU.");
+  }
 }
 
 // ------------------------------ Link parsing --------------------------------
@@ -189,13 +198,11 @@ void parseLine(char* line) {
     live.answers++;
     if (clearState == CLR_WAIT_READ) {
       clearState = CLR_IDLE;
+      readWait = false;
       if (list.length())
-        event(LV_WARN, "Cleared, but " + list + " came back at once: the fault is still active on Set 1. "
-                       "Remove it (turn the encoder / bring the value back to normal), then Clear again.");
-      else event(LV_OK, clearedCodes.length() ? "Cleared " + clearedCodes + ". No DTCs stored, MIL off."
-                                              : String("Cleared. No DTCs stored, MIL off."));
-    } else if (list != live.dtcs || !live.dtcRead) {
-      event(list.length() ? LV_WARN : LV_OK, list.length() ? "Stored DTCs: " + list : String("No DTCs stored"));
+        event(LV_WARN, "Cleared, but " + list + " is still stored. Press Clear DTC again.");
+      else event(LV_OK, (clearedCodes.length() ? "Cleared " + clearedCodes + ". " : String("Cleared. ")) +
+                        "Set 1 reset to normal, no DTCs stored, MIL off.");
     }
     live.dtcs = list;
     live.dtcRead = true;
@@ -204,8 +211,13 @@ void parseLine(char* line) {
     String list;
     if (!dtcList(f, n, list)) { bad("malformed pending DTC"); return; }
     live.lastAnswerMs = millis();
-    if (list != live.pend && list.length()) event(LV_WARN, "Pending: " + list);
     live.pend = list;
+    if (readWait) {  // Result of the Read DTC button.
+      readWait = false;
+      if (!live.dtcs.length() && !list.length()) event(LV_OK, "Read DTC: no DTCs stored or pending.");
+      else event(LV_WARN, "Read DTC: " + (live.dtcs.length() ? "stored " + live.dtcs : String("none stored")) +
+                          (list.length() ? ", pending " + list : String("")));
+    }
   } else if (strcmp(f[0], "ACK") == 0 && n >= 2) {
     if (cmd.name && strcmp(cmd.name, f[1]) == 0) {
       cmd.name = nullptr;
@@ -314,14 +326,17 @@ void handleLive() {
   j += ",\"tps\":"; j += jsonNum(live.validTps, live.tps, 0);
   j += ",\"o2\":"; j += jsonNum(live.validO2, live.o2, 3);
   j += ",\"afr\":"; j += jsonNum(live.validO2, afr(), 1);
-  j += ",\"mil\":"; j += live.mil ? "true" : "false";
-  j += ",\"dtcCount\":"; j += live.dtcCount;
+  // The DTC card shows the last Read DTC result only: MIL = stored DTCs in that read.
+  int stored = 0;
+  if (live.dtcs.length()) { stored = 1; for (unsigned i = 0; i < live.dtcs.length(); i++) if (live.dtcs[i] == ',') stored++; }
+  j += ",\"mil\":"; j += stored ? "true" : "false";
+  j += ",\"dtcCount\":"; j += stored;
   j += ",\"dtcRead\":"; j += live.dtcRead ? "true" : "false";
   j += ",\"dtcAge\":"; j += live.dtcRead ? now - live.dtcMs : 0;
   j += ",\"dtcs\":"; jsonList(j, live.dtcs);
   j += ",\"pend\":"; jsonList(j, live.pend);
   j += ",\"busy\":\"";
-  j += clearState != CLR_IDLE ? "clear" : (cmd.name && strcmp(cmd.name, "READ") == 0) ? "read" : "";
+  j += clearState != CLR_IDLE ? "clear" : readWait ? "read" : "";
   j += "\",\"supported\":\""; j += String(live.supported, HEX);
   j += "\",\"answers\":"; j += live.answers;
   j += ",\"noResp\":"; j += live.noResponse;
@@ -343,6 +358,8 @@ void handleCmd() {
   const String c = server.arg("c");
   if (c == "read") {
     startCmd("READ");
+    readWait = true;
+    readMs = millis();
     event(LV_INFO, "Reading DTCs...");
   } else if (c == "clear") {
     clearedCodes = live.dtcs;

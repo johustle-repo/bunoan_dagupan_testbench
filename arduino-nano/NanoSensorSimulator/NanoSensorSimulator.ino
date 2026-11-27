@@ -12,7 +12,8 @@
 // multi-frame.
 //   Mode 01  PID 00 supported PIDs, 01 MIL + DTC count, 05 ECT, 0B MAP,
 //            0C engine RPM, 0F IAT, 11 TPS, 14 O2 B1S1 voltage
-//   Mode 03  stored DTCs      Mode 04  clear DTCs (an active fault sets its DTC again)
+//   Mode 03  stored DTCs      Mode 04  clear DTCs: also removes every fault and puts
+//            out-of-range values back to their power-up values (see resetToNormal)
 //   Mode 07  pending DTCs
 // Range / engine checks (thresholds under "Range and engine checks"):
 //   outside NORMAL -> pending DTC, beyond SAFE -> confirmed DTC + MIL
@@ -372,6 +373,38 @@ uint8_t storedCount() {
   return n;
 }
 
+// Clear DTC (mode 04) fixes the problems on the bench, then clears the codes:
+// every circuit fault is removed, and every sensor whose value is outside its
+// normal range goes back to its power-up value (ECT 90 C, IAT 25 C, O2 0.45 V,
+// MAP 35 kPa, TPS 0 %, RPM 800). Repeats, because resetting one value can
+// switch on another check (TPS back to 0 % turns on the MAP-at-idle check).
+int16_t startValue[SENSOR_COUNT];  // Power-up values, saved in setup().
+
+void resetToNormal() {
+  uint8_t changed = 0;  // Bit i = sensor i reset.
+  for (uint8_t i = 0; i < SENSOR_COUNT; i++)
+    if (sensors[i].fault != FAULT_NONE) { sensors[i].fault = FAULT_NONE; changed |= 1 << i; }
+  for (uint8_t pass = 0; pass < 3; pass++) {
+    bool again = false;
+    for (uint8_t c = 0; c < CHECK_COUNT; c++) {
+      const uint8_t s = checks[c].sensor;
+      const uint8_t level = evaluate(c);
+      if (level != 0 && level != 0xFF && sensors[s].value != startValue[s]) {
+        sensors[s].value = startValue[s];
+        changed |= 1 << s;
+        again = true;
+      }
+    }
+    if (!again) break;
+  }
+  for (uint8_t c = 0; c < CHECK_COUNT; c++) { checks[c].level = checks[c].candidate = 0; checks[c].sinceMs = millis(); }
+  storedHigh = storedLow = 0;
+  confirmedChecks = 0;
+  Serial.println(F("# Clear DTC: faults removed, values back to normal, DTCs cleared"));
+  for (uint8_t i = 0; i < SENSOR_COUNT; i++) if (changed & (1 << i)) applyOutput(i);
+  lcdDirty = true;
+}
+
 // Value the ECU reports: the set value, or the fail-safe one during a fault.
 int16_t reported(uint8_t id) { return sensors[id].fault != FAULT_NONE ? sensors[id].failSafe : sensors[id].value; }
 
@@ -495,11 +528,7 @@ void handleRequest(const uint8_t* buf, uint8_t len) {
     for (uint8_t c = 0; c < CHECK_COUNT; c++)
       if ((m >> c) & 1) { r[rn++] = checks[c].dtc >> 8; r[rn++] = checks[c].dtc & 0xFF; }
   } else if (mode == 0x04) {
-    storedHigh = storedLow = 0;  // Active faults set theirs again on the next loop.
-    confirmedChecks = 0;         // A check still beyond safe confirms again on the next loop.
-    for (uint8_t c = 0; c < CHECK_COUNT; c++)
-      if (checks[c].level == 2) confirmedChecks |= 1 << c;
-    Serial.println(F("# DTCs cleared by the scan tool"));
+    resetToNormal();  // Removes the faults and out-of-range values, then clears the DTCs.
     r[0] = 0x44;
     rn = 1;
   } else {
@@ -638,6 +667,7 @@ void drawLcd() {
 void setup() {
   Serial.begin(115200);
   Serial.println(F("# NANO ECU SIMULATOR, OBD-II (IAT D5, ECT D6, O2 D9, MAP D10, TPS D3, RPM over OBD, CAN CS D8)"));
+  for (uint8_t i = 0; i < SENSOR_COUNT; i++) startValue[i] = sensors[i].value;  // For Clear DTC.
 
   pinMode(PIN_CAN_INT, INPUT_PULLUP);
   canBegin();  // Before the PWM outputs: SPI start-up sets D10 (SS).
