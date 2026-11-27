@@ -5,10 +5,11 @@
 // and passes the answers to the ESP32 (EspObdDashboard), which shows them on
 // a Wi-Fi web page and sends back the Read / Clear DTC commands.
 //
-//   ECU simulator Nano --CAN--> this Nano --AltSoftSerial 38400--> ESP32
+//   ECU simulator Nano --CAN--> this Nano --SoftwareSerial 38400--> ESP32
 //
 // What it does:
-//   - polls mode 01 PIDs 01, 05, 0F, 0B, 11, 14 in turn, one every 50 ms
+//   - polls mode 01 PIDs 01, 05, 0F, 0B, 11, 14 in turn, one every 50 ms,
+//     with RPM (PID 0C) between each of them so the tachometer stays smooth
 //   - reads the stored DTCs (mode 03) and pending DTCs (mode 07) every 2 s and on READ
 //   - clears the DTCs (mode 04) on a CLEAR command
 //   - asks for the supported PIDs (PID 00) at start and every 10 s
@@ -21,28 +22,38 @@
 //   D12  IN   MCP2515 SO  (SPI MISO)
 //   D13  OUT  MCP2515 SCK
 //   D2   IN   MCP2515 INT
-//   D9   OUT  AltSoftSerial TX -> 10k / 20k divider -> ESP32 GPIO16 (RX2)
-//   D8   IN   AltSoftSerial RX <- ESP32 GPIO17 (TX2, 3.3 V is read as HIGH)
+//   D9   OUT  SoftwareSerial TX -> 10k / 20k divider -> ESP32 GPIO16 (RX2)
+//   D8   IN   SoftwareSerial RX <- ESP32 GPIO17 (TX2, 3.3 V is read as HIGH)
 //   GND       common ground with the ESP32
 // USB Serial (115200) shows the same lines, for the Serial Monitor.
 //
-// Lines to the ESP32:
+// Lines to the ESP32 end in *HH, the XOR of every character before the '*'
+// (as in NMEA). The ESP32 drops a line whose checksum is wrong, so a noisy
+// wire can't put stray characters into a DTC. The USB Serial copy has no *HH.
 //   PID,<pid>,<A>,<B>,<C>,<D>   mode 01 answer (hex PID, decimal bytes)
 //   DTC,<n>,<code>,...          mode 03 answer, e.g. DTC,2,P0113,P0122
 //   PEND,<n>,<code>,...         mode 07 answer (pending DTCs), e.g. PEND,1,P0217
 //   CLR,OK                      mode 04 done
 //   NEG,<mode>,<code>           negative answer (7F)
 //   NORESP,<mode>,<pid>         no answer in 150 ms
+//   ACK,READ / ACK,CLEAR        command from the ESP32 received
 //   # ...                       information
-// Commands from the ESP32: READ, CLEAR.
+// Commands from the ESP32: READ, CLEAR (each answered with ACK).
 //
 // Board: Arduino Nano (ATmega328P). Libraries: "mcp_can" by coryjfowler,
-// "AltSoftSerial" by Paul Stoffregen.
+// SoftwareSerial (built in).
+//
+// Not AltSoftSerial: it sends by rewriting TCCR1A on every bit, and the
+// MCP2515 CS on D10 (a Timer1 pin) makes every digitalWrite(10) do an
+// unprotected read-modify-write of TCCR1A too. The two collided thousands of
+// times a second and garbled the lines to the ESP32 (the "weird symbols").
+// SoftwareSerial does not use Timer1. It cannot receive while it sends, so a
+// READ / CLEAR can be missed; the ESP32 re-sends it until it gets the ACK.
 
 #include <Arduino.h>
 #include <SPI.h>
 #include <mcp_can.h>
-#include <AltSoftSerial.h>
+#include <SoftwareSerial.h>
 
 constexpr uint8_t PIN_CAN_CS = 10;
 constexpr uint8_t PIN_CAN_INT = 2;
@@ -57,23 +68,33 @@ constexpr uint16_t DTC_PERIOD_MS = 2000;
 constexpr uint16_t SUPPORTED_PERIOD_MS = 10000;
 constexpr uint32_t ESP_BAUD = 38400;
 
-const uint8_t POLL_PIDS[] = {0x01, 0x05, 0x0F, 0x0B, 0x11, 0x14};
+const uint8_t POLL_PIDS[] = {0x0C, 0x01, 0x0C, 0x05, 0x0C, 0x0F, 0x0C, 0x0B, 0x0C, 0x11, 0x0C, 0x14};
 
 MCP_CAN can(PIN_CAN_CS);
-AltSoftSerial esp;  // RX D8, TX D9 (fixed by the library).
+SoftwareSerial esp(8, 9);  // RX D8, TX D9.
 bool canReady = false;
+
+// One line to the ESP32, with its *HH checksum.
+void espLine(const char* line) {
+  uint8_t sum = 0;
+  for (const char* p = line; *p; p++) sum ^= uint8_t(*p);
+  char tail[6];
+  snprintf(tail, sizeof(tail), "*%02X\n", sum);
+  esp.print(line);
+  esp.print(tail);
+}
 
 // Sends one line to both the ESP32 and the USB Serial Monitor.
 void emit(const char* line) {
   Serial.println(line);
-  esp.print(line);
-  esp.print('\n');
+  espLine(line);
 }
 
 void info(const __FlashStringHelper* text) {
-  Serial.println(text);
-  esp.print(text);
-  esp.print('\n');
+  char line[96];
+  strncpy_P(line, reinterpret_cast<const char*>(text), sizeof(line) - 1);
+  line[sizeof(line) - 1] = '\0';
+  emit(line);
 }
 
 void canBegin() {
@@ -232,8 +253,8 @@ void readEsp() {
     if (c != '\n') { if (len < sizeof(buf) - 1) buf[len++] = c; continue; }
     buf[len] = '\0';
     len = 0;
-    if (strcmp(buf, "READ") == 0) { readRequested = true; info(F("# READ DTC requested")); }
-    else if (strcmp(buf, "CLEAR") == 0) { clearRequested = true; info(F("# CLEAR DTC requested")); }
+    if (strcmp(buf, "READ") == 0) { readRequested = true; emit("ACK,READ"); }
+    else if (strcmp(buf, "CLEAR") == 0) { clearRequested = true; emit("ACK,CLEAR"); }
   }
 }
 

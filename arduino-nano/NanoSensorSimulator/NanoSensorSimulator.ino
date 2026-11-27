@@ -11,23 +11,27 @@
 // on 0x7DF (functional) or 0x7E0 (physical), ISO 15765-2 single and
 // multi-frame.
 //   Mode 01  PID 00 supported PIDs, 01 MIL + DTC count, 05 ECT, 0B MAP,
-//            0F IAT, 11 TPS, 14 O2 B1S1 voltage
+//            0C engine RPM, 0F IAT, 11 TPS, 14 O2 B1S1 voltage
 //   Mode 03  stored DTCs      Mode 04  clear DTCs (an active fault sets its DTC again)
 //   Mode 07  pending DTCs
 // Range / engine checks (thresholds under "Range and engine checks"):
 //   outside NORMAL -> pending DTC, beyond SAFE -> confirmed DTC + MIL
 //   P0217 engine overheat (ECT), P0111 IAT range, P0171 too lean / P0172 too
-//   rich (O2), P0106 MAP high at closed throttle, P0121 TPS open with no load
+//   rich (O2), P0106 MAP high at closed throttle, P0121 TPS open with no load,
+//   P0219 engine overspeed (RPM)
 // A sensor with an active fault reports its fail-safe value in mode 01, like
-// a real ECU: IAT 20 C, ECT 80 C, O2 0.45 V, MAP 100 kPa, TPS 0 %.
+// a real ECU: IAT 20 C, ECT 80 C, O2 0.45 V, MAP 100 kPa, TPS 0 %, RPM 0.
+//
+// RPM is an OBD-only value (no output pin): 0-8000 rpm, starts at 800 (idle).
 //
 // Encoder:
 //   Turn          change the selected sensor (spin fast = bigger steps)
-//   Short press   next sensor: IAT -> ECT -> O2 -> MAP -> TPS
+//   Short press   next sensor: IAT -> ECT -> O2 -> MAP -> TPS -> RPM
 //   Long press    fault on the selected sensor: OK -> HIGH -> LOW -> OK
 //                 HIGH = output above the sensor's ERR limit (open circuit),
 //                 LOW  = output 0 V (short to ground; IAT / ECT / O2 only,
 //                 MAP and TPS have no low limit so they go OK -> HIGH -> OK)
+//                 RPM: OK -> NO SIGNAL (crank sensor P0335) -> OK
 //
 // Pins:
 //   D5   OUT  IAT  (PWM 980 Hz)  -> 10k -> Mega A0, 10 uF to GND
@@ -107,7 +111,8 @@ float tempToVolts(float t, const float* volts, const float* temps, int n) {
   return volts[n - 1];
 }
 
-enum SensorId : uint8_t { IAT, ECT, O2, MAP, TPS, SENSOR_COUNT };
+enum SensorId : uint8_t { IAT, ECT, O2, MAP, TPS, RPM, SENSOR_COUNT };
+constexpr uint8_t NO_PIN = 0xFF;  // Value only sent over OBD (RPM).
 enum Fault : uint8_t { FAULT_NONE, FAULT_HIGH, FAULT_LOW };
 
 struct Sensor {
@@ -130,6 +135,7 @@ Sensor sensors[SENSOR_COUNT] = {
   {"O2 ", 'O', 9,  O2_FULL_SCALE_V,  20,  1200,  10,  50,  450,  true,  FAULT_NONE, 450,  0x0131, 0x0132},  // mV
   {"MAP", 'M', 10, NANO_VCC,         10,  100,   1,   5,   35,   false, FAULT_NONE, 100,  0x0107, 0x0108},  // kPa
   {"TPS", 'T', 3,  NANO_VCC,         0,   100,   1,   5,   0,    false, FAULT_NONE, 0,    0x0122, 0x0123},  // %
+  {"RPM", 'R', NO_PIN, 0,            0,   8000,  50,  250, 800,  false, FAULT_NONE, 0,    0x0000, 0x0335},  // rpm, fault = no crank signal
 };
 
 // Volts the sensor should give for its value (no fault).
@@ -141,6 +147,7 @@ float targetVolts(uint8_t id) {
     case O2:  return v / 1000.0f;
     case MAP: return (v - 10) * 4.21f / 90.0f;  // 0 V = 10 kPa, 4.21 V = 100 kPa.
     case TPS: return v * 4.25f / 100.0f;        // 0 V = 0 %, 4.25 V = 100 %.
+    default:  return 0;                         // RPM: no output.
   }
   return 0;
 }
@@ -155,6 +162,13 @@ float dutyVolts(uint8_t id) { return duty[id] * sensors[id].fullScaleV / 255.0f;
 
 void applyOutput(uint8_t id) {
   const Sensor& s = sensors[id];
+  if (s.pin == NO_PIN) {  // RPM: OBD only.
+    duty[id] = 0;
+    Serial.print(F("# ")); Serial.print(s.name); Serial.print(' ');
+    if (s.fault != FAULT_NONE) Serial.println(F("NO SIGNAL (crank sensor fault)"));
+    else { Serial.print(s.value); Serial.println(F(" rpm")); }
+    return;
+  }
   if (s.fault == FAULT_HIGH) duty[id] = 255;      // Above every high ERR limit.
   else if (s.fault == FAULT_LOW) duty[id] = 0;    // Below every low ERR limit.
   else duty[id] = uint8_t(constrain(lroundf(targetVolts(id) / s.fullScaleV * 255.0f), 0L, 255L));
@@ -278,8 +292,9 @@ constexpr int16_t MAP_IDLE_TPS_MAX = 5;                        // %, throttle cl
 constexpr int16_t MAP_IDLE_NORMAL = 60, MAP_IDLE_SAFE = 80;    // kPa at closed throttle -> P0106 MAP range
 constexpr int16_t TPS_NOLOAD_MAP_MAX = 30;                     // kPa, no engine load for the TPS check
 constexpr int16_t TPS_NOLOAD_NORMAL = 50, TPS_NOLOAD_SAFE = 80;// % with no load -> P0121 TPS range
+constexpr int16_t RPM_NORMAL_MAX = 6000, RPM_SAFE_MAX = 6500;  // rpm    -> P0219 engine overspeed
 
-enum CheckId : uint8_t { CHK_OVERHEAT, CHK_IAT, CHK_LEAN, CHK_RICH, CHK_MAP, CHK_TPS, CHECK_COUNT };
+enum CheckId : uint8_t { CHK_OVERHEAT, CHK_IAT, CHK_LEAN, CHK_RICH, CHK_MAP, CHK_TPS, CHK_OVERREV, CHECK_COUNT };
 struct RangeCheck {
   uint16_t dtc;
   const char* text;
@@ -295,6 +310,7 @@ RangeCheck checks[CHECK_COUNT] = {
   {0x0172, "system too rich", O2,  0, 0, 0},
   {0x0106, "MAP range",       MAP, 0, 0, 0},
   {0x0121, "TPS range",       TPS, 0, 0, 0},
+  {0x0219, "engine overspeed", RPM, 0, 0, 0},
 };
 uint8_t confirmedChecks = 0;  // Bit c = check c confirmed (latched until mode 04).
 
@@ -317,6 +333,7 @@ uint8_t evaluate(uint8_t c) {
     case CHK_TPS:
       if (!ok(MAP) || !ok(TPS)) return 0xFF;
       return map <= TPS_NOLOAD_MAP_MAX ? above(tps, TPS_NOLOAD_NORMAL, TPS_NOLOAD_SAFE) : 0;
+    case CHK_OVERREV:  return ok(RPM) ? above(sensors[RPM].value, RPM_NORMAL_MAX, RPM_SAFE_MAX) : 0xFF;
   }
   return 0;
 }
@@ -420,7 +437,7 @@ void sendResponse(const uint8_t* data, uint8_t n) {
   }
 }
 
-constexpr uint8_t SUPPORTED_PIDS[] = {0x01, 0x05, 0x0B, 0x0F, 0x11, 0x14};
+constexpr uint8_t SUPPORTED_PIDS[] = {0x01, 0x05, 0x0B, 0x0C, 0x0F, 0x11, 0x14};
 
 void handleRequest(const uint8_t* buf, uint8_t len) {
   if (len < 2 || (buf[0] & 0xF0) != 0x00) return;  // Single-frame requests only.
@@ -450,6 +467,11 @@ void handleRequest(const uint8_t* buf, uint8_t len) {
       }
       case 0x05: r[2] = uint8_t(reported(ECT) + 40); rn = 3; break;
       case 0x0B: r[2] = uint8_t(reported(MAP)); rn = 3; break;
+      case 0x0C: {  // RPM = (256 A + B) / 4.
+        const uint16_t q = uint16_t(reported(RPM)) * 4;
+        r[2] = q >> 8; r[3] = q & 0xFF; rn = 4;
+        break;
+      }
       case 0x0F: r[2] = uint8_t(reported(IAT) + 40); rn = 3; break;
       case 0x11: r[2] = uint8_t((reported(TPS) * 255L + 50) / 100); rn = 3; break;
       case 0x14: r[2] = uint8_t(reported(O2) / 5); r[3] = 0xFF; rn = 4; break;  // A = V x 200, B = FF: no trim.
@@ -533,7 +555,9 @@ void updateCan(uint32_t now) {
 
 // ========================= Display (16x2 I2C LCD) ===========================
 //   IAT  25'C 2.300V   <- selected sensor: value (or HIGH / LOW fault) and output volts
-//   [I] E  O  M  T C   <- [ ] = selected, ! = circuit fault or beyond safe, * = outside normal,
+//   RPM  2500 r/min       (RPM has no output pin, so no volts)
+//   I<E O M*T R!   C   <- after each letter: < (left arrow) = selected, ! = circuit fault
+//                         or beyond safe, * = outside normal,
 //                         last char: C = scan tool connected, . = CAN idle, - = no MCP2515
 // LiquidCrystal_I2C library (Frank de Brabander) at the fixed address LCD_ADDR.
 LiquidCrystal_I2C lcd(LCD_ADDR, 16, 2);
@@ -587,16 +611,21 @@ void drawLcd() {
 
   const int mv = int(lroundf(dutyVolts(selected) * 1000));
   char line[17];
-  snprintf(line, sizeof(line), "%s%s %d.%03dV", s.name, value, mv / 1000, mv % 1000);
+  if (selected == RPM) {
+    if (s.fault != FAULT_NONE) strcpy(line, "RPM  NO SIGNAL");
+    else snprintf(line, sizeof(line), "RPM %5d r/min", s.value);
+  } else {
+    snprintf(line, sizeof(line), "%s%s %d.%03dV", s.name, value, mv / 1000, mv % 1000);
+  }
   lcdLine(0, line);
 
+  memset(line, ' ', 16);
   for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
     uint8_t level = 0;  // Worst range check on this sensor.
     for (uint8_t c = 0; c < CHECK_COUNT; c++)
       if (checks[c].sensor == i && checks[c].level > level) level = checks[c].level;
-    line[i * 3] = i == selected ? '[' : ' ';
-    line[i * 3 + 1] = sensors[i].letter;
-    line[i * 3 + 2] = i == selected ? ']'
+    line[i * 2] = sensors[i].letter;
+    line[i * 2 + 1] = i == selected ? '\x7F'  // Left arrow on the HD44780.
                     : sensors[i].fault != FAULT_NONE || level == 2 ? '!'
                     : level == 1 ? '*' : ' ';
   }
@@ -608,12 +637,12 @@ void drawLcd() {
 // ============================== Main ========================================
 void setup() {
   Serial.begin(115200);
-  Serial.println(F("# NANO ECU SIMULATOR, OBD-II (IAT D5, ECT D6, O2 D9, MAP D10, TPS D3, CAN CS D8)"));
+  Serial.println(F("# NANO ECU SIMULATOR, OBD-II (IAT D5, ECT D6, O2 D9, MAP D10, TPS D3, RPM over OBD, CAN CS D8)"));
 
   pinMode(PIN_CAN_INT, INPUT_PULLUP);
   canBegin();  // Before the PWM outputs: SPI start-up sets D10 (SS).
 
-  for (uint8_t i = 0; i < SENSOR_COUNT; i++) pinMode(sensors[i].pin, OUTPUT);
+  for (uint8_t i = 0; i < SENSOR_COUNT; i++) if (sensors[i].pin != NO_PIN) pinMode(sensors[i].pin, OUTPUT);
   // Timer1 (D9, D10) and Timer2 (D3) to 31.4 kHz for low ripple.
   // Timer0 (D5, D6) stays at 980 Hz because millis() depends on it.
   TCCR1B = (TCCR1B & 0xF8) | 0x01;

@@ -28,8 +28,8 @@ filter, with the capacitor's + leg on the Mega side and its − leg to GND.
 | Action | Effect |
 |---|---|
 | Turn | Change the selected sensor (spin fast for 5× steps) |
-| Short press | Next sensor: IAT → ECT → O2 → MAP → TPS |
-| Long press (0.8 s) | Fault: OK → HIGH → LOW → OK (MAP / TPS: OK → HIGH → OK) |
+| Short press | Next sensor: IAT → ECT → O2 → MAP → TPS → RPM |
+| Long press (0.8 s) | Fault: OK → HIGH → LOW → OK (MAP / TPS: OK → HIGH → OK, RPM: OK → NO SIGNAL → OK) |
 | Turn while in fault | Clears the fault and goes back to the set value |
 
 HIGH drives the output to full scale, above every ERR limit (like an open
@@ -45,12 +45,19 @@ short to ground).
 | O2 | 0.02–1.20 V (LCD shows the AFR) | 0.01 V | 0.45 V |
 | MAP | 10–100 kPa | 1 kPa | 35 kPa |
 | TPS | 0–100 % | 1 % | 0 % |
+| RPM | 0–8000 rpm (OBD only, no output pin) | 50 rpm (fast 250) | 800 rpm |
+
+RPM has no wire to the Mega: it is the engine speed the ECU reports over
+OBD-II (mode 01 PID 0C). NO SIGNAL is a crankshaft sensor fault (P0335): the
+ECU then reports 0 rpm.
 
 ## LCD
 
 ```
 IAT  25°C 2.294V     selected sensor, value (or HIGH / LOW), output volts
-[I] E  O! M  T       [ ] = selected, ! = sensor in fault
+RPM  2500 r/min      (RPM selected: no volts; NO SIGNAL during its fault)
+I←E O!M T*R     C    ← after a letter = selected, ! = fault or beyond safe,
+                     * = outside normal; last char = CAN state
 ```
 
 ## Accuracy
@@ -69,7 +76,7 @@ Brabander). Serial at 115200 prints every change, for example
 
 This Nano is the **ECU** of the OBD-II bench (Set 1). It answers a scan tool
 over CAN (MCP2515, 500 kbps, 8 MHz crystal): requests on 0x7DF / 0x7E0,
-answers on 0x7E8. Mode 01 PIDs 00, 01, 05, 0B, 0F, 11 and 14, mode 03 (read
+answers on 0x7E8. Mode 01 PIDs 00, 01, 05, 0B, 0C (RPM), 0F, 11 and 14, mode 03 (read
 DTCs) and mode 04 (clear DTCs). A fault set with a long press stores its DTC
 and turns on the MIL until it is cleared. See `esp32-can/README.md` for the
 whole bench. The last character on LCD line 2 shows: `C` = scan tool talking,
