@@ -7,7 +7,7 @@
 // the instrument panel of the browser dashboard in three screens:
 //   CLASSIC - tachometer (RPM), lamps, sensor column, readout grid and DTC line
 //   RACE    - REF 1 / REF 2, LED indicator strip, curved RPM bar, speed / RPM, tiles
-//   SENSORS - per-channel volts, value and circuit status, link and battery info
+//   SMART   - neon REF1 / REF2 / BAT boxes, RPM and speed dials, six sensor tiles
 // There are no tabs: double-tap anywhere on the screen for the next screen.
 // Display and touch share the VSPI bus with separate chip selects; none of
 // these pins overlap the Uno/Nano/Mega link on GPIO16/17.
@@ -48,7 +48,7 @@ struct DisplayData {
   float batteryV;
   bool currentAvailable;   // Mega U5 frame with the A8 current input.
   float currentA;          // Mega A8, 0-10 A.
-  // SENSORS tab.
+  // Board and link details (the old SENSORS screen; also used by the dashboard).
   bool references;         // Board sends Reference 1/2 (Nano U4: 0-5 V, Mega U5: 0-30 V).
   const char* board;       // "Uno", "Nano" or "Mega".
   const char* boardFrame;  // "U3", "U4", "U5" or "U6".
@@ -149,8 +149,8 @@ LGFX_Sprite gaugeBand[2] = {LGFX_Sprite(&lcd), LGFX_Sprite(&lcd)};  // Ping-pong
 LGFX_Sprite throttleSprite(&lcd);
 
 constexpr uint8_t VIEW_COUNT = 3;
-enum View : uint8_t { CLASSIC, RACE, SENSORS } view = CLASSIC;
-const char* const VIEW_NAMES[VIEW_COUNT] = {"CLASSIC", "RACE", "SENSORS"};
+enum View : uint8_t { CLASSIC, RACE, SMART } view = CLASSIC;
+const char* const VIEW_NAMES[VIEW_COUNT] = {"CLASSIC", "RACE", "SMART"};
 constexpr int TAB_Y = 4, TAB_H = 28;           // Header row: status pill, board, REF boxes.
 constexpr uint32_t DOUBLE_TAP_MS = 400;        // Second tap within this time switches screen.
 
@@ -158,7 +158,7 @@ bool wasTouched = false, wasRunning = false, selfTestActive = false;
 uint32_t lastTapMs = 0, lastPressMs = 0, lastTouchPollMs = 0;
 uint32_t lastGaugeMs = 0, lastTextMs = 0, lastAnimMs = 0, selfTestStartMs = 0;
 float animatedRpm = 0;
-int32_t shownGaugeKey = -1;
+int32_t shownGaugeKey = -1, shownSpeedKey = -1;  // SMART: RPM dial, speed dial.
 
 // Last text / colour drawn in each slot; a slot is redrawn only when it changes.
 // Slots are reused between tabs: drawFrame() forgets them all.
@@ -670,143 +670,341 @@ void raceText(const DisplayData& d, bool running) {
   drawThrottle(tileX(t) + tileW(t) - TP_SIZE - 2, tileY(t) + TILE_HEAD + 1, TILE_BG, tpsOk, tpsOk ? throttleDeg(d.tps) : 0);
 }
 
-// ---- Sensors display -------------------------------------------------------
-// One row per channel: pin voltage (bar + value), engineering value and the
-// circuit status the DTC logic sees, then a grid of link / board / battery info.
-const char* const SENSOR_NAMES[5] = {"IAT", "ECT", "O2", "MAP", "TPS"};
-const char* const SENSOR_PINS[5] = {"A0", "A1", "A2", "A3", "A4"};
-constexpr int SN_Y0 = 60, SN_ROW = 34, VB_X = 84, VB_W = 120, VB_H = 12;
-constexpr int INFO_Y0 = 238, INFO_ROW = 27, INFO_COL = 120;
-const char* const INFO_LABELS[12] = {
-  "BOARD", "LINK", "PACKET AGE", "BAD FRAMES",
-  "REF 1  A5", "REF 2  A6", "D7 FREQUENCY", "ENGINE RPM",
-  "BATTERY  A7", "CURRENT  A8", "TPS CAL (raw)", "WI-FI AP"};
-enum : uint8_t { SS_ROW0 = S_VALUE0, SS_INFO0 = S_VALUE0 + 20 };  // 4 slots per row, then 12 info cells.
+// ---- Smart gauge display ---------------------------------------------------
+// Neon "SMART GAUGE" screen: REF1 / REF2 / BAT boxes on top, an RPM dial and
+// a speed dial with the title between them, and six sensor tiles below
+// (ECT, AIT, MAP, O2, AFR, TPS).
+constexpr uint32_t SM_BG888 = 0x040710;
+constexpr uint16_t SM_BG = rgb(0x04, 0x07, 0x10), SM_FACE = rgb(0x01, 0x02, 0x06);
+constexpr uint16_t SM_CHROME = rgb(0xc4, 0xcc, 0xd6), SM_CHROME_DK = rgb(0x4a, 0x55, 0x63), SM_GLOW = rgb(0x12, 0x3a, 0x8a);
+constexpr uint16_t SM_NEEDLE = rgb(0xff, 0x2a, 0x2a), SM_NEEDLE_GLOW = rgb(0x5a, 0x0a, 0x0a);
+constexpr uint16_t SM_TICK = rgb(0xf2, 0xf7, 0xfc), SM_TICK_MINOR = rgb(0x8a, 0x97, 0xab);
+constexpr uint16_t SM_GOLD = rgb(0xff, 0xc4, 0x1a), SM_SILVER = rgb(0xdd, 0xe3, 0xea);
 
-void drawSensorsFrame() {
-  label(lcd, "CH", 10, 44, MUTED, textdatum_t::top_left, &fonts::Font0);
-  label(lcd, "PIN VOLTAGE  0-5 V", VB_X, 44, MUTED, textdatum_t::top_left, &fonts::Font0);
-  label(lcd, "VALUE", 370, 44, MUTED, textdatum_t::top_right, &fonts::Font0);
-  label(lcd, "STATUS", 474, 44, MUTED, textdatum_t::top_right, &fonts::Font0);
-  for (uint8_t i = 0; i < 5; ++i) {
-    const int y = SN_Y0 + i * SN_ROW, cy = y + SN_ROW / 2;
-    label(lcd, SENSOR_NAMES[i], 10, cy, TEXT, textdatum_t::middle_left, &fonts::Font2);
-    label(lcd, SENSOR_PINS[i], 50, cy, MUTED, textdatum_t::middle_left, &fonts::Font0);
-    lcd.drawFastHLine(6, y + SN_ROW - 1, W - 12, EDGE);
-  }
-  for (uint8_t i = 0; i < 12; ++i) {
-    const int x = (i % 4) * INFO_COL, y = INFO_Y0 + (i / 4) * INFO_ROW;
-    lcd.fillRect(x + 2, y + 1, INFO_COL - 4, INFO_ROW - 2, PANEL);
-    label(lcd, INFO_LABELS[i], x + 6, y + 3, MUTED, textdatum_t::top_left, &fonts::Font0);
-  }
+constexpr uint16_t hex(uint32_t c) { return rgb(c >> 16, (c >> 8) & 0xFF, c & 0xFF); }
+inline uint16_t neonFill(uint32_t c) { return lerpColor(SM_BG888, c, 0.12f); }
+
+// Rounded box with a soft outer glow, a 2 px neon edge and a dark tinted fill.
+void neonBox(int x, int y, int w, int h, uint32_t c) {
+  lcd.drawRoundRect(x, y, w, h, 9, lerpColor(SM_BG888, c, 0.4f));
+  lcd.drawRoundRect(x + 1, y + 1, w - 2, h - 2, 8, hex(c));
+  lcd.drawRoundRect(x + 2, y + 2, w - 4, h - 4, 7, hex(c));
+  lcd.fillRoundRect(x + 3, y + 3, w - 6, h - 6, 6, neonFill(c));
 }
 
-void drawVoltBar(uint8_t slot, uint8_t channel, int y, float volts, bool on, bool ok) {
-  const int fill = on ? lroundf(constrain(volts / 5.0f, 0.0f, 1.0f) * (VB_W - 2)) : 0;
-  const uint16_t color = ok ? GREEN : RED;
-  char tag[8];
-  snprintf(tag, sizeof(tag), "%d", fill);
-  if (!changed(slot, tag, color)) return;
-  lcd.fillRect(VB_X, y, VB_W, VB_H, BAR_TRACK);
-  if (fill) lcd.fillRect(VB_X + 1, y + 1, fill, VB_H - 2, color);
-  // This channel's fault limits (no marker for a sensor without a low fault).
-  for (float v : {FAULT_LIMITS[channel].low, FAULT_LIMITS[channel].high})
-    if (v > 0) lcd.drawFastVLine(VB_X + 1 + lroundf(v / 5.0f * (VB_W - 2)), y - 2, VB_H + 4, AMBER);
-  lcd.drawRect(VB_X, y, VB_W, VB_H, BAR_EDGE);
+// Clears a rectangle and draws the text on it, only when the text changes.
+// (Free fonts are taller than their digits, so an opaque string would spill
+// over the neon edges; the clear rectangle keeps it inside.)
+void boxText(uint8_t slot, int cx, int cy, int cw, int ch, uint16_t bg, const char* text, uint16_t color,
+             int tx, int ty, textdatum_t datum, const lgfx::IFont* font) {
+  if (!changed(slot, text, color)) return;
+  lcd.fillRect(cx, cy, cw, ch, bg);
+  label(lcd, text, tx, ty, color, datum, font);
 }
 
-void sensorsText(const DisplayData& d, bool running) {
-  char text[24];
-  const bool inSpec[5] = {d.iat.inSpec, d.ect.inSpec, d.o2.inSpec, d.map.inSpec, d.tps.inSpec};
-  for (uint8_t i = 0; i < 5; ++i) {
-    const int y = SN_Y0 + i * SN_ROW, cy = y + SN_ROW / 2;
-    const uint8_t slot = SS_ROW0 + i * 4, bit = 1 << i;
-    const float v = d.volts[i];
-    const bool circuit = !sensorFault(i, v);
-    drawVoltBar(slot, i, cy - VB_H / 2, v, running, circuit);
-    if (running) snprintf(text, sizeof(text), "%.3f V", v); else strcpy(text, "--");
-    field(slot + 1, 286, cy, textdatum_t::middle_right, &fonts::Font2, running ? TEXT : MUTED, BG, text, 72);
+// -- Dials --
+constexpr int DG_W = 180, DG_H = 156, DG_BAND = 26, DG_CX = 90, DG_CY = 90, DG_Y = 58;
+constexpr int DG_X[2] = {4, 296};
+constexpr float DG_START = 150, DG_SWEEP = 240, DG_STEP = 4;  // Screen degrees, clockwise from 3 o'clock.
+constexpr int DG_BAND_IN = 71, DG_BAND_OUT = 79;              // Coloured scale band.
 
-    uint16_t color = MUTED;
-    char number[12];
-    if (!running) strcpy(text, "--");
-    else if (i == 2) {
-      if (d.o2.afrAvailable) { snprintf(text, sizeof(text), "%.1f:1 %s", d.o2.afr, d.o2.mixture); color = mixtureColor(d.o2); }
-      else { strcpy(text, "ERR"); color = RED; }
-    } else {
-      const SensorReading& r = i == 0 ? d.iat : i == 1 ? d.ect : i == 3 ? d.map : d.tps;
-      color = sensorText(r, 1, number, sizeof(number));
-      snprintf(text, sizeof(text), r.available ? "%s %s" : "%s", number, i == 3 ? "kPa" : i == 4 ? "%" : "C");
+struct Dial {
+  const char* title;
+  const char* unit;
+  float max, minor, major, labelDiv, red;
+  const lgfx::IFont* digits;
+};
+const Dial DIALS[2] = {
+  {"RPM", "rpm", RPM_MAX, 1000, 3000, 1000, 12000, &fonts::FreeSansBold18pt7b},  // Labels x1000, red from 12,000.
+  {"SPEED", "km/h", 240, 20, 40, 1, 1e9f, &fonts::FreeSansBold24pt7b}};
+
+inline float dialAngle(const Dial& g, float v) { return DG_START + constrain(v / g.max, 0.0f, 1.0f) * DG_SWEEP; }
+
+inline void dialPoint(float deg, float r, int cy, float& x, float& y) {
+  x = DG_CX + cosf(deg * DEG_TO_RAD) * r;
+  y = cy + sinf(deg * DEG_TO_RAD) * r;
+}
+
+// fillArc with angles past 360 split in two.
+void arcDeg(LovyanGFX& c, int cx, int cy, int r0, int r1, float a0, float a1, uint16_t color) {
+  if (a1 <= a0) return;
+  if (a0 >= 360) c.fillArc(cx, cy, r0, r1, a0 - 360, a1 - 360, color);
+  else if (a1 > 360) { c.fillArc(cx, cy, r0, r1, a0, 360, color); c.fillArc(cx, cy, r0, r1, 0, a1 - 360, color); }
+  else c.fillArc(cx, cy, r0, r1, a0, a1, color);
+}
+
+// Does the piece of ring between a0 and a1 (r0-r1) touch this band?
+bool arcInBand(int cy, int r0, int r1, float a0, float a1) {
+  const float s0 = sinf(a0 * DEG_TO_RAD), s1 = sinf(a1 * DEG_TO_RAD);
+  const float lo = cy + min(min(s0 * r0, s0 * r1), min(s1 * r0, s1 * r1)) - 2;
+  const float hi = cy + max(max(s0 * r0, s0 * r1), max(s1 * r0, s1 * r1)) + 2;
+  return hi >= 0 && lo < DG_BAND;
+}
+
+// Scale colour: blue -> cyan along the dial, red in the red zone. Unlit
+// parts of the band are a dim version of the same colour.
+uint16_t dialColor(const Dial& g, float v, bool lit) {
+  const uint16_t c = v >= g.red ? RED : lerpColor(0x1f5bff, 0x2ee6ff, constrain(v / g.max, 0.0f, 1.0f));
+  return lit ? c : lerpColor(0x010206, to888(c), 0.32f);
+}
+
+void renderDial(uint8_t which, float value, bool needle, const char* digits) {
+  if (!gaugeBand[0].getBuffer() || !gaugeBand[1].getBuffer()) return;
+  const Dial& g = DIALS[which];
+  const float aValue = needle ? dialAngle(g, value) : DG_START;
+  const int segments = int(DG_SWEEP / DG_STEP);
+  for (int oy = 0, band = 0; oy < DG_H; oy += DG_BAND, ++band) {
+    LGFX_Sprite& c = gaugeBand[band & 1];
+    c.fillScreen(SM_BG);
+    const int cy = DG_CY - oy;
+    // Face, cut flat at the bottom, with a chrome bezel and a blue glow.
+    c.fillCircle(DG_CX, cy, 82, SM_FACE);
+    arcDeg(c, DG_CX, cy, 88, 90, 134, 406, SM_GLOW);
+    arcDeg(c, DG_CX, cy, 84, 87, 134, 406, SM_CHROME);
+    arcDeg(c, DG_CX, cy, 82, 83, 134, 406, SM_CHROME_DK);
+    c.fillRect(0, cy + 63, DG_W, DG_H, SM_BG);
+    c.fillRect(DG_CX - 61, cy + 60, 122, 3, SM_CHROME);
+    // Scale band: lit up to the needle.
+    for (int i = 0; i < segments; ++i) {
+      const float a0 = DG_START + i * DG_STEP, a1 = a0 + DG_STEP;
+      if (!arcInBand(cy, DG_BAND_IN, DG_BAND_OUT, a0, a1)) continue;
+      const float v = (i + 0.5f) / segments * g.max;
+      if (a1 <= aValue) arcDeg(c, DG_CX, cy, DG_BAND_IN, DG_BAND_OUT, a0, a1, dialColor(g, v, true));
+      else if (a0 >= aValue) arcDeg(c, DG_CX, cy, DG_BAND_IN, DG_BAND_OUT, a0, a1, dialColor(g, v, false));
+      else {
+        arcDeg(c, DG_CX, cy, DG_BAND_IN, DG_BAND_OUT, a0, aValue, dialColor(g, v, true));
+        arcDeg(c, DG_CX, cy, DG_BAND_IN, DG_BAND_OUT, aValue, a1, dialColor(g, v, false));
+      }
     }
-    field(slot + 2, 370, cy, textdatum_t::middle_right, &fonts::Font2, color, BG, text, 80);
-
-    if (!running) { strcpy(text, "--"); color = MUTED; }
-    else if (d.injectedMask & bit) { snprintf(text, sizeof(text), "%s INJ", SENSOR_DTCS[i].general); color = ORANGE; }
-    else if (d.autoMask & bit) { strcpy(text, d.highMask & bit ? SENSOR_DTCS[i].high : SENSOR_DTCS[i].low); color = RED; }
-    else if (!circuit) { strcpy(text, sensorFaultHigh(i, v) ? "HIGH ..." : "LOW ..."); color = AMBER; }  // Pending DTC.
-    else if (!inSpec[i]) { strcpy(text, "OUT OF SPEC"); color = AMBER; }
-    else { strcpy(text, "OK"); color = GREEN; }
-    field(slot + 3, 474, cy, textdatum_t::middle_right, &fonts::Font2, color, BG, text, 96);
+    // Ticks and labels.
+    for (float v = 0; v <= g.max + 0.5f; v += g.minor) {
+      const bool major = fmodf(v + 0.5f, g.major) < 1;
+      const float a = dialAngle(g, v);
+      float x1, y1, x2, y2;
+      dialPoint(a, 67, cy, x1, y1);
+      dialPoint(a, major ? 57 : 62, cy, x2, y2);
+      if (max(y1, y2) < -2 || min(y1, y2) > DG_BAND + 2) continue;
+      c.drawWideLine(x1, y1, x2, y2, major ? 1.5f : 0.8f, v >= g.red ? RED : major ? SM_TICK : SM_TICK_MINOR);
+      if (major) {
+        float tx, ty;
+        dialPoint(a, 46, cy, tx, ty);
+        char text[6];
+        snprintf(text, sizeof(text), "%d", int(lroundf(v / g.labelDiv)));
+        label(c, text, tx, ty, v >= g.red ? RED : SM_TICK, textdatum_t::middle_center, &fonts::FreeSansBold9pt7b);
+      }
+    }
+    // Needle (under the readout so the digits stay readable).
+    if (needle) {
+      float x1, y1, x2, y2;
+      dialPoint(aValue, 24, cy, x1, y1);
+      dialPoint(aValue, 72, cy, x2, y2);
+      c.drawWideLine(x1, y1, x2, y2, 3.0f, SM_NEEDLE_GLOW);
+      c.drawWideLine(x1, y1, x2, y2, 1.4f, SM_NEEDLE);
+    }
+    label(c, g.title, DG_CX, cy - 26, SM_TICK, textdatum_t::middle_center, &fonts::FreeSansBold9pt7b);
+    label(c, digits, DG_CX, cy + 4, TEXT, textdatum_t::middle_center, g.digits);
+    label(c, g.unit, DG_CX, cy + 44, MUTED, textdatum_t::middle_center, &fonts::FreeSansBold9pt7b);
+    lcd.waitDMA();  // The other buffer's transfer must end before this one starts.
+    c.pushSprite(&lcd, DG_X[which], DG_Y + oy);
   }
+}
 
-  const bool havePacket = d.link != DisplayData::WAITING;
-  for (uint8_t i = 0; i < 12; ++i) {
-    uint16_t color = TEXT;
-    switch (i) {
-      case 0:
-        if (havePacket) snprintf(text, sizeof(text), "%s  (%s)", d.board, d.boardFrame); else strcpy(text, "--");
-        break;
-      case 1:
-        strcpy(text, d.link == DisplayData::LIVE ? "LIVE" : d.link == DisplayData::STALE ? "STALE" : "WAITING");
-        color = d.link == DisplayData::LIVE ? GREEN : RED;
-        break;
-      case 2:
-        if (havePacket) snprintf(text, sizeof(text), "%lu ms", (unsigned long)d.packetAgeMs); else strcpy(text, "--");
-        break;
-      case 3:
-        snprintf(text, sizeof(text), "%lu", (unsigned long)d.badFrames);
-        if (d.badFrames) color = AMBER;
-        break;
-      case 4: case 5:
-        if (havePacket && !d.references) { snprintf(text, sizeof(text), "n/a on %s", d.board); color = MUTED; }
-        else if (running && isnan(d.reference[i - 4])) { strcpy(text, "ERR"); color = RED; }
-        else if (running) snprintf(text, sizeof(text), "%.2f V", d.reference[i - 4]);
-        else { strcpy(text, "--"); color = MUTED; }
-        break;
-      case 6:
-        if (running) snprintf(text, sizeof(text), "%.1f Hz", d.frequencyHz); else { strcpy(text, "--"); color = MUTED; }
-        break;
-      case 7:
-        if (running) snprintf(text, sizeof(text), "%.0f rpm", d.rpm); else { strcpy(text, "--"); color = MUTED; }
-        break;
-      case 8:
-        if (!d.batteryAvailable) {
-          if (havePacket) snprintf(text, sizeof(text), "n/a on %s", d.board); else strcpy(text, "--");
-          color = MUTED; break;
+// -- Top boxes: REF1, REF2, BAT --
+constexpr int BX_Y = 2, BX_H = 50, BX_W = 154;
+constexpr int BX_X[3] = {4, 163, 322};
+const char* const BX_NAMES[3] = {"REF1", "REF2", "BAT"};
+constexpr uint32_t BX_EDGE[3] = {0x39ff5a, 0x1e9bff, 0xffe11a};
+constexpr uint32_t BX_VALUE[3] = {0x5cff7a, 0x5cff7a, 0xffe53b};
+
+void drawBoxIcon(uint8_t i, int ix, int iy, uint16_t c) {
+  if (i == 0) {  // Lightning bolt.
+    lcd.fillTriangle(ix + 16, iy, ix + 4, iy + 18, ix + 13, iy + 17, c);
+    lcd.fillTriangle(ix + 10, iy + 14, ix + 21, iy + 13, ix + 7, iy + 32, c);
+    lcd.fillTriangle(ix + 16, iy, ix + 10, iy + 14, ix + 13, iy + 17, c);
+  } else if (i == 1) {  // Crosshair.
+    const int cx = ix + 12, cy = iy + 16;
+    lcd.drawCircle(cx, cy, 10, c);
+    lcd.drawCircle(cx, cy, 9, c);
+    lcd.fillCircle(cx, cy, 3, c);
+    lcd.fillRect(cx - 1, cy - 15, 3, 7, c);
+    lcd.fillRect(cx - 1, cy + 9, 3, 7, c);
+    lcd.fillRect(cx - 15, cy - 1, 7, 3, c);
+    lcd.fillRect(cx + 9, cy - 1, 7, 3, c);
+  } else {  // Battery.
+    lcd.fillRect(ix + 8, iy + 1, 8, 4, c);
+    lcd.drawRoundRect(ix + 3, iy + 5, 18, 27, 3, c);
+    lcd.drawRoundRect(ix + 4, iy + 6, 16, 25, 2, c);
+    for (int k = 0; k < 3; ++k) lcd.fillRect(ix + 7, iy + 10 + k * 7, 10, 4, c);
+  }
+}
+
+// -- Bottom tiles: ECT, AIT, MAP, O2, AFR, TPS --
+constexpr int TL_Y = 222, TL_H = 96, TL_W = 76;
+inline int tlX(uint8_t i) { return 2 + i * 80; }
+const char* const TL_NAMES[6] = {"ECT", "AIT", "MAP", "O2", "AFR", "TPS"};
+const char* const TL_UNITS[6] = {"C", "C", "kPa", "V", ":1", "%"};
+constexpr uint32_t TL_EDGE[6] = {0x22d3ee, 0x7cff3a, 0xe03cff, 0xff7a1a, 0x2ee6c0, 0x9b5cff};
+// Value area: right of the icon (the TPS throttle symbol is wider).
+inline int tlValueX(uint8_t i) { return tlX(i) + (i == 5 ? 36 : 24); }
+
+void drawThermometer(int ix, int iy, int len, uint16_t c, uint16_t fill) {
+  lcd.fillRoundRect(ix + 6, iy, 7, len, 3, c);
+  lcd.fillRoundRect(ix + 8, iy + 2, 3, len - 4, 1, fill);
+  lcd.fillRect(ix + 8, iy + len / 3, 3, len - len / 3, c);  // Mercury.
+  lcd.fillCircle(ix + 9, iy + len + 3, 5, c);
+  for (int k = 0; k < 3; ++k) lcd.drawFastHLine(ix + 14, iy + 3 + k * 5, 4, c);
+}
+
+void drawTileIcon(uint8_t i, int ix, int iy, uint16_t c, uint16_t fill) {
+  switch (i) {
+    case 0:  // Coolant: thermometer over waves.
+      drawThermometer(ix, iy, 20, c, fill);
+      for (int row = 0; row < 2; ++row)
+        for (int k = 0; k < 3; ++k) {
+          const int x = ix + k * 6, y = iy + 33 + row * 5;
+          lcd.drawLine(x, y, x + 3, y - 2, c);
+          lcd.drawLine(x + 3, y - 2, x + 6, y, c);
         }
-        if (isnan(d.batteryV)) { strcpy(text, "ERR"); color = RED; break; }
-        snprintf(text, sizeof(text), "%.2f V %s", d.batteryV,
-                 d.batteryV > 15.0f ? "OVER" : d.batteryV >= 13.2f ? "CHG" : d.batteryV < 11.8f ? "LOW" : "");
-        color = d.batteryV < 11.8f || d.batteryV > 15.0f ? ORANGE : d.batteryV >= 13.2f ? GREEN : TEXT;
-        break;
-      case 9:
-        field(S_INFO_LABEL, (9 % 4) * INFO_COL + 6, INFO_Y0 + (9 / 4) * INFO_ROW + 3, textdatum_t::top_left, &fonts::Font0, MUTED, PANEL,
-              d.declogHzAvailable ? "DECLOG  A9 POT" : "CURRENT  A8", INFO_COL - 10);
-        if (d.declogHzAvailable) {
-          if (running) snprintf(text, sizeof(text), "%.2f Hz", d.declogHz); else { strcpy(text, "--"); color = MUTED; }
-        } else if (d.currentAvailable) snprintf(text, sizeof(text), "%.2f A", d.currentA);
-        else { strcpy(text, havePacket ? "n/a" : "--"); color = MUTED; }
-        break;
-      case 10: snprintf(text, sizeof(text), "%.0f - %.0f", d.tpsClosedRaw, d.tpsWotRaw); break;
-      case 11: strcpy(text, "192.168.4.1"); color = ACCENT; break;
-    }
-    const int x = (i % 4) * INFO_COL, y = INFO_Y0 + (i / 4) * INFO_ROW;
-    field(SS_INFO0 + i, x + 6, y + 12, textdatum_t::top_left, &fonts::Font2, color, PANEL, text, INFO_COL - 10);
+      break;
+    case 1: drawThermometer(ix, iy + 2, 26, c, fill); break;  // Air temperature.
+    case 2:  // Intake manifold: three runners on a plenum.
+      for (int k = 0; k < 3; ++k) lcd.fillRoundRect(ix + 1 + k * 6, iy + 2, 4, 15, 2, c);
+      lcd.drawRoundRect(ix, iy + 16, 18, 18, 3, c);
+      lcd.drawRoundRect(ix + 1, iy + 17, 16, 16, 3, c);
+      lcd.drawFastHLine(ix + 4, iy + 25, 10, c);
+      break;
+    case 3:  // Oxygen sensor.
+      lcd.drawCircle(ix + 9, iy + 18, 10, c);
+      lcd.drawCircle(ix + 9, iy + 18, 9, c);
+      label(lcd, "O2", ix + 10, iy + 18, c, textdatum_t::middle_center, &fonts::Font0);
+      break;
+    case 4:  // Fuel pump.
+      lcd.drawRoundRect(ix, iy + 6, 12, 28, 2, c);
+      lcd.drawRoundRect(ix + 1, iy + 7, 10, 26, 2, c);
+      lcd.fillRect(ix + 3, iy + 10, 6, 6, c);
+      lcd.fillRect(ix - 1, iy + 34, 14, 3, c);
+      lcd.fillRect(ix + 12, iy + 8, 3, 3, c);
+      lcd.drawLine(ix + 14, iy + 10, ix + 17, iy + 14, c);
+      lcd.drawFastVLine(ix + 17, iy + 14, 14, c);
+      lcd.drawLine(ix + 17, iy + 28, ix + 14, iy + 31, c);
+      break;
+    default: break;  // TPS: the live throttle symbol, drawn by smartText().
   }
+}
+
+// Simple coupe outline for the centre column, around (cx, cy).
+void drawCar(int cx, int cy, uint16_t c, float w) {
+  static const int8_t BODY[][2] = {{-46, 14}, {-45, 6}, {-34, 2}, {-15, -6}, {4, -9}, {19, -8}, {32, -1}, {44, 2}, {47, 9}, {46, 14}};
+  static const int8_t ROOF[][2] = {{-14, 0}, {-5, -5}, {13, -5}, {21, 1}, {-14, 0}};
+  for (uint8_t k = 1; k < sizeof(BODY) / sizeof(BODY[0]); ++k)
+    lcd.drawWideLine(cx + BODY[k - 1][0], cy + BODY[k - 1][1], cx + BODY[k][0], cy + BODY[k][1], w, c);
+  for (uint8_t k = 1; k < sizeof(ROOF) / sizeof(ROOF[0]); ++k)
+    lcd.drawWideLine(cx + ROOF[k - 1][0], cy + ROOF[k - 1][1], cx + ROOF[k][0], cy + ROOF[k][1], w * 0.7f, c);
+  lcd.drawWideLine(cx - 46, cy + 14, cx - 36, cy + 14, w, c);
+  lcd.drawWideLine(cx - 20, cy + 14, cx + 20, cy + 14, w, c);
+  lcd.drawWideLine(cx + 36, cy + 14, cx + 46, cy + 14, w, c);
+  for (int s = -1; s <= 1; s += 2) lcd.fillArc(cx + s * 28, cy + 14, 8 + int(w), 7 - int(w / 2), 180, 360, c);
+}
+
+enum : uint8_t { SM_TILE0 = S_VALUE0, SM_BOX0 = S_VALUE0 + 6 };
+
+void drawSmartFrame() {
+  for (uint8_t i = 0; i < 3; ++i) {
+    const int x = BX_X[i];
+    neonBox(x, BX_Y, BX_W, BX_H, BX_EDGE[i]);
+    drawBoxIcon(i, x + 9, BX_Y + 9, hex(BX_EDGE[i]));
+    label(lcd, BX_NAMES[i], (x + 36 + x + BX_W - 8) / 2, BX_Y + 18, TEXT, textdatum_t::baseline_center, &fonts::FreeSansBold9pt7b);
+    label(lcd, "V", x + BX_W - 9, BX_Y + 45, hex(BX_VALUE[i]), textdatum_t::baseline_right, &fonts::FreeSansBold12pt7b);
+  }
+  for (uint8_t i = 0; i < 6; ++i) {
+    const int x = tlX(i);
+    neonBox(x, TL_Y, TL_W, TL_H, TL_EDGE[i]);
+    const uint16_t fill = neonFill(TL_EDGE[i]);
+    label(lcd, TL_NAMES[i], x + TL_W / 2, TL_Y + 22, TEXT, textdatum_t::baseline_center, &fonts::FreeSansBold9pt7b);
+    drawTileIcon(i, x + 6, TL_Y + 33, hex(TL_EDGE[i]), fill);
+    label(lcd, TL_UNITS[i], x + TL_W - 7, TL_Y + 84, TEXT, textdatum_t::baseline_right, &fonts::FreeSansBold9pt7b);
+    if (i < 2) {  // Degree sign: the fonts have no glyph for it.
+      lcd.setFont(&fonts::FreeSansBold9pt7b);
+      lcd.drawCircle(x + TL_W - 7 - lcd.textWidth("C") - 4, TL_Y + 73, 2, TEXT);
+    }
+  }
+  // Centre column between the dials: car, SMART GAUGE, stripes.
+  constexpr int CX = 240;
+  drawCar(CX, 80, lerpColor(SM_BG888, 0x2ea8ff, 0.35f), 2.5f);
+  drawCar(CX, 80, hex(0x4cc3ff), 0.8f);
+  label(lcd, "SMART", CX, 129, SM_SILVER, textdatum_t::baseline_center, &fonts::FreeSansBoldOblique12pt7b);
+  label(lcd, "GAUGE", CX, 153, SM_GOLD, textdatum_t::baseline_center, &fonts::FreeSansBoldOblique12pt7b);
+  for (int k = 0; k < 5; ++k) {
+    const int x = 202 + k * 16;
+    const uint16_t c = lerpColor(0x0b3a8a, 0x2ea8ff, k / 4.0f);
+    lcd.fillTriangle(x + 5, 160, x + 13, 160, x, 168, c);
+    lcd.fillTriangle(x + 13, 160, x + 8, 168, x, 168, c);
+  }
+}
+
+void smartText(const DisplayData& d, bool running) {
+  char value[16];
+  const bool live = d.link == DisplayData::LIVE, havePacket = d.link != DisplayData::WAITING;
+  // Status pill and board name in the centre column.
+  const char* status = !havePacket ? "WAITING" : !live ? "NO LINK" : !d.keyOn ? "KEY OFF" : "LIVE";
+  const uint16_t statusColor = !live ? RED : d.keyOn ? GREEN : AMBER;
+  if (changed(S_STATUS, status, statusColor)) {
+    lcd.fillRect(188, 186, 104, 26, SM_BG);
+    lcd.fillRoundRect(192, 188, 96, 22, 11, statusColor);
+    label(lcd, status, 240, 199, SM_BG, textdatum_t::middle_center);
+  }
+  char board[8] = "";
+  if (havePacket) for (uint8_t i = 0; i < 7 && d.board[i]; ++i) board[i] = toupper(d.board[i]);
+  boxText(S_BOARD, 192, 173, 96, 10, SM_BG, board, MUTED, 240, 178, textdatum_t::middle_center, &fonts::Font0);
+
+  // REF1 / REF2 (key on) and BAT (live with the key off).
+  for (uint8_t i = 0; i < 3; ++i) {
+    uint16_t color = hex(BX_VALUE[i]);
+    if (i < 2) {
+      if (havePacket && !d.references) { strcpy(value, "n/a"); color = MUTED; }
+      else if (running && isnan(d.reference[i])) { strcpy(value, "ERR"); color = RED; }
+      else if (running) snprintf(value, sizeof(value), "%.2f", d.reference[i]);
+      else { strcpy(value, "--"); color = MUTED; }
+    } else if (d.batteryAvailable && isnan(d.batteryV)) { strcpy(value, "ERR"); color = RED; }
+    else if (d.batteryAvailable) {
+      snprintf(value, sizeof(value), "%.1f", d.batteryV);
+      if (d.batteryV < 11.8f || d.batteryV > 15.0f) color = ORANGE;
+    } else { strcpy(value, havePacket ? "n/a" : "--"); color = MUTED; }
+    const int x = BX_X[i];
+    boxText(SM_BOX0 + i, x + 36, BX_Y + 20, BX_W - 36 - 27, 27, neonFill(BX_EDGE[i]), value, color,
+            x + BX_W - 28, BX_Y + 45, textdatum_t::baseline_right, &fonts::FreeSansBold18pt7b);
+  }
+
+  // Sensor tiles.
+  for (uint8_t i = 0; i < 6; ++i) {
+    uint16_t color = TEXT;
+    if (!running) { strcpy(value, "--"); color = MUTED; }
+    else switch (i) {
+      case 0: color = sensorText(d.ect, 0, value, sizeof(value)); break;
+      case 1: color = sensorText(d.iat, 0, value, sizeof(value)); break;
+      case 2: color = sensorText(d.map, 0, value, sizeof(value)); break;
+      case 3:
+        if (d.o2.afrAvailable) { snprintf(value, sizeof(value), "%.2f", d.o2.volts); color = mixtureColor(d.o2); }
+        else { strcpy(value, "ERR"); color = RED; }
+        break;
+      case 4:
+        if (d.o2.afrAvailable) snprintf(value, sizeof(value), "%.1f", d.o2.afr); else { strcpy(value, "ERR"); color = RED; }
+        break;
+      case 5:
+        if (d.tps.available) { snprintf(value, sizeof(value), "%.0f", d.tps.value); color = d.tps.inSpec ? TEXT : AMBER; }
+        else { strcpy(value, "ERR"); color = RED; }
+        break;
+    }
+    const int vx = tlValueX(i), right = tlX(i) + TL_W - 5;
+    boxText(SM_TILE0 + i, vx, TL_Y + 38, right - vx, 22, neonFill(TL_EDGE[i]), value, color,
+            right - 1, TL_Y + 57, textdatum_t::baseline_right, &fonts::FreeSansBold12pt7b);
+  }
+  const bool tpsOk = running && d.tps.available;
+  drawThrottle(tlX(5) + 5, TL_Y + 34, neonFill(TL_EDGE[5]), tpsOk, tpsOk ? throttleDeg(d.tps) : 0);
 }
 
 // ---- Shared frame ----------------------------------------------------------
-uint16_t viewBg() { return view == RACE ? RACE_BG : BG; }
+uint16_t viewBg() { return view == RACE ? RACE_BG : view == SMART ? SM_BG : BG; }
 
 // REF 1 / REF 2 boxes in the RACE header.
 constexpr int REF_X[2] = {4, 150}, REF_W = 140;
@@ -814,6 +1012,7 @@ constexpr int REF_X[2] = {4, 150}, REF_W = 140;
 // Header without tabs: the screen name (RACE shows REF 1 / REF 2 instead),
 // then the board and the status pill drawn by drawStatus().
 void drawHeader() {
+  if (view == SMART) return;  // Its REF / BAT boxes are part of drawSmartFrame().
   if (view != RACE) {
     label(lcd, VIEW_NAMES[view], 10, TAB_Y + TAB_H / 2, MUTED, textdatum_t::middle_left, &fonts::Font2);
     return;
@@ -829,20 +1028,21 @@ void drawFrame() {
   lcd.startWrite();
   lcd.fillScreen(viewBg());
   drawHeader();
-  lcd.drawFastHLine(0, HEADER_H, W, EDGE);
+  if (view != SMART) lcd.drawFastHLine(0, HEADER_H, W, EDGE);
   lcd.waitDMA();
   for (auto& band : gaugeBand) {
     band.deleteSprite();
     if (view == CLASSIC) band.createSprite(CG_W, CG_BAND);
     else if (view == RACE) band.createSprite(RG_W, RG_BAND);
+    else band.createSprite(DG_W, DG_BAND);
   }
   if (view == CLASSIC) drawClassicFrame();
   else if (view == RACE) drawRaceFrame();
-  else drawSensorsFrame();
+  else drawSmartFrame();
   lcd.endWrite();
   memset(shown, 0, sizeof(shown));
   memset(shownColor, 0, sizeof(shownColor));
-  shownGaugeKey = -1;
+  shownGaugeKey = shownSpeedKey = -1;
 }
 
 // No calibration screen: double-tap only needs to know the panel is pressed,
@@ -983,7 +1183,26 @@ void update(const DisplayData& d) {
   const float speed = selfTest ? sweep : running ? d.speedKmh : 0;
   const float rpm = selfTest ? sweep / SPEED_MAX * RPM_MAX : animatedRpm;
 
-  if (view != SENSORS && now - lastGaugeMs >= GAUGE_REFRESH_MS) {
+  if (view == SMART && now - lastGaugeMs >= GAUGE_REFRESH_MS) {
+    lastGaugeMs = now;
+    // Each dial is redrawn only when its own value changes.
+    const bool locked = live && !d.keyOn, show = running || selfTest;
+    const int32_t flags = (selfTest << 30) ^ (running << 29) ^ (locked << 28);
+    const int32_t rpmKey = (int32_t(rpm / 50) << 4) ^ flags, speedKey = (int32_t(lroundf(speed * 2)) << 4) ^ flags;
+    char text[8];
+    lcd.startWrite();
+    if (rpmKey != shownGaugeKey) {
+      shownGaugeKey = rpmKey;
+      if (show) snprintf(text, sizeof(text), "%d", int(lroundf(rpm / 10)) * 10); else strcpy(text, locked ? "0" : "---");
+      renderDial(0, rpm, show || locked, text);
+    }
+    if (speedKey != shownSpeedKey) {
+      shownSpeedKey = speedKey;
+      if (show) snprintf(text, sizeof(text), "%d", int(lroundf(speed))); else strcpy(text, locked ? "0" : "-");
+      renderDial(1, speed, show || locked, text);
+    }
+    lcd.endWrite();
+  } else if (view != SMART && now - lastGaugeMs >= GAUGE_REFRESH_MS) {
     lastGaugeMs = now;
     const bool locked = live && !d.keyOn;
     const int32_t key = (int32_t(lroundf(speed * 2)) << 16) ^ (int32_t(rpm / 50) << 4) 
@@ -1009,9 +1228,9 @@ void update(const DisplayData& d) {
   if (now - lastTextMs < TEXT_REFRESH_MS) return;
   lastTextMs = now;
   lcd.startWrite();
-  drawStatus(d);
-  if (view == SENSORS) sensorsText(d, running);
+  if (view == SMART) smartText(d, running);
   else {
+    drawStatus(d);
     uint16_t lamps[LAMP_COUNT];
     lampColors(d, selfTest, speed, now, lamps);
     for (uint8_t i = 0; i < LAMP_COUNT; ++i) {
